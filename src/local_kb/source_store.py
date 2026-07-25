@@ -539,23 +539,26 @@ class SourceStore:
                 except BaseException as archive_error:
                     if stage_fd is not None and not published:
                         try:
-                            removed = self._cleanup_posix_stage(
+                            self._cleanup_posix_stage(
                                 stage_fd,
-                                source_fd,
-                                stage_name,
                                 (source.original_name, _MANIFEST_NAME),
                             )
                         except BaseException as cleanup_error:
                             archive_error.add_note(
                                 f"stage cleanup failed safely: {cleanup_error}"
                             )
+                            archive_error.add_note(
+                                "POSIX orphan stage directory was preserved "
+                                "for future safe GC; cleanup through its "
+                                "original directory descriptor was incomplete"
+                            )
                         else:
-                            if not removed:
-                                archive_error.add_note(
-                                    "stage namespace changed; original files "
-                                    "were unlinked by fd but orphan directory "
-                                    "was preserved"
-                                )
+                            archive_error.add_note(
+                                "POSIX cleanup unlinked owned stage files "
+                                "through the original directory descriptor; "
+                                "the empty orphan stage directory was "
+                                "preserved for future safe GC"
+                            )
                     raise
                 finally:
                     if stage_fd is not None:
@@ -671,33 +674,13 @@ class SourceStore:
     @staticmethod
     def _cleanup_posix_stage(
         stage_fd: int,
-        parent_fd: int,
-        stage_name: str,
         owned_names: tuple[str, ...],
-    ) -> bool:
+    ) -> None:
         for name in owned_names:
             try:
                 os.unlink(name, dir_fd=stage_fd)
             except FileNotFoundError:
                 pass
-        original = _posix_fstat(stage_fd)
-        try:
-            current = _posix_stat_at(
-                stage_name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-        except OSError:
-            return False
-        if not stat.S_ISDIR(current.st_mode):
-            return False
-        if (original.st_dev, original.st_ino) != (
-            current.st_dev,
-            current.st_ino,
-        ):
-            return False
-        os.rmdir(stage_name, dir_fd=parent_fd)
-        return True
 
     @contextmanager
     def _archive_lock(self) -> Iterator[None]:

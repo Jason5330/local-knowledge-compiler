@@ -16,6 +16,20 @@ def write_file(path: Path, content: bytes) -> Path:
     return path
 
 
+def assert_failed_archive_cleanup(
+    raw_root: Path, *, allow_empty_posix_orphans: bool | None = None
+) -> None:
+    if allow_empty_posix_orphans is None:
+        allow_empty_posix_orphans = os.name != "nt"
+    stages = list(raw_root.rglob(".ver_*.tmp-*"))
+    if not allow_empty_posix_orphans:
+        assert stages == []
+        return
+    for stage in stages:
+        assert stage.is_dir()
+        assert list(stage.iterdir()) == []
+
+
 def test_file_sha256_streams_the_file_contents(tmp_path: Path) -> None:
     from local_kb.source_store import file_sha256
 
@@ -40,6 +54,7 @@ def test_archive_stores_an_immutable_source_version(tmp_path: Path) -> None:
     assert archived.status == "archived"
     assert archived.media_type == "text/markdown"
     assert (raw_root / "work" / archived.source_id / archived.version_id / "report.md").read_bytes() == b"hello source"
+    assert not list(raw_root.rglob(".ver_*.tmp-*"))
 
 
 def test_archive_deduplicates_equal_content_with_a_different_name(tmp_path: Path) -> None:
@@ -172,7 +187,7 @@ def test_archive_fails_when_the_copied_checksum_does_not_match(
     with pytest.raises(ValueError, match="checksum"):
         source_store.SourceStore(tmp_path / "10_raw").archive(incoming, "work")
 
-    assert not list((tmp_path / "10_raw").rglob(".ver_*.tmp-*"))
+    assert_failed_archive_cleanup(tmp_path / "10_raw")
 
 
 def test_archive_is_safe_when_equal_content_arrives_concurrently(tmp_path: Path) -> None:
@@ -191,6 +206,7 @@ def test_archive_is_safe_when_equal_content_arrives_concurrently(tmp_path: Path)
     manifests = list(raw_root.rglob("manifest.json"))
     assert len(manifests) == 1
     assert json.loads(manifests[0].read_text(encoding="utf-8"))["sha256"] == versions[0].sha256
+    assert not list(raw_root.rglob(".ver_*.tmp-*"))
 
 
 def test_manifest_round_trips_all_source_version_fields(tmp_path: Path) -> None:
@@ -480,7 +496,7 @@ def test_flush_failure_does_not_publish_or_leave_temp_artifacts(
         store.archive(write_file(tmp_path / "flush.txt", b"flush"), "work")
 
     assert not list(raw_root.rglob("manifest.json"))
-    assert not list(raw_root.rglob(".ver_*.tmp-*"))
+    assert_failed_archive_cleanup(raw_root)
 
 
 def test_atomic_publish_failure_does_not_return_success_or_leave_temp_artifacts(
@@ -503,7 +519,7 @@ def test_atomic_publish_failure_does_not_return_success_or_leave_temp_artifacts(
         )
 
     assert not list(raw_root.rglob("manifest.json"))
-    assert not list(raw_root.rglob(".ver_*.tmp-*"))
+    assert_failed_archive_cleanup(raw_root)
 
 
 def test_posix_publish_refuses_target_created_after_final_precheck(
@@ -538,7 +554,9 @@ def test_posix_publish_refuses_target_created_after_final_precheck(
 
     assert (target / "marker").read_bytes() == marker
     assert not (target / "race-target.txt").exists()
-    assert not list(raw_root.rglob(".ver_*.tmp-*"))
+    assert_failed_archive_cleanup(
+        raw_root, allow_empty_posix_orphans=True
+    )
 
 
 def test_posix_component_open_is_dirfd_relative_and_nofollow_when_parent_races(
@@ -766,8 +784,6 @@ def test_posix_cleanup_uses_original_stage_fd_and_preserves_replacement(
 
     source_store.SourceStore._cleanup_posix_stage(
         73,
-        41,
-        ".ver_stage.tmp-race",
         ("payload.txt", "manifest.json"),
     )
 
@@ -780,6 +796,51 @@ def test_posix_cleanup_uses_original_stage_fd_and_preserves_replacement(
         "payload.txt": b"replacement payload",
         "manifest.json": b"replacement manifest",
     }
+
+
+def test_posix_cleanup_never_rmdirs_stage_name_after_identity_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_kb import source_store
+
+    class FakeStat:
+        st_dev = 1
+        st_ino = 100
+        st_mode = source_store.stat.S_IFDIR
+
+    unlinked: list[tuple[str, int | None]] = []
+    monkeypatch.setattr(
+        source_store,
+        "_posix_fstat",
+        lambda descriptor: FakeStat(),
+    )
+    monkeypatch.setattr(
+        source_store,
+        "_posix_stat_at",
+        lambda component, *, dir_fd, follow_symlinks: FakeStat(),
+    )
+    monkeypatch.setattr(
+        source_store.os,
+        "unlink",
+        lambda name, *, dir_fd: unlinked.append((name, dir_fd)),
+    )
+    monkeypatch.setattr(
+        source_store.os,
+        "rmdir",
+        lambda name, *, dir_fd: pytest.fail(
+            "name-based rmdir could delete a raced replacement"
+        ),
+    )
+
+    source_store.SourceStore._cleanup_posix_stage(
+        73,
+        ("payload.txt", "manifest.json"),
+    )
+
+    assert unlinked == [
+        ("payload.txt", 73),
+        ("manifest.json", 73),
+    ]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX dir_fd semantics")
@@ -812,9 +873,13 @@ def test_posix_cleanup_does_not_delete_replacement_stage_contents(
 
     monkeypatch.setattr(store, "_copy_posix_file", race_cleanup)
 
-    with pytest.raises(OSError, match="injected failure"):
+    with pytest.raises(OSError, match="injected failure") as captured:
         store.archive(incoming, "work")
 
+    assert any(
+        "orphan stage directory" in note and "safe GC" in note
+        for note in captured.value.__notes__
+    )
     replacement_stage = next(source_dir.glob(".ver_*.tmp-*"))
     assert (replacement_stage / "payload.txt").read_bytes() == replacement_payload
     assert (replacement_stage / "manifest.json").read_bytes() == replacement_manifest
