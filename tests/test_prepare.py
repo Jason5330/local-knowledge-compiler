@@ -117,7 +117,7 @@ def test_prepare_includes_bounded_pending_job_metadata(seeded_catalog, tmp_path)
 
     assert packet["pending_jobs"]["scope"] == "selected_spaces"
     assert packet["pending_jobs"]["jobs"] == [{
-        "job_id": "pending-job", "state": "pending_attention", "compiler_status": "needs_agent", "source_status": None, "pending_reason": "needs_agent",
+        "job_id": "pending-job", "state": "pending_attention", "compiler_status": "needs_agent", "source_status": None, "pending_reason": "needs_agent", "relation": "unknown",
         "source": "src-pending", "space": "work", "error": "x" * 256,
     }]
 
@@ -137,7 +137,7 @@ def test_prepare_keeps_published_pending_extractor_and_unknown_space_visible(see
     pending = packet["pending_jobs"]
     assert pending["scope"] == "selected_spaces_plus_unknown"
     assert pending["jobs"] == [{
-        "job_id": "ocr-job", "state": "published", "compiler_status": None, "source_status": "pending_extractor", "pending_reason": "extractor_required",
+        "job_id": "ocr-job", "state": "published", "compiler_status": None, "source_status": "pending_extractor", "pending_reason": "extractor_required", "relation": "unknown",
         "source": "src-image", "space": None, "error": None,
     }]
 
@@ -189,7 +189,7 @@ def test_prepare_wiki_title_route_is_secondary_and_bounded(tmp_path):
     vault = build_vault(tmp_path / "vault")
     (vault.wiki / "work" / "aurora.md").parent.mkdir(exist_ok=True)
     (vault.wiki / "work" / "aurora.md").write_text(
-        "---\ntitle: \"Aurora plan\"\naliases:\n  - \"launch plan\"\ntype: \"topic\"\nspace: \"work\"\nsource_ids:\n  - \"src-wiki\"\n---\n\n## Current State\n\nDerived summary only.\n\n## Evidence\n\n- src-wiki\n",
+        "---\ntitle: \"Aurora plan\"\naliases:\n  - \"launch plan\"\ntype: \"topic\"\nspace: \"work\"\nsource_ids:\n  - \"src-raw\"\n---\n\n## Current State\n\nDerived summary only.\n\n## Evidence\n\n- src-raw\n",
         encoding="utf-8",
     )
     catalog = Catalog(vault.index / "catalog.sqlite3")
@@ -198,13 +198,15 @@ def test_prepare_wiki_title_route_is_secondary_and_bounded(tmp_path):
         _source(source_id="src-raw", version_id="ver-raw", space="work", name="a.txt", digest="e"),
         [("line:3", "Aurora raw primary evidence")],
     )
+    raw_file = vault.root / "10_raw/work/src-raw/ver-raw/a.txt"
+    raw_file.parent.mkdir(parents=True); raw_file.write_text("backing", encoding="utf-8")
     packet = QueryService(catalog, vault=vault).prepare("Aurora", {"work"})
     assert packet["evidence"][0]["kind"] == "raw_fragment"
     derived = [item for item in packet["evidence"] if item["kind"] == "derived_wiki"]
     assert derived == [{
         "kind": "derived_wiki", "evidence_class": "derived", "space": "work",
         "path": "20_wiki/work/aurora.md", "locator": "Current State",
-        "text": "Derived summary only.", "source_ids": ["src-wiki"], "score": 0.0,
+        "text": "Derived summary only.", "source_ids": ["src-raw"], "score": 0.0,
         "truncated": False,
     }]
 
@@ -216,14 +218,30 @@ def test_prepare_derived_only_result_is_ready_without_raw_no_match_reason(tmp_pa
 
     vault = build_vault(tmp_path / "vault")
     (vault.wiki / "work" / "only.md").write_text(
-        "---\ntitle: \"derived route\"\nspace: \"work\"\n---\n\n## Current State\n\nderived only text\n",
+        "---\ntitle: \"derived route\"\nspace: \"work\"\nsource_ids:\n  - \"src-derived\"\n---\n\n## Current State\n\nderived only text\n",
         encoding="utf-8",
     )
     catalog = Catalog(vault.index / "catalog.sqlite3")
     catalog.initialize()
+    catalog.upsert_source(_source(source_id="src-derived", version_id="ver-derived", space="work", name="only.txt", digest="a"), [("line:1", "derived backing")])
+    raw_file = vault.root / "10_raw/work/src-derived/ver-derived/only.txt"
+    raw_file.parent.mkdir(parents=True); raw_file.write_text("backing", encoding="utf-8")
     packet = QueryService(catalog, vault=vault).prepare("derived route", {"work"})
     assert packet["status"] == "ready"
     assert "reason" not in packet
+
+
+def test_prepare_rejects_wiki_page_with_fake_provenance(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.query import QueryService
+
+    vault = build_vault(tmp_path / "vault")
+    (vault.wiki / "work" / "fake.md").write_text("---\ntitle: \"fake route\"\nspace: \"work\"\nsource_ids:\n  - \"fake-source\"\n---\n\n## Current State\n\nfake text\n", encoding="utf-8")
+    catalog = Catalog(vault.index / "catalog.sqlite3"); catalog.initialize()
+    packet = QueryService(catalog, vault=vault).prepare("fake route", {"work"})
+    assert packet["status"] == "insufficient_evidence"
+    assert packet["warnings"] == ["wiki_page_skipped_invalid_provenance"]
 
 
 def test_exact_identifier_route_inside_question_is_safe_and_stable(seeded_catalog):
@@ -258,6 +276,37 @@ def test_prepare_wiki_walk_is_bounded_by_depth_and_entries(tmp_path):
     catalog.initialize()
     packet = QueryService(catalog, vault=vault).prepare("overflow route", {"work"})
     assert packet["status"] == "insufficient_evidence"
+
+
+def test_pending_jobs_report_total_shown_relation_and_truncation(seeded_catalog, tmp_path):
+    from local_kb.query import QueryService
+    from local_kb.queue import DiskQueue
+
+    queue = DiskQueue(tmp_path / "queue")
+    for number in range(41):
+        job = queue.enqueue(tmp_path / f"aurora-{number}.txt", job_id=f"job-{number}")
+        queue.update(job.job_id, lambda current: current.metadata.update({"space": "work", "source_id": f"aurora-{number}"}))
+    pending = QueryService(seeded_catalog, queue=queue).prepare("Aurora", {"work"})["pending_jobs"]
+    assert (pending["total"], pending["shown"], pending["truncated"]) == (41, 40, True)
+    assert pending["jobs"][0]["relation"] == "matched_metadata"
+
+
+def test_prepare_keeps_derived_wiki_when_raw_hits_fill_limit(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.query import QueryService
+
+    vault = build_vault(tmp_path / "vault")
+    catalog = Catalog(vault.index / "catalog.sqlite3"); catalog.initialize()
+    raw = vault.raw / "work" / "src-wiki" / "ver-wiki" / "source.txt"
+    raw.parent.mkdir(parents=True); raw.write_text("wiki source", encoding="utf-8")
+    catalog.upsert_source(_source(source_id="src-wiki", version_id="ver-wiki", space="work", name="source.txt", digest="f"), [("line:1", "Aurora wiki backing source")])
+    for number in range(12):
+        catalog.upsert_source(_source(source_id=f"src-{number}", version_id=f"ver-{number}", space="work", name=f"{number}.txt", digest=f"{number:x}"), [("line:1", "Aurora raw evidence")])
+    (vault.wiki / "work" / "page.md").write_text("---\ntitle: \"Aurora\"\nspace: \"work\"\nsource_ids:\n  - \"src-wiki\"\n---\n\n## Current State\n\nAurora wiki summary\n", encoding="utf-8")
+    evidence = QueryService(catalog, vault=vault).prepare("Aurora", {"work"}, limit=12)["evidence"]
+    assert evidence[0]["kind"] == "raw_fragment"
+    assert any(item["kind"] == "derived_wiki" for item in evidence)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX fd-relative open race test")

@@ -85,19 +85,21 @@ def ranked_search(
     if not has_searchable_terms(checked_question):
         return []
     hits = catalog.search(checked_question, checked_spaces, limit=min(40, Catalog.MAX_SEARCH_LIMIT))
-    if hits:
-        return _deduplicate(hits, limit)
-    fallback: list[EvidenceHit] = []
+    combined: list[EvidenceHit] = [EvidenceHit(
+        source_id=hit.source_id, version_id=hit.version_id, space=hit.space,
+        relative_path=hit.relative_path, locator=hit.locator, text=hit.text,
+        score=float(hit.score) + 1.0, route="full_question",
+    ) for hit in hits]
     for route in _fallback_queries(checked_question):
         for hit in catalog.search(route, checked_spaces, limit=8):
-            fallback.append(EvidenceHit(
+            combined.append(EvidenceHit(
                 source_id=hit.source_id, version_id=hit.version_id, space=hit.space,
                 relative_path=hit.relative_path, locator=hit.locator, text=hit.text,
                 # Catalog already exposes -bm25 (larger is better).  A tiny route
                 # length bonus makes longer, more specific fallbacks win stable ties.
                 score=float(hit.score) + len(route) / 1_000_000, route=f"fallback:{route}",
             ))
-    return _deduplicate(fallback, limit)
+    return _deduplicate(combined, limit)
 
 
 def exact_routes(
@@ -180,3 +182,8 @@ def _fallback_queries(question: str) -> tuple[str, ...]:
         for width in (3, 2):
             routes.extend(run[index:index + width] for index in range(max(0, len(run) - width + 1)))
     return tuple(dict.fromkeys(route for route in routes if route))[:MAX_FALLBACK_ROUTES]
+
+
+def significant_routes(question: str) -> tuple[str, ...]:
+    """Bounded searchable fragments shared by retrieval and queue relation checks."""
+    return _fallback_queries(question)

@@ -138,16 +138,17 @@ def _open_pinned_regular(path: Path, *, parent_fd: int | None = None, name: str 
         os.close(descriptor)
 
 
-def _safe_read_wiki(vault: VaultPaths, question: str, spaces: tuple[str, ...]) -> tuple[list[dict[str, object]], bool]:
+def _safe_read_wiki(catalog: Catalog, vault: VaultPaths, question: str, spaces: tuple[str, ...]) -> tuple[list[dict[str, object]], bool, list[str]]:
     """Read only bounded Current State text from a caller-provided vault."""
     wiki_root = vault.wiki.absolute()
     if not wiki_root.is_dir():
-        return [], False
+        return [], False, []
     _safe_existing_tree(vault.root, wiki_root)
     terms = [term.casefold() for term in Catalog._plain_query_terms(question) if len(term) > 1]
     if not terms:
-        return [], False
+        return [], False, []
     findings: list[dict[str, object]] = []
+    warnings: list[str] = []
     scan_state = {"truncated": False}
     # A deterministic cap prevents a huge wiki tree becoming an unbounded query operation.
     for path, parent_fd, name in _safe_walk_wiki(wiki_root, scan_state):
@@ -178,16 +179,42 @@ def _safe_read_wiki(vault: VaultPaths, question: str, spaces: tuple[str, ...]) -
         title_and_aliases = " ".join([values.get("title", ""), *_frontmatter_list(header, "aliases")]).casefold()
         if not current or not (all(term in current.casefold() for term in terms) or all(term in title_and_aliases for term in terms)):
             continue
+        source_ids = _frontmatter_list(header, "source_ids")
+        if not _valid_wiki_provenance(catalog, vault, source_ids):
+            warnings.append("wiki_page_skipped_invalid_provenance")
+            continue
         findings.append({
             "kind": "derived_wiki", "evidence_class": "derived", "space": space, "path": path.relative_to(vault.root).as_posix(),
             "locator": "Current State", "text": current[:MAX_EVIDENCE_TEXT],
-            "source_ids": _frontmatter_list(header, "source_ids"), "score": 0.0,
+            "source_ids": source_ids, "score": 0.0,
             "truncated": len(current) > MAX_EVIDENCE_TEXT,
         })
         if len(findings) >= MAX_RESULTS:
             scan_state["truncated"] = True
             break
-    return findings, scan_state["truncated"]
+    return findings, scan_state["truncated"], sorted(set(warnings))
+
+
+def _valid_wiki_provenance(catalog: Catalog, vault: VaultPaths, source_ids: list[str]) -> bool:
+    if not source_ids or len(source_ids) > 32:
+        return False
+    marks = ", ".join("?" for _ in source_ids)
+    with catalog.connection() as connection:
+        rows = connection.execute(
+            f"SELECT source_id, relative_path FROM sources WHERE source_id IN ({marks})", source_ids
+        ).fetchall()
+    if {row["source_id"] for row in rows} != set(source_ids):
+        return False
+    for row in rows:
+        candidate = vault.root / row["relative_path"]
+        try:
+            _safe_existing_tree(vault.raw, candidate)
+            with _open_pinned_regular(candidate) as (descriptor, _):
+                if os.read(descriptor, 1) is not None:
+                    return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 def _frontmatter_list(header: str, name: str) -> list[str]:
@@ -214,6 +241,11 @@ def _frontmatter_scalar(value: str) -> str:
     return parsed if isinstance(parsed, str) else ""
 
 
+def _significant_routes(question: str) -> tuple[str, ...]:
+    from .search import significant_routes
+    return significant_routes(question)
+
+
 def _raw_evidence(hits: list[EvidenceHit]) -> list[dict[str, object]]:
     evidence: list[dict[str, object]] = []
     for hit in hits:
@@ -233,15 +265,15 @@ def _short(value: object) -> str | None:
     return value.replace("\x00", "").replace("\r", " ").replace("\n", " ")[:MAX_JOB_TEXT]
 
 
-def _pending_jobs(queue: DiskQueue | None, spaces: tuple[str, ...]) -> dict[str, object]:
+def _pending_jobs(queue: DiskQueue | None, spaces: tuple[str, ...], question: str) -> dict[str, object]:
     if queue is None:
-        return {"scope": "selected_spaces", "jobs": [], "truncated": False}
+        return {"scope": "selected_spaces", "jobs": [], "total": 0, "shown": 0, "truncated": False}
     jobs: list[dict[str, object]] = []
     unknown_space = False
     try:
         candidates = queue.iter_jobs()
     except (OSError, ValueError):
-        return {"scope": "all-active", "jobs": [], "truncated": True, "error": "queue_unavailable"}
+        return {"scope": "all-active", "jobs": [], "total": 0, "shown": 0, "truncated": True, "error": "queue_unavailable"}
     for job in candidates:
         source_metadata = job.metadata.get("source")
         source_values = source_metadata if isinstance(source_metadata, dict) else {}
@@ -261,16 +293,23 @@ def _pending_jobs(queue: DiskQueue | None, spaces: tuple[str, ...]) -> dict[str,
             else "needs_agent" if compiler_status == "needs_agent"
             else "job_error" if job.error else "incomplete_job"
         )
+        metadata = " ".join(filter(None, [
+            _short(job.metadata.get("source_id")), _short(source_values.get("source_id")),
+            _short(source_values.get("original_name")), _short(job.source_path), _short(job.error),
+        ])).casefold()
+        relation = "matched_metadata" if any(route.casefold() in metadata for route in _significant_routes(question)) else "unknown"
         jobs.append({
             "job_id": job.job_id, "state": job.state,
             "compiler_status": compiler_status, "source_status": source_status,
             "pending_reason": pending_reason,
+            "relation": relation,
             "source": (_short(job.metadata.get("source_id")) or _short(source_values.get("source_id"))
                        or _short(source_values.get("original_name")) or _short(job.source_path)),
             "space": space, "error": _short(job.error),
         })
     jobs.sort(key=lambda item: str(item["job_id"]))
-    return {"scope": "selected_spaces_plus_unknown" if unknown_space else "selected_spaces", "jobs": jobs[:MAX_PENDING_JOBS], "truncated": len(jobs) > MAX_PENDING_JOBS}
+    shown = jobs[:MAX_PENDING_JOBS]
+    return {"scope": "selected_spaces_plus_unknown" if unknown_space else "selected_spaces", "jobs": shown, "total": len(jobs), "shown": len(shown), "truncated": len(jobs) > MAX_PENDING_JOBS}
 
 
 class QueryService:
@@ -283,7 +322,7 @@ class QueryService:
         self.queue = queue
         self.clock = clock
 
-    def prepare(self, question: str, spaces: Collection[str], *, limit: int = MAX_RESULTS) -> dict[str, object]:
+    def prepare(self, question: str, spaces: Collection[str], *, limit: int = MAX_RESULTS, space_selection: str = "explicit") -> dict[str, object]:
         checked_question = validate_question(question)
         checked_spaces = validate_spaces(spaces)
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_RESULTS:
@@ -301,16 +340,19 @@ class QueryService:
         wiki_scan_truncated = False
         # Generated wiki pages are useful secondary context only.  Raw extraction is
         # always listed first and is never relabelled as original evidence.
-        if self.vault is not None and len(evidence) < limit and has_searchable_terms(checked_question):
-            derived, wiki_scan_truncated = _safe_read_wiki(self.vault, checked_question, checked_spaces)
-            evidence.extend(derived[:limit - len(evidence)])
-        evidence = evidence[:limit]
+        if self.vault is not None and has_searchable_terms(checked_question):
+            derived, wiki_scan_truncated, warnings = _safe_read_wiki(self.catalog, self.vault, checked_question, checked_spaces)
+            evidence = (evidence[:limit - 1] + derived[:1]) if limit >= 2 and derived else evidence[:limit]
+        else:
+            warnings = []
+            evidence = evidence[:limit]
         reason = ("question_has_no_searchable_terms" if not has_searchable_terms(checked_question)
                   else "no_matching_evidence") if not evidence else None
-        pending_jobs = _pending_jobs(self.queue, checked_spaces)
+        pending_jobs = _pending_jobs(self.queue, checked_spaces, checked_question)
         packet: dict[str, object] = {
             "schema_version": SCHEMA_VERSION, "question": checked_question,
             "prepared_at": _validate_prepared_at(self.clock()), "spaces": list(checked_spaces),
+            "space_selection": space_selection,
             "status": "ready" if evidence else "insufficient_evidence",
             "instructions": [
                 "只能依據 evidence 回答，不可補造事實。",
@@ -319,6 +361,7 @@ class QueryService:
                 "不要把 pending_jobs 當成已完成或已驗證的證據。",
             ],
             "evidence": evidence, "pending_jobs": pending_jobs,
+            "warnings": warnings,
             "truncated": {
                 "evidence": any(item.get("truncated") is True for item in evidence),
                 "pending_jobs": pending_jobs["truncated"],

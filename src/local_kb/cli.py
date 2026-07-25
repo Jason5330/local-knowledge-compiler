@@ -13,6 +13,7 @@ from .ingest import IngestService
 from .paths import VaultPaths
 from .queue import DiskQueue
 from .query import QueryService, write_packet
+from .search import ranked_search
 from .watcher import StableTracker
 
 
@@ -104,9 +105,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "prepare":
             catalog = Catalog(paths.index / "catalog.sqlite3")
             catalog.initialize()
-            spaces = arguments.space or ["unclassified"]
+            spaces, selection = _select_prepare_spaces(catalog, arguments.question, arguments.space)
             packet = QueryService(catalog, vault=paths, queue=DiskQueue(paths.queue, config.max_retries)).prepare(
-                arguments.question, spaces
+                arguments.question, spaces, space_selection=selection
             )
             print(write_packet(paths, packet, arguments.output))
             return 0
@@ -130,6 +131,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     return 1
+
+
+def _select_prepare_spaces(catalog: Catalog, question: str, explicit: list[str]) -> tuple[list[str], str]:
+    if explicit:
+        return explicit, "explicit"
+    lowered = question.casefold()
+    if any(marker in question for marker in ("個人", "私密")) or "personal" in lowered:
+        return ["personal"], "inferred_personal"
+    if any(marker in question for marker in ("工作",)) or "work" in lowered:
+        return ["work"], "inferred_work"
+    import re
+    match = re.search(r"project:([a-z0-9]+(?:-[a-z0-9]+)*)", lowered)
+    if match:
+        return [f"project:{match.group(1)}"], "inferred_project"
+    candidates = ["work", "shared", "unclassified"]
+    hits = {space: ranked_search(catalog, question, {space}, limit=1) for space in candidates}
+    matched = [space for space, found in hits.items() if found]
+    if len(matched) == 1:
+        return matched, "inferred_preview"
+    raise ValueError("cannot infer a safe space; pass --space explicitly")
 
 
 def watch_once(
