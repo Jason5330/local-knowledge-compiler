@@ -242,7 +242,7 @@ def test_prepare_rejects_wiki_page_with_fake_provenance(tmp_path):
     catalog = Catalog(vault.index / "catalog.sqlite3"); catalog.initialize()
     packet = QueryService(catalog, vault=vault).prepare("fake route", {"work"})
     assert packet["status"] == "insufficient_evidence"
-    assert packet["warnings"] == ["wiki_page_skipped_invalid_provenance"]
+    assert packet["warnings"] == ["wiki_page_skipped_invalid_provenance", "wiki_invalid_provenance_count:1"]
 
 
 def test_exact_identifier_route_inside_question_is_safe_and_stable(seeded_catalog):

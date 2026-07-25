@@ -179,7 +179,7 @@ def _safe_read_wiki(catalog: Catalog, vault: VaultPaths, question: str, spaces: 
         aliases = _frontmatter_list(header, "aliases")
         title_and_aliases = " ".join([values.get("title", ""), *aliases]).casefold()
         direct_routes = tuple(route for route in _significant_routes(question) if route.casefold() in title_and_aliases or route.casefold() in current.casefold())[:16]
-        if not current or not direct_routes:
+        if not current:
             continue
         source_ids = _frontmatter_list(header, "source_ids")
         candidates.append({
@@ -187,6 +187,9 @@ def _safe_read_wiki(catalog: Catalog, vault: VaultPaths, question: str, spaces: 
             "locator": "Current State", "text": current[:MAX_EVIDENCE_TEXT],
             "source_ids": source_ids, "score": float(len(direct_routes) + sum(route.casefold() in title_and_aliases for route in direct_routes)),
             "route": "direct_wiki", "routes": list(direct_routes), "coverage": len(direct_routes), "match_kind": "direct",
+            "page_id": values.get("id", ""), "title": values.get("title", ""), "aliases": aliases,
+            "related": _frontmatter_list(header, "related"), "page_type": values.get("type", ""),
+            "updated_at": values.get("updated_at", ""),
             "truncated": len(current) > MAX_EVIDENCE_TEXT,
         })
     all_ids = list(dict.fromkeys(source_id for item in candidates for source_id in item["source_ids"]))[:128]
@@ -202,8 +205,32 @@ def _safe_read_wiki(catalog: Catalog, vault: VaultPaths, question: str, spaces: 
             warnings.append("wiki_page_skipped_invalid_provenance")
             continue
         findings.append(item)
-    findings.sort(key=lambda item: (-float(item["score"]), str(item["path"])))
-    return findings[:MAX_RESULTS], scan_state["truncated"], sorted(set(warnings))
+    direct = [item for item in findings if item["coverage"]]
+    date_terms = tuple(route for route in _significant_routes(question) if re.fullmatch(r"\d{4}(?:-\d{2}(?:-\d{2})?)?", route))
+    decision = "決策" in question or "decision" in question.casefold()
+    for item in direct:
+        if decision and item["page_type"] == "decision": item["score"] = float(item["score"]) + 2
+        if date_terms and any(term in str(item["updated_at"]) or term in str(item["text"]) for term in date_terms): item["score"] = float(item["score"]) + 1
+    direct.sort(key=lambda item: (-float(item["score"]), str(item["path"])))
+    expanded: list[dict[str, object]] = []
+    if direct:
+        direct_keys = {str(item["page_id"]) for item in direct} | {str(item["path"]) for item in direct} | {str(item["title"]) for item in direct}
+        for item in findings:
+            if item in direct or item["space"] != direct[0]["space"]: continue
+            common = any(set(item["source_ids"]) & set(parent["source_ids"]) for parent in direct)
+            related = any(target in direct_keys for target in item["related"]) or any(str(item["path"]) in parent["related"] for parent in direct)
+            if not (common or related): continue
+            item["match_kind"] = "expanded"; item["route"] = "expanded_related" if related else "expanded_common_source"; item["score"] = -1.0 - len(expanded)/1000
+            expanded.append(item)
+            if len(expanded) >= 4: break
+    public = direct + expanded
+    for item in public:
+        for key in ("page_id", "title", "aliases", "related", "page_type", "updated_at"): item.pop(key, None)
+    invalid_count = len(warnings)
+    warning_summary = (["wiki_page_skipped_invalid_provenance"] if invalid_count else [])
+    if invalid_count:
+        warning_summary.append(f"wiki_invalid_provenance_count:{invalid_count}")
+    return public[:MAX_RESULTS], scan_state["truncated"], warning_summary
 
 
 def _valid_wiki_provenance(catalog: Catalog, vault: VaultPaths, source_ids: list[str]) -> bool:
