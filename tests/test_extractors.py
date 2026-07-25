@@ -735,3 +735,90 @@ def test_text_extractor_streams_lines_without_read_text(
         Fragment("lines:1-1", "first"),
         Fragment("lines:2-2", "second"),
     ]
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\n", "\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+)
+def test_text_streaming_supports_every_splitlines_separator(
+    tmp_path: Path, separator: str
+) -> None:
+    path = tmp_path / "separator.txt"
+    path.write_text(f"first{separator}second", encoding="utf-8", newline="")
+
+    result = registry.extract(path)
+
+    assert result.fragments == [
+        Fragment("lines:1-1", "first"),
+        Fragment("lines:2-2", "second"),
+    ]
+
+
+def test_text_streaming_handles_mixed_unicode_boundaries(tmp_path: Path) -> None:
+    path = tmp_path / "mixed.txt"
+    path.write_text("first\u2028second\x85third\vfourth\fform", encoding="utf-8")
+
+    assert registry.extract(path).fragments == [
+        Fragment("lines:1-1", "first"),
+        Fragment("lines:2-2", "second"),
+        Fragment("lines:3-3", "third"),
+        Fragment("lines:4-4", "fourth"),
+        Fragment("lines:5-5", "form"),
+    ]
+
+
+def test_text_streaming_treats_cross_chunk_crlf_as_one_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb.extractors import text
+
+    path = tmp_path / "crlf.txt"
+    path.write_bytes(b"first\r\nsecond")
+    monkeypatch.setattr(text, "TEXT_CHUNK_CHARACTERS", 6)
+
+    assert registry.extract(path).fragments == [
+        Fragment("lines:1-1", "first"),
+        Fragment("lines:2-2", "second"),
+    ]
+
+
+def test_text_streaming_counts_ignored_blank_logical_lines(tmp_path: Path) -> None:
+    path = tmp_path / "blank-lines.txt"
+    path.write_text("first\u2028 \x85third", encoding="utf-8")
+
+    assert registry.extract(path).fragments == [
+        Fragment("lines:1-1", "first"),
+        Fragment("lines:3-3", "third"),
+    ]
+
+
+def test_text_streaming_rejects_overlong_unbroken_line_before_reading_more(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb.extractors import text
+
+    source = tmp_path / "overlong.txt"
+    source.write_text("placeholder", encoding="utf-8")
+    monkeypatch.setattr(base, "MAX_EXTRACTION_CHARACTERS", 1)
+    monkeypatch.setattr(text, "TEXT_CHUNK_CHARACTERS", 2)
+    reads = 0
+
+    class FakeStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size: int) -> str:
+            nonlocal reads
+            reads += 1
+            return "ab" if reads == 1 else "should-not-be-read"
+
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: FakeStream())
+
+    with pytest.raises(base.ExtractionError, match="unbroken line exceeds"):
+        text.TextExtractor().extract(source)
+
+    assert reads == 1
