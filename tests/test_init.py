@@ -1,7 +1,23 @@
+import re
+import tomllib
+
+import pytest
+
 from local_kb.cli import build_vault, main
 from local_kb.config import Config
 from local_kb.paths import VaultPaths
-import tomllib
+
+
+VALID_CONFIG = """[compiler]
+provider = "claude"
+
+[watcher]
+poll_seconds = 2.0
+stable_seconds = 5.0
+
+[queue]
+max_retries = 3
+"""
 
 
 def test_build_vault_creates_required_layout(tmp_path):
@@ -35,6 +51,67 @@ def test_build_vault_creates_source_categories_and_default_config(tmp_path):
     assert config == Config(vault=tmp_path.resolve())
     with (tmp_path / "80_system" / "config.toml").open("rb") as config_file:
         assert tomllib.load(config_file)["compiler"]["provider"] == "claude"
+
+
+def test_build_vault_preserves_existing_config_bytes(tmp_path):
+    build_vault(tmp_path)
+    config_path = tmp_path / "80_system" / "config.toml"
+    custom_config = b"""# Keep this customized configuration byte-for-byte.
+[compiler]
+provider = "codex"
+
+[watcher]
+poll_seconds = 3
+stable_seconds = 0
+
+[queue]
+max_retries = 7
+"""
+    config_path.write_bytes(custom_config)
+
+    build_vault(tmp_path)
+
+    assert config_path.read_bytes() == custom_config
+    assert Config.load(config_path) == Config(
+        vault=tmp_path.resolve(),
+        compiler="codex",
+        poll_seconds=3.0,
+        stable_seconds=0.0,
+        max_retries=7,
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "field"),
+    [
+        ('provider = "claude"\n', "", "compiler.provider"),
+        ('provider = "claude"', 'provider = " "', "compiler.provider"),
+        (
+            "[watcher]\npoll_seconds = 2.0\nstable_seconds = 5.0\n\n",
+            "",
+            "watcher.poll_seconds",
+        ),
+        ("poll_seconds = 2.0", 'poll_seconds = "2.0"', "watcher.poll_seconds"),
+        ("poll_seconds = 2.0", "poll_seconds = true", "watcher.poll_seconds"),
+        ("poll_seconds = 2.0", "poll_seconds = 0", "watcher.poll_seconds"),
+        ("poll_seconds = 2.0", "poll_seconds = nan", "watcher.poll_seconds"),
+        ("stable_seconds = 5.0\n", "", "watcher.stable_seconds"),
+        ("stable_seconds = 5.0", "stable_seconds = true", "watcher.stable_seconds"),
+        ("stable_seconds = 5.0", "stable_seconds = -1", "watcher.stable_seconds"),
+        ("stable_seconds = 5.0", "stable_seconds = nan", "watcher.stable_seconds"),
+        ("[queue]\nmax_retries = 3\n", "", "queue.max_retries"),
+        ("max_retries = 3", "max_retries = 0", "queue.max_retries"),
+        ("max_retries = 3", "max_retries = true", "queue.max_retries"),
+        ("max_retries = 3", "max_retries = 3.0", "queue.max_retries"),
+    ],
+)
+def test_config_load_rejects_invalid_required_fields(tmp_path, old, new, field):
+    config_path = tmp_path / "80_system" / "config.toml"
+    config_path.parent.mkdir()
+    config_path.write_text(VALID_CONFIG.replace(old, new), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=re.escape(field)):
+        Config.load(config_path)
 
 
 def test_vault_paths_exposes_approved_roots(tmp_path):

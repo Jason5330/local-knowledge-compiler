@@ -41,7 +41,11 @@ def build_vault(root: Path) -> VaultPaths:
             (source_root / category).mkdir(exist_ok=True)
     paths.queue.mkdir(parents=True, exist_ok=True)
     paths.staging.mkdir(parents=True, exist_ok=True)
-    paths.config.write_text(DEFAULT_CONFIG, encoding="utf-8")
+    try:
+        with paths.config.open("x", encoding="utf-8") as config_file:
+            config_file.write(DEFAULT_CONFIG)
+    except FileExistsError:
+        pass
     return paths
 
 
