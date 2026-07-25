@@ -12,6 +12,7 @@ from .config import Config
 from .ingest import IngestService
 from .paths import VaultPaths
 from .queue import DiskQueue
+from .query import QueryService, write_packet
 from .watcher import StableTracker
 
 
@@ -85,6 +86,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     once_parser.add_argument("vault", type=Path)
     once_parser.add_argument("path", type=Path)
     once_parser.add_argument("--space", default="unclassified")
+    prepare_parser = subcommands.add_parser("prepare", help="prepare a grounded local evidence packet")
+    prepare_parser.add_argument("question")
+    prepare_parser.add_argument("--vault", type=Path, default=Path.cwd())
+    prepare_parser.add_argument("--space", action="append", default=[])
+    prepare_parser.add_argument("--output", type=Path, default=Path(".kb/last-packet.json"))
     arguments = parser.parse_args(argv)
 
     if arguments.command == "init":
@@ -95,6 +101,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     paths = VaultPaths(arguments.vault.resolve())
     try:
         config = Config.load(paths.config)
+        if arguments.command == "prepare":
+            catalog = Catalog(paths.index / "catalog.sqlite3")
+            catalog.initialize()
+            spaces = arguments.space or ["unclassified"]
+            packet = QueryService(catalog, vault=paths, queue=DiskQueue(paths.queue, config.max_retries)).prepare(
+                arguments.question, spaces
+            )
+            print(write_packet(paths, packet, arguments.output))
+            return 0
         if arguments.command == "ingest-once":
             queue = DiskQueue(paths.queue, config.max_retries)
             service = IngestService(paths, queue, Catalog(paths.index / "catalog.sqlite3"))
