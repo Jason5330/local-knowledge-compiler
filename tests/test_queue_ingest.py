@@ -111,6 +111,20 @@ def test_disk_queue_lists_valid_jobs_stably_and_finds_active_source(tmp_path):
     assert queue.active_for_source("C:/inbox/a.txt").job_id == "a"
 
 
+def test_disk_queue_bounded_scan_stops_at_total_byte_budget(tmp_path):
+    from local_kb.queue import DiskQueue
+
+    queue = DiskQueue(tmp_path / "queue")
+    for number in range(5):
+        job = queue.enqueue(tmp_path / f"source-{number}.txt", job_id=f"job-{number}")
+        queue.update(job.job_id, lambda current: current.metadata.update(payload="x" * 1000))
+
+    jobs, truncated = queue.iter_jobs_bounded(100, max_bytes=2500)
+
+    assert truncated is True
+    assert 0 < len(jobs) < 5
+
+
 def test_stable_tracker_requires_two_matching_observations_and_elapsed_time(tmp_path):
     from local_kb.watcher import StableTracker
 

@@ -19,6 +19,8 @@ from .models import Job, JobState
 _JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _JOB_STATES = frozenset(get_args(JobState))
 MAX_JOB_BYTES = 4 * 1024 * 1024
+MAX_QUEUE_BATCH_BYTES = 64 * 1024 * 1024
+DEFAULT_QUEUE_BATCH_BYTES = 16 * 1024 * 1024
 
 
 def _bounded_json(value: object) -> str:
@@ -81,12 +83,15 @@ class DiskQueue:
         with self._locked():
             return [self._read(path) for path in sorted(self.root.glob("*.json"))]
 
-    def iter_jobs_bounded(self, max_jobs: int) -> tuple[list[Job], bool]:
+    def iter_jobs_bounded(self, max_jobs: int, max_bytes: int = DEFAULT_QUEUE_BATCH_BYTES) -> tuple[list[Job], bool]:
         if isinstance(max_jobs, bool) or not isinstance(max_jobs, int) or max_jobs < 1:
             raise ValueError("max_jobs must be a positive integer")
+        if (isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
+                or not 1 <= max_bytes <= MAX_QUEUE_BATCH_BYTES):
+            raise ValueError("max_bytes must be a positive bounded integer")
         with self._locked():
             paths: list[Path] = []
-            scanned=0
+            scanned=0; selected_bytes=0
             with os.scandir(self.root) as entries:
                 for entry in entries:
                     scanned += 1
@@ -94,9 +99,18 @@ class DiskQueue:
                         return [self._read(path) for path in sorted(paths)], True
                     if not entry.name.endswith(".json"):
                         continue
+                    try:
+                        info=entry.stat(follow_symlinks=False)
+                    except OSError:
+                        return [self._read(path) for path in sorted(paths)], True
+                    if not stat.S_ISREG(info.st_mode) or entry.is_symlink():
+                        return [self._read(path) for path in sorted(paths)], True
+                    if selected_bytes + info.st_size > max_bytes:
+                        return [self._read(path) for path in sorted(paths)], True
                     if len(paths) >= max_jobs:
                         return [self._read(path) for path in sorted(paths)], True
                     paths.append(Path(entry.path))
+                    selected_bytes += info.st_size
             return [self._read(path) for path in sorted(paths)], False
 
     def active_for_source(self, source_path: Path | str) -> Job | None:
