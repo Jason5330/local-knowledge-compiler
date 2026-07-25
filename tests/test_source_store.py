@@ -724,3 +724,100 @@ def test_posix_binding_change_after_publish_preserves_recoverable_version(
     assert (recovered / "manifest.json").is_file()
     assert source_dir.is_symlink()
     assert list(outside.iterdir()) == []
+
+
+def test_posix_cleanup_uses_original_stage_fd_and_preserves_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_kb import source_store
+
+    class FakeStat:
+        def __init__(self, inode: int) -> None:
+            self.st_dev = 1
+            self.st_ino = inode
+            self.st_mode = source_store.stat.S_IFDIR
+
+    unlinked: list[tuple[str, int | None]] = []
+    removed: list[tuple[str, int | None]] = []
+    replacement = {
+        "payload.txt": b"replacement payload",
+        "manifest.json": b"replacement manifest",
+    }
+    monkeypatch.setattr(
+        source_store,
+        "_posix_fstat",
+        lambda descriptor: FakeStat(100),
+    )
+    monkeypatch.setattr(
+        source_store,
+        "_posix_stat_at",
+        lambda component, *, dir_fd, follow_symlinks: FakeStat(200),
+    )
+    monkeypatch.setattr(
+        source_store.os,
+        "unlink",
+        lambda name, *, dir_fd: unlinked.append((name, dir_fd)),
+    )
+    monkeypatch.setattr(
+        source_store.os,
+        "rmdir",
+        lambda name, *, dir_fd: removed.append((name, dir_fd)),
+    )
+
+    source_store.SourceStore._cleanup_posix_stage(
+        73,
+        41,
+        ".ver_stage.tmp-race",
+        ("payload.txt", "manifest.json"),
+    )
+
+    assert unlinked == [
+        ("payload.txt", 73),
+        ("manifest.json", 73),
+    ]
+    assert removed == []
+    assert replacement == {
+        "payload.txt": b"replacement payload",
+        "manifest.json": b"replacement manifest",
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX dir_fd semantics")
+def test_posix_cleanup_does_not_delete_replacement_stage_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb.source_store import SourceStore
+
+    raw_root = tmp_path / "10_raw"
+    incoming = write_file(tmp_path / "payload.txt", b"owned payload")
+    digest = hashlib.sha256(b"owned payload").hexdigest()
+    source_id = f"src_{digest[:16]}"
+    source_dir = raw_root / "work" / source_id
+    moved_stage: Path | None = None
+    replacement_payload = b"someone else's payload"
+    replacement_manifest = b"someone else's manifest"
+    store = SourceStore(raw_root)
+    original_copy = store._copy_posix_file
+
+    def race_cleanup(*args, **kwargs) -> None:
+        nonlocal moved_stage
+        original_copy(*args, **kwargs)
+        stage = next(source_dir.glob(".ver_*.tmp-*"))
+        moved_stage = stage.with_name(f"{stage.name}.moved")
+        stage.rename(moved_stage)
+        stage.mkdir()
+        (stage / "payload.txt").write_bytes(replacement_payload)
+        (stage / "manifest.json").write_bytes(replacement_manifest)
+        raise OSError("injected failure after stage replacement")
+
+    monkeypatch.setattr(store, "_copy_posix_file", race_cleanup)
+
+    with pytest.raises(OSError, match="injected failure"):
+        store.archive(incoming, "work")
+
+    replacement_stage = next(source_dir.glob(".ver_*.tmp-*"))
+    assert (replacement_stage / "payload.txt").read_bytes() == replacement_payload
+    assert (replacement_stage / "manifest.json").read_bytes() == replacement_manifest
+    assert moved_stage is not None
+    assert moved_stage.is_dir()
+    assert list(moved_stage.iterdir()) == []
