@@ -397,7 +397,8 @@ class QueryService:
         # always listed first and is never relabelled as original evidence.
         if self.vault is not None and has_searchable_terms(checked_question):
             derived, wiki_scan_truncated, warnings = _safe_read_wiki(self.catalog, self.vault, checked_question, checked_spaces)
-            evidence = (evidence[:limit - 1] + derived[:1]) if limit >= 2 and derived else evidence[:limit]
+            wiki_quota = min(5, limit - 1)
+            evidence = (evidence[:limit - wiki_quota] + derived[:wiki_quota]) if limit >= 2 and derived else evidence[:limit]
         else:
             warnings = []
             evidence = evidence[:limit]

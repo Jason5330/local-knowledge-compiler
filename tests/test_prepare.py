@@ -310,6 +310,25 @@ def test_prepare_keeps_derived_wiki_when_raw_hits_fill_limit(tmp_path):
     assert any(item["kind"] == "derived_wiki" for item in evidence)
 
 
+def test_wiki_expansion_is_same_space_bounded_and_lower_than_direct(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.query import QueryService
+    vault = build_vault(tmp_path / "vault"); catalog = Catalog(vault.index / "catalog.sqlite3"); catalog.initialize()
+    for number in range(6):
+        source_id = f"src-expand-{number}"; version = f"ver-expand-{number}"
+        raw = vault.root / f"10_raw/work/{source_id}/{version}/a.txt"; raw.parent.mkdir(parents=True); raw.write_text("x", encoding="utf-8")
+        catalog.upsert_source(_source(source_id=source_id, version_id=version, space="work", name="a.txt", digest=f"{number+1:x}"), [("line:1", "decision evidence")])
+    (vault.wiki / "work" / "direct.md").write_text("---\nid: \"direct\"\ntitle: \"decision route\"\ntype: \"decision\"\nspace: \"work\"\nsource_ids:\n  - \"src-expand-0\"\n---\n\n## Current State\n\ndirect state\n", encoding="utf-8")
+    for number in range(1, 6):
+        (vault.wiki / "work" / f"x{number}.md").write_text(f"---\ntitle: \"x{number}\"\nspace: \"work\"\nsource_ids:\n  - \"src-expand-0\"\nrelated:\n  - \"direct\"\n---\n\n## Current State\n\ncontext\n", encoding="utf-8")
+    packet = QueryService(catalog, vault=vault).prepare("decision route", {"work"})
+    wiki = [item for item in packet["evidence"] if item["kind"] == "derived_wiki"]
+    assert wiki[0]["match_kind"] == "direct"
+    assert len([item for item in wiki if item["match_kind"] == "expanded"]) == 4
+    assert all(item["score"] < wiki[0]["score"] for item in wiki[1:])
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX fd-relative open race test")
 def test_prepare_wiki_parent_replacement_cannot_redirect_pinned_read(tmp_path, monkeypatch):
     from contextlib import contextmanager
