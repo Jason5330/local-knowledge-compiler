@@ -55,6 +55,16 @@ class Catalog:
             migration_counts: tuple[int, int] | None = None
             if sources_exist is not None and current_version < self.SCHEMA_VERSION:
                 migration_counts = self._stage_legacy_catalog(connection)
+                self._validate_catalog_lineage(connection)
+                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise RuntimeError("legacy catalog foreign key check failed")
+                connection.execute(
+                    """
+                    UPDATE sources
+                    SET previous_version_id = NULL
+                    WHERE previous_version_id IS NOT NULL
+                    """
+                )
                 self._drop_schema(connection)
             connection.execute(
                 """

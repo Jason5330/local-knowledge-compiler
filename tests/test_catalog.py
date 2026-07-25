@@ -97,6 +97,34 @@ def test_initialize_rebuilds_v3_index_for_mixed_script_ngrams(tmp_path):
     ]
 
 
+def test_v3_to_v4_migration_preserves_self_fk_lineage(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(
+        make_source(version_id="old"), [("line:1", "old text")]
+    )
+    catalog.upsert_source(
+        make_source(
+            version_id="new", sha256="b" * 64, previous_version_id="old"
+        ),
+        [("line:1", "new searchable text")],
+    )
+    with catalog.connection() as connection:
+        connection.execute("PRAGMA user_version=3")
+
+    catalog.initialize()
+
+    latest = catalog.latest_source("work", "notes.md")
+    assert latest is not None
+    assert latest.version_id == "new"
+    assert latest.previous_version_id == "old"
+    assert [hit.version_id for hit in catalog.search("searchable", {"work"})] == [
+        "new"
+    ]
+
+
 def test_search_finds_korean_substring_inside_continuous_text(tmp_path):
     from local_kb.catalog import Catalog
 
