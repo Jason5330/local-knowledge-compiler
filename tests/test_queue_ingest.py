@@ -278,7 +278,9 @@ def test_processed_move_before_metadata_failure_recovers_on_retry(tmp_path, monk
     completed = service.process(job.job_id)
     restored = queue.get(job.job_id)
     assert completed.status == "extracted"
-    assert restored.state == "published"
+    assert restored.state == "pending_attention"
+    assert restored.metadata["compiler_status"] == "needs_agent"
+    assert len(list((vault.runtime / "manual").glob("manual_*.json"))) == 1
     assert (vault.root / restored.metadata["processed_path"]).is_file()
     assert catalog.search("transition", {"unclassified"})
 
@@ -503,7 +505,9 @@ def test_processed_publish_rehashes_incoming_after_archive_before_removal(tmp_pa
     assert incoming.read_text(encoding="utf-8") == "B"
     assert (vault.trash / "processed-inbox" / job.job_id / incoming.name).read_text() == "A"
     assert catalog.latest_source("unclassified", incoming.name) is not None
-    assert queue.get(job.job_id).state == "published"
+    completed = queue.get(job.job_id)
+    assert completed.state == "pending_attention"
+    assert completed.metadata["compiler_status"] == "needs_agent"
 
 
 def test_ingest_rejects_untrusted_resume_metadata(tmp_path):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import errno
 import hashlib
@@ -75,6 +75,16 @@ def _safe_compiler_line(value: object, field: str, *, limit: int = 300) -> str:
     return text
 
 
+@dataclass(frozen=True)
+class _CompileOutcome:
+    paths: tuple[str, ...] = ()
+    handoff: dict[str, str] | None = None
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 class IngestService:
     def __init__(
         self,
@@ -97,6 +107,15 @@ class IngestService:
         job = self.queue.get(job_id)
         try:
             self.catalog.initialize()
+            if job.state == "pending_attention" and job.metadata.get("compiler_status") == "needs_agent":
+                # A manual handoff is deliberately terminal for normal ingest.
+                # Only resume_compilation() may request another model attempt.
+                self._validate_pending_compiler_metadata(job)
+                source = self._source_for(job)
+                extraction = job.metadata.get("extraction")
+                if source is None or not isinstance(extraction, dict) or not self._valid_extraction(extraction):
+                    raise ValueError("pending compiler job is incomplete")
+                return replace(source, status=extraction["status"])
             job = self._claim(job)
             source = self._source_for(job)
             if source is None:
@@ -104,13 +123,24 @@ class IngestService:
                 job = self.queue.get(job_id)
             extraction = self._extraction_for(job, source)
             final = replace(source, status=extraction["status"])
-            if final.status == "extracted":
-                self.compile_extraction(final, extraction)
             fragments = [(item["locator"], item["text"]) for item in extraction["fragments"]]
             self._write_cache(final, extraction)
             processed = self._move_processed(self.queue.get(job_id), final)
             self._mark(job_id, "validated", source=asdict(final), processed_path=str(processed.relative_to(self.vault.root)))
             self.catalog.upsert_source(final, fragments)
+            self._cleanup_claim_staging(job_id)
+            outcome = _CompileOutcome()
+            if final.status == "extracted":
+                outcome = self._compile_extraction_outcome(final, extraction)
+                if outcome.handoff is not None:
+                    self._record_compiler_handoff(job_id, outcome.handoff)
+            if outcome.handoff is not None:
+                self._mark_compiler_pending(
+                    job_id,
+                    final,
+                    processed.relative_to(self.vault.root).as_posix(),
+                )
+                return final
             self._mark(job_id, "published", source=asdict(final), processed_path=str(processed.relative_to(self.vault.root)))
             return final
         except BaseException as error:
@@ -118,17 +148,23 @@ class IngestService:
             raise
 
     def compile_extraction(self, source: SourceVersion, extraction: dict[str, Any]) -> list[str]:
+        """Public compatibility wrapper: return pages, never a manual handoff path."""
+        return list(self._compile_extraction_outcome(source, extraction).paths)
+
+    def _compile_extraction_outcome(
+        self, source: SourceVersion, extraction: dict[str, Any], *, compiler: Any = None
+    ) -> _CompileOutcome:
         """Validate every model change before opening one all-or-nothing transaction."""
         if source.status != "extracted":
-            return []
+            return _CompileOutcome()
         evidence = self._compiler_evidence(source, extraction)
-        result = self.compiler.compile(evidence)
+        result = (compiler or self.compiler).compile(evidence)
         if isinstance(result, Path):
-            return []
+            return _CompileOutcome(handoff=self._handoff_metadata(result))
         changes = self._validated_compiler_changes(result, source)
         if not changes:
-            return []
-        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            return _CompileOutcome()
+        now = _utc_now()
         pages: list[tuple[str, WikiPage]] = []
         for relative, change in changes:
             pages.append((relative, WikiPage(
@@ -150,7 +186,150 @@ class IngestService:
             transaction.stage(relative, content)
         transaction.publish(lambda _: None)
         transaction.commit_git(f"kb: compile {source.version_id}")
-        return [relative for relative, _ in rendered]
+        return _CompileOutcome(paths=tuple(relative for relative, _ in rendered))
+
+    def resume_compilation(self, job_id: str, *, compiler: Any = None) -> SourceVersion:
+        """Recompile one durable manual handoff without re-ingesting its raw file."""
+        job = self.queue.get(job_id)
+        self._validate_pending_compiler_metadata(job)
+        source = self._source_for(job)
+        if source is None:
+            raise ValueError("pending compiler job is missing its source")
+        extraction = job.metadata.get("extraction")
+        if not isinstance(extraction, dict) or not self._valid_extraction(extraction):
+            raise ValueError("pending compiler job has invalid extraction metadata")
+        final = replace(source, status=extraction["status"])
+        if final.status != "extracted":
+            raise ValueError("pending compiler job has no extracted evidence")
+        outcome = self._compile_extraction_outcome(final, extraction, compiler=compiler)
+        if outcome.handoff is not None:
+            self._record_compiler_handoff(job_id, outcome.handoff)
+            processed_path = self._safe_processed_metadata(job.metadata.get("processed_path"))
+            self._mark_compiler_pending(job_id, final, processed_path)
+            return final
+
+        def complete(current: Job) -> None:
+            self._validate_pending_compiler_metadata(current)
+            current.state = "published"
+            current.error = None
+            current.metadata["source"] = asdict(final)
+            current.metadata["compiler_status"] = "completed"
+            current.metadata["compiler_completed_at"] = _utc_now()
+            current.metadata.pop("compiler_handoff", None)
+
+        self.queue.update(job_id, complete)
+        return final
+
+    def _handoff_metadata(self, handoff: Path) -> dict[str, str]:
+        """Read only a canonical packet created beneath this vault's manual outbox."""
+        candidate = Path(handoff)
+        if not candidate.is_absolute():
+            raise ValueError("compiler handoff must be an absolute vault path")
+        manual_root = self.vault.runtime / "manual"
+        try:
+            self._safe_regular_under(manual_root, candidate)
+            relative = candidate.relative_to(self.vault.root).as_posix()
+        except (OSError, ValueError) as error:
+            raise ValueError("compiler handoff is outside the trusted manual outbox") from error
+        if not re.fullmatch(r"\.kb/manual/manual_[0-9a-f]{32}\.json", relative):
+            raise ValueError("compiler handoff has an unsafe filename")
+        try:
+            packet = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError("compiler handoff packet is unreadable") from error
+        if not isinstance(packet, dict) or packet.get("status") != "needs_agent":
+            raise ValueError("compiler handoff packet is invalid")
+        created_at = packet.get("created_at")
+        reason = packet.get("reason", "manual compilation requested")
+        self._validate_handoff_record({
+            "path": relative,
+            "status": "needs_agent",
+            "created_at": created_at,
+            "reason": reason,
+        })
+        return {
+            "path": relative,
+            "status": "needs_agent",
+            "created_at": created_at,
+            "reason": reason,
+        }
+
+    def _record_compiler_handoff(self, job_id: str, handoff: dict[str, str]) -> None:
+        self._validate_handoff_record(handoff)
+
+        def record(current: Job) -> None:
+            history = current.metadata.get("compiler_handoffs", [])
+            if not isinstance(history, list):
+                raise ValueError("compiler handoff history is invalid")
+            for item in history:
+                self._validate_handoff_record(item)
+            current.metadata["compiler_handoffs"] = [*history, handoff]
+            current.metadata["compiler_handoff"] = handoff["path"]
+            current.metadata["compiler_status"] = "needs_agent"
+            current.metadata["compiler_requested_at"] = handoff["created_at"]
+
+        self.queue.update(job_id, record)
+
+    def _mark_compiler_pending(
+        self, job_id: str, source: SourceVersion, processed_path: str
+    ) -> None:
+        def pending(current: Job) -> None:
+            self._validate_handoff_history(current.metadata)
+            current.state = "pending_attention"
+            current.error = "compiler handoff required"
+            current.metadata["source"] = asdict(source)
+            current.metadata["processed_path"] = processed_path
+            current.metadata["compiler_status"] = "needs_agent"
+
+        self.queue.update(job_id, pending)
+
+    def _validate_pending_compiler_metadata(self, job: Job) -> None:
+        if job.state != "pending_attention" or job.metadata.get("compiler_status") != "needs_agent":
+            raise ValueError("job is not awaiting a compiler handoff")
+        self._validate_handoff_history(job.metadata)
+        self._safe_processed_metadata(job.metadata.get("processed_path"))
+
+    def _validate_handoff_history(self, metadata: dict[str, object]) -> None:
+        history = metadata.get("compiler_handoffs")
+        latest = metadata.get("compiler_handoff")
+        if not isinstance(history, list) or not history or not isinstance(latest, str):
+            raise ValueError("compiler handoff metadata is invalid")
+        for item in history:
+            self._validate_handoff_record(item)
+        if history[-1]["path"] != latest:
+            raise ValueError("compiler handoff metadata has an inconsistent latest path")
+
+    def _validate_handoff_record(self, item: object) -> None:
+        if not isinstance(item, dict) or set(item) != {"path", "status", "created_at", "reason"}:
+            raise ValueError("compiler handoff metadata is invalid")
+        path = item["path"]
+        if not isinstance(path, str) or re.fullmatch(r"\.kb/manual/manual_[0-9a-f]{32}\.json", path) is None:
+            raise ValueError("compiler handoff path is invalid")
+        candidate = self.vault.root / Path(*PurePosixPath(path).parts)
+        try:
+            self._safe_regular_under(self.vault.runtime / "manual", candidate)
+        except (OSError, ValueError) as error:
+            raise ValueError("compiler handoff path is unsafe") from error
+        if item["status"] != "needs_agent":
+            raise ValueError("compiler handoff status is invalid")
+        created_at = item["created_at"]
+        try:
+            if not isinstance(created_at, str):
+                raise ValueError
+            datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("compiler handoff timestamp is invalid") from error
+        _safe_compiler_line(item["reason"], "handoff reason", limit=500)
+
+    def _safe_processed_metadata(self, value: object) -> str:
+        if not isinstance(value, str) or not value or Path(value).is_absolute():
+            raise ValueError("processed path metadata is invalid")
+        candidate = self.vault.root / value
+        try:
+            self._safe_regular_under(self.vault.trash, candidate)
+        except (OSError, ValueError) as error:
+            raise ValueError("processed path metadata is unsafe") from error
+        return candidate.relative_to(self.vault.root).as_posix()
 
     def _compiler_evidence(self, source: SourceVersion, extraction: dict[str, Any]) -> str:
         if extraction.get("status") != "extracted":
@@ -444,6 +623,26 @@ class IngestService:
             job.metadata.update(metadata)
             job.error = None
         self.queue.update(job_id, apply)
+
+    def _cleanup_claim_staging(self, job_id: str) -> None:
+        """Remove only this now-empty Task 5 claim directory before a Wiki transaction."""
+        job = self.queue.get(job_id)
+        claimed_value = job.metadata.get("claimed_path")
+        if not isinstance(claimed_value, str):
+            return
+        claim = Path(claimed_value)
+        expected = self.vault.staging / job_id
+        if claim.parent != expected:
+            raise ValueError("claimed staging path is invalid")
+        if not expected.exists():
+            return
+        self._safe_directory(expected)
+        try:
+            expected.rmdir()
+        except OSError:
+            # A non-empty directory can contain only an interrupted claim artifact;
+            # leave it for normal recovery rather than deleting unrecognized data.
+            return
 
     def _write_cache(self, source: SourceVersion, extraction: dict[str, Any]) -> None:
         directory = self.vault.index / "cache"

@@ -107,8 +107,9 @@ def test_compile_extraction_publishes_only_valid_current_source_changes(tmp_path
     from local_kb.queue import DiskQueue
 
     class Compiler:
-        def compile(self, _evidence):
-            return {"changes": [_valid_change()]}
+        def compile(self, evidence):
+            source_id = evidence.split(" locator=", 1)[0].removeprefix("source_id=")
+            return {"changes": [_valid_change(source_ids=[source_id])]}
 
     vault = build_vault(tmp_path / "vault")
     service = IngestService(vault, DiskQueue(vault.queue), Catalog(vault.index / "catalog.sqlite3"), compiler=Compiler())
@@ -175,3 +176,135 @@ def test_pending_extractor_never_calls_compiler(tmp_path):
     job = service.queue.enqueue(incoming, job_id="pending")
 
     assert service.process(job.job_id).status == "pending_extractor"
+
+
+def test_default_manual_handoff_finishes_local_ingest_but_leaves_job_pending(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue)
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"))
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("durable local evidence", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="manual-handoff")
+
+    source = service.process(job.job_id, space="work")
+    pending = queue.get(job.job_id)
+
+    assert source.status == "extracted"
+    assert pending.state == "pending_attention"
+    assert pending.metadata["compiler_status"] == "needs_agent"
+    assert pending.metadata["compiler_handoff"].startswith(".kb/manual/manual_")
+    assert len(pending.metadata["compiler_handoffs"]) == 1
+    assert (vault.root / pending.metadata["compiler_handoff"]).is_file()
+    assert (vault.index / "cache" / f"{source.version_id}.json").is_file()
+    assert service.catalog.search("durable", {"work"})
+
+
+def test_resume_compilation_publishes_only_after_replacement_compiler_succeeds(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    class Compiler:
+        def compile(self, evidence):
+            source_id = evidence.split(" locator=", 1)[0].removeprefix("source_id=")
+            return {"changes": [_valid_change(source_ids=[source_id])]}
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue)
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"))
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("resume evidence", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="resume")
+    service.process(job.job_id, space="work")
+    handoff = queue.get(job.job_id).metadata["compiler_handoff"]
+
+    source = service.resume_compilation(job.job_id, compiler=Compiler())
+    completed = queue.get(job.job_id)
+
+    assert source.status == "extracted"
+    assert completed.state == "published"
+    assert completed.metadata["compiler_status"] == "completed"
+    assert "compiler_handoff" not in completed.metadata
+    assert completed.metadata["compiler_handoffs"][0]["path"] == handoff
+    assert (vault.wiki / "work" / "testing.md").is_file()
+
+
+def test_resume_compilation_keeps_pending_and_appends_history_on_new_handoff(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue)
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"))
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("retry manual", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="retry-manual")
+    service.process(job.job_id)
+    first = queue.get(job.job_id).metadata["compiler_handoff"]
+
+    service.resume_compilation(job.job_id)
+    pending = queue.get(job.job_id)
+
+    assert pending.state == "pending_attention"
+    assert pending.metadata["compiler_status"] == "needs_agent"
+    assert len(pending.metadata["compiler_handoffs"]) == 2
+    assert pending.metadata["compiler_handoff"] != first
+    assert (vault.root / pending.metadata["compiler_handoff"]).is_file()
+
+
+def test_process_does_not_recreate_handoff_for_an_already_pending_job(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue)
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"))
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("no duplicate handoff", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="no-duplicate")
+    service.process(job.job_id)
+    first = queue.get(job.job_id).metadata["compiler_handoff"]
+
+    service.process(job.job_id)
+    pending = queue.get(job.job_id)
+
+    assert pending.state == "pending_attention"
+    assert pending.metadata["compiler_handoff"] == first
+    assert len(pending.metadata["compiler_handoffs"]) == 1
+
+
+def test_resume_compilation_fails_closed_for_forged_handoff_metadata(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue)
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"))
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("safe evidence", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="forged-handoff")
+    service.process(job.job_id)
+    queue.update(job.job_id, lambda current: current.metadata.update(compiler_handoff="../outside.json"))
+
+    with pytest.raises(ValueError, match="handoff"):
+        service.resume_compilation(job.job_id)
+
+
+def test_claude_prompt_instruction_constant_is_readable_and_local_only():
+    from local_kb.compiler import CLAUDE_PROMPT_INSTRUCTIONS
+
+    assert "Use only the following local evidence" in CLAUDE_PROMPT_INSTRUCTIONS
+    assert "Do not browse the web" in CLAUDE_PROMPT_INSTRUCTIONS
+    assert "source_id" in CLAUDE_PROMPT_INSTRUCTIONS

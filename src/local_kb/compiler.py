@@ -7,6 +7,7 @@ instead of an unverified knowledge-base update.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,16 @@ MAX_PROMPT_CHARS = 600_000
 MAX_OUTPUT_BYTES = 1_000_000
 MAX_CHANGES = 100
 MAX_SOURCE_IDS_PER_CHANGE = 8
+
+# Kept as plain English source text so every terminal can inspect this safety
+# boundary without locale-dependent rendering.  User-facing answers remain
+# Traditional Chinese elsewhere in the system.
+CLAUDE_PROMPT_INSTRUCTIONS = (
+    "Use only the following local evidence to propose Wiki changes. "
+    "Do not browse the web and do not add model background knowledge. "
+    "Every factual claim must preserve its source_id. "
+    "Return an empty changes array when the evidence is insufficient."
+)
 
 _CHANGE_FIELDS = frozenset({
     "path", "title", "type", "space", "confidence", "source_ids",
@@ -105,6 +116,7 @@ class ManualCompiler:
         packet: dict[str, Any] = {
             "schema_version": 1,
             "status": "needs_agent",
+            "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "evidence": evidence,
             "output_schema": _OUTPUT_SCHEMA_DATA,
             "instructions": (
@@ -162,10 +174,7 @@ class ClaudeCompiler:
     def compile(self, evidence: str) -> dict[str, Any] | Path:
         if not isinstance(evidence, str) or len(evidence) > MAX_EVIDENCE_CHARS:
             return self.fallback.compile("", reason="evidence exceeds compiler budget")
-        prompt = (
-            "只根據下列本地證據提出 Wiki 變更。不得上網，不得加入模型常識。"
-            "每項事實必須保留 source_id；若證據不足，回傳空 changes。\n\n" + evidence
-        )
+        prompt = CLAUDE_PROMPT_INSTRUCTIONS + "\n\n" + evidence
         if len(prompt) > MAX_PROMPT_CHARS:
             return self.fallback.compile(evidence, reason="evidence exceeds Claude prompt budget")
         command = [
