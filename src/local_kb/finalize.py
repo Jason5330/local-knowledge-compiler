@@ -125,14 +125,11 @@ def _validate(packet: object, answer: object) -> _ValidatedAnswer:
         raise ValueError("packet contains too much evidence")
 
     allowed: dict[tuple[object, ...], tuple[dict[str, object], tuple[str, ...]]] = {}
-    legacy: dict[str, list[tuple[dict[str, object], tuple[str, ...]]]] = {}
     for item in evidence:
         identity, public, raw_ids = _evidence_identity(item)
         if identity in allowed:
             raise ValueError("packet contains duplicate evidence")
         allowed[identity] = (public, raw_ids)
-        if identity[0] == "legacy":
-            legacy.setdefault(str(identity[1]), []).append((public, raw_ids))
 
     citations = answer.get("citations", [])
     if not isinstance(citations, list):
@@ -144,12 +141,7 @@ def _validate(packet: object, answer: object) -> _ValidatedAnswer:
     seen: set[tuple[object, ...]] = set()
     for citation in citations:
         if isinstance(citation, str):
-            source_id = _safe_id(citation, "citation source_id")
-            choices = legacy.get(source_id, [])
-            if len(choices) != 1:
-                raise ValueError(f"unknown citation: {source_id}")
-            identity = ("legacy", source_id)
-            public, raw_ids = choices[0]
+            raise ValueError("citation requires structured exact provenance")
         elif isinstance(citation, dict):
             identity, public = _citation_identity(citation)
             match = allowed.get(identity)
@@ -183,11 +175,8 @@ def _evidence_identity(item: object) -> tuple[tuple[object, ...], dict[str, obje
     if not isinstance(item, dict):
         raise TypeError("packet evidence item must be an object")
     kind = item.get("kind")
-    if kind in (None, "raw_fragment") and "source_id" in item:
+    if kind == "raw_fragment" and "source_id" in item:
         source_id = _safe_id(item.get("source_id"), "evidence source_id")
-        if "version_id" not in item and "locator" not in item and kind is None:
-            public = {"source_id": source_id}
-            return ("legacy", source_id), public, (source_id,)
         version_id = _safe_id(item.get("version_id"), "evidence version_id")
         locator = _safe_locator(item.get("locator"), "evidence locator")
         digest = _verified_evidence_digest(item)

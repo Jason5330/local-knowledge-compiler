@@ -134,6 +134,9 @@ class IngestService:
                     raise ValueError("pending compiler job is incomplete")
                 return replace(source, status=extraction["status"])
             job = self._claim(job)
+            # The source pathname may have been replaced after the first check.
+            # Re-check the exact pinned file that was claimed before archiving it.
+            self._reject_derived_input(job)
             source = self._source_for(job)
             if source is None:
                 source = self._archive(job, space)
@@ -189,18 +192,25 @@ class IngestService:
                 continue
             try:
                 with self._open_pinned_regular(candidate) as (descriptor, _):
-                    data = os.read(descriptor, _DERIVED_HEADER_BYTES + 1)
+                    chunks = bytearray()
+                    remaining = _DERIVED_HEADER_BYTES + 1
+                    while remaining and (
+                        chunk := os.read(descriptor, min(4_096, remaining))
+                    ):
+                        chunks.extend(chunk)
+                        remaining -= len(chunk)
             except FileNotFoundError:
                 continue
-            if len(data) > _DERIVED_HEADER_BYTES or not data.startswith(b"---\n"):
-                continue
-            marker = data.find(b"\n---\n", 4)
-            if marker < 0:
-                continue
             try:
-                header = data[4:marker].decode("utf-8")
+                prefix = bytes(chunks).decode("utf-8-sig").replace("\r\n", "\n")
             except UnicodeDecodeError:
                 continue
+            if not prefix.startswith("---\n"):
+                continue
+            marker = prefix.find("\n---\n", 4)
+            if marker < 0:
+                raise ValueError("frontmatter header exceeds safe inspection limit")
+            header = prefix[4:marker]
             if _DERIVED_TYPE.search(header):
                 raise ValueError("derived answer cannot be ingested as a raw source")
 

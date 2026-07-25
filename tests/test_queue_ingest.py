@@ -172,11 +172,65 @@ def test_disk_queue_atomic_update_leaves_complete_json_after_replace_failure(tmp
     def explode(source, target, **_kwargs):
         raise OSError("replace failed")
 
-    monkeypatch.setattr(os, "replace", explode)
+    if os.name == "nt":
+        monkeypatch.setattr(queue, "_windows_replace_open_file", explode)
+    else:
+        monkeypatch.setattr(os, "replace", explode)
     with pytest.raises(OSError, match="replace failed"):
         queue.update("job", lambda current: current)
     assert json.loads((tmp_path / "queue" / "job.json").read_text(encoding="utf-8")) == json.loads(before)
     assert not list((tmp_path / "queue").glob("*.tmp"))
+
+
+def test_disk_queue_rejects_temp_substitution_before_replace(tmp_path, monkeypatch):
+    from local_kb.queue import DiskQueue
+
+    queue = DiskQueue(tmp_path / "queue")
+    source = tmp_path / "source.txt"
+    source.write_text("safe", encoding="utf-8")
+    original_replace = os.replace
+    attacked = False
+
+    def substitute_then_replace(source_name, target_name, **kwargs):
+        nonlocal attacked
+        if not attacked and Path(target_name).name == "victim.json":
+            attacked = True
+            source_fd = kwargs.get("src_dir_fd")
+            if source_fd is None:
+                temporary = Path(source_name)
+                payload = json.loads(temporary.read_text(encoding="utf-8"))
+                temporary.unlink()
+                payload["metadata"]["attacker"] = "evil"
+                temporary.write_text(json.dumps(payload), encoding="utf-8")
+            else:
+                descriptor = os.open(source_name, os.O_RDONLY, dir_fd=source_fd)
+                try:
+                    payload = json.loads(
+                        os.read(descriptor, 4 * 1024 * 1024).decode("utf-8")
+                    )
+                finally:
+                    os.close(descriptor)
+                os.unlink(source_name, dir_fd=source_fd)
+                payload["metadata"]["attacker"] = "evil"
+                descriptor = os.open(
+                    source_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=source_fd,
+                )
+                try:
+                    os.write(descriptor, json.dumps(payload).encode("utf-8"))
+                finally:
+                    os.close(descriptor)
+        return original_replace(source_name, target_name, **kwargs)
+
+    monkeypatch.setattr(os, "replace", substitute_then_replace)
+    try:
+        queue.enqueue(source, job_id="victim")
+    except (OSError, ValueError):
+        assert attacked is True
+    else:
+        assert queue.get("victim").metadata.get("attacker") is None
 
 
 def test_disk_queue_does_not_lose_concurrent_process_failure_attempts(tmp_path):

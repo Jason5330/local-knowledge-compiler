@@ -271,28 +271,51 @@ class DiskQueue:
     def _write(self, path: Path, job: Job) -> None:
         self._validate_job(job, path.name)
         payload = _bounded_json(job.to_dict())
+        encoded = payload.encode("utf-8")
         temporary_name = f".{path.name}.{uuid4().hex}.tmp"
         temporary = self.root / temporary_name
+        descriptor: int | None = None
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
             flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-            descriptor = self._open_entry(temporary_name, flags, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            if os.name == "nt":
-                os.replace(temporary, path)
-            else:
-                root_fd = self._require_root_descriptor()
-                os.replace(
-                    temporary_name,
-                    path.name,
-                    src_dir_fd=root_fd,
-                    dst_dir_fd=root_fd,
-                )
+            descriptor = self._open_temporary(temporary_name, flags, 0o600)
+            offset = 0
+            while offset < len(encoded):
+                offset += os.write(descriptor, encoded[offset:])
+            os.fsync(descriptor)
+            opened = os.fstat(descriptor)
+            identity = (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+            )
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if self._read_descriptor(descriptor, len(encoded) + 1) != encoded:
+                raise ValueError("queue temporary payload changed before publish")
+            try:
+                if os.name == "nt":
+                    self._windows_replace_open_file(descriptor, path)
+                else:
+                    root_fd = self._require_root_descriptor()
+                    os.replace(
+                        temporary_name,
+                        path.name,
+                        src_dir_fd=root_fd,
+                        dst_dir_fd=root_fd,
+                    )
+            except OSError:
+                if not self._published_descriptor_matches(
+                    descriptor, path.name, identity, encoded
+                ):
+                    raise
+            if not self._published_descriptor_matches(
+                descriptor, path.name, identity, encoded
+            ):
+                raise ValueError("queue publish does not match temporary payload")
             self._sync_directory()
         finally:
+            if descriptor is not None:
+                os.close(descriptor)
             try:
                 if os.name == "nt":
                     temporary.unlink(missing_ok=True)
@@ -305,6 +328,124 @@ class DiskQueue:
                 pass
             except OSError:
                 pass
+
+    @staticmethod
+    def _read_descriptor(descriptor: int, limit: int) -> bytes:
+        chunks: list[bytes] = []
+        remaining = limit
+        while remaining and (chunk := os.read(descriptor, min(65_536, remaining))):
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _published_descriptor_matches(
+        self,
+        descriptor: int,
+        name: str,
+        identity: tuple[int, int, int],
+        expected: bytes,
+    ) -> bool:
+        try:
+            info = self._entry_stat(name)
+            current = (info.st_dev, info.st_ino, info.st_size)
+            if current != identity or not stat.S_ISREG(info.st_mode):
+                return False
+            opened = os.fstat(descriptor)
+            if (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+            ) != identity:
+                return False
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            return self._read_descriptor(descriptor, len(expected) + 1) == expected
+        except (OSError, ValueError):
+            return False
+
+    def _open_temporary(self, name: str, flags: int, mode: int) -> int:
+        if os.name != "nt":
+            return self._open_entry(name, flags, mode)
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+
+        candidate = self.root / name
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        handle = kernel32.CreateFileW(
+            str(candidate),
+            0x80000000 | 0x40000000 | 0x00010000,  # read, write, delete
+            0x00000001 | 0x00000002,  # share read/write, never delete
+            None,
+            1,  # CREATE_NEW
+            0x00000080 | 0x00200000,  # normal + open reparse point
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            descriptor = msvcrt.open_osfhandle(
+                int(handle), os.O_RDWR | getattr(os, "O_BINARY", 0)
+            )
+        except BaseException:
+            _windows_close_handle(int(handle))
+            raise
+        try:
+            opened = os.fstat(descriptor)
+            current = os.lstat(candidate)
+            reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or getattr(current, "st_file_attributes", 0) & reparse
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            ):
+                raise ValueError("queue temporary entry is unsafe")
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _windows_replace_open_file(descriptor: int, target: Path) -> None:
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+
+        class FileRenameInformation(ctypes.Structure):
+            _fields_ = [
+                ("flags", wintypes.DWORD),
+                ("root_directory", wintypes.HANDLE),
+                ("file_name_length", wintypes.DWORD),
+                ("file_name", wintypes.WCHAR * 1),
+            ]
+
+        encoded = str(target).encode("utf-16-le")
+        offset = FileRenameInformation.file_name.offset
+        buffer = ctypes.create_string_buffer(
+            offset + len(encoded) + ctypes.sizeof(wintypes.WCHAR)
+        )
+        information = ctypes.cast(
+            buffer, ctypes.POINTER(FileRenameInformation)
+        ).contents
+        information.flags = 0x00000001  # FILE_RENAME_FLAG_REPLACE_IF_EXISTS
+        information.root_directory = None
+        information.file_name_length = len(encoded)
+        ctypes.memmove(ctypes.addressof(buffer) + offset, encoded, len(encoded))
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+        ]
+        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+        if not kernel32.SetFileInformationByHandle(
+            msvcrt.get_osfhandle(descriptor), 3, buffer, len(buffer)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
 
     def _sync_directory(self) -> None:
         if os.name == "nt":

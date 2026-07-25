@@ -58,10 +58,29 @@ def _answer(citations=None) -> dict:
 def test_finalize_rejects_unknown_source(tmp_path):
     from local_kb.finalize import finalize_answer
 
-    packet = {"question": "Q", "evidence": [{"source_id": "src_ok"}]}
-    answer = {"conclusion": "A", "citations": ["src_missing"], "confidence": "high"}
+    packet = _packet()
+    answer = {
+        "conclusion": "A",
+        "citations": [{
+            "source_id": "src-missing",
+            "version_id": "ver-1",
+            "locator": "line:7",
+            "evidence_sha256": packet["evidence"][0]["evidence_sha256"],
+        }],
+        "confidence": "high",
+    }
 
     with pytest.raises(ValueError, match="unknown citation"):
+        finalize_answer(tmp_path, packet, answer)
+
+
+def test_finalize_rejects_legacy_source_only_provenance(tmp_path):
+    from local_kb.finalize import finalize_answer
+
+    packet = {"question": "Q", "evidence": [{"source_id": "src_ok"}]}
+    answer = {"conclusion": "A", "citations": ["src_ok"], "confidence": "high"}
+
+    with pytest.raises(ValueError, match="provenance|citation"):
         finalize_answer(tmp_path, packet, answer)
 
 
@@ -466,3 +485,77 @@ def test_ingest_rejects_copied_derived_marker_without_moving_or_indexing_it(tmp_
     assert copied.is_file()
     catalog.initialize()
     assert catalog.search("採用", {"work"}) == []
+
+
+def test_ingest_rejects_derived_copy_larger_than_marker_sniff_budget(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.finalize import finalize_answer
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path)
+    generated = finalize_answer(
+        vault, _packet(), dict(_answer(), conclusion="長答案" * 4_000)
+    )
+    copied = vault.inbox / "long-answer.md"
+    copied.write_bytes(generated.read_bytes())
+    queue = DiskQueue(vault.queue)
+    job = queue.enqueue(copied, job_id="derived-long")
+    catalog = Catalog(vault.index / "catalog.sqlite3")
+
+    with pytest.raises(ValueError, match="derived answer"):
+        IngestService(vault, queue, catalog).process(job.job_id, space="work")
+    assert copied.is_file()
+    catalog.initialize()
+    assert catalog.search("長答案", {"work"}) == []
+
+
+def test_ingest_rejects_bom_crlf_derived_frontmatter(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.finalize import finalize_answer
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path)
+    generated = finalize_answer(vault, _packet(), _answer())
+    copied = vault.inbox / "bom-answer.md"
+    copied.write_bytes(b"\xef\xbb\xbf" + generated.read_bytes().replace(b"\n", b"\r\n"))
+    queue = DiskQueue(vault.queue)
+    job = queue.enqueue(copied, job_id="derived-bom")
+
+    with pytest.raises(ValueError, match="derived answer"):
+        IngestService(
+            vault, queue, Catalog(vault.index / "catalog.sqlite3")
+        ).process(job.job_id, space="work")
+    assert copied.is_file()
+
+
+def test_ingest_rechecks_claimed_identity_after_source_replacement(tmp_path, monkeypatch):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.finalize import finalize_answer
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path)
+    generated = finalize_answer(vault, _packet(), _answer())
+    incoming = vault.inbox / "race.md"
+    incoming.write_text("ordinary note", encoding="utf-8")
+    queue = DiskQueue(vault.queue)
+    job = queue.enqueue(incoming, job_id="derived-race")
+    catalog = Catalog(vault.index / "catalog.sqlite3")
+    service = IngestService(vault, queue, catalog)
+    original_claim = service._claim
+
+    def replace_then_claim(current):
+        incoming.write_bytes(generated.read_bytes())
+        return original_claim(current)
+
+    monkeypatch.setattr(service, "_claim", replace_then_claim)
+    with pytest.raises(ValueError, match="derived answer"):
+        service.process(job.job_id, space="work")
+    catalog.initialize()
+    assert catalog.search("採用", {"work"}) == []
+    assert list(vault.raw.rglob("race.md")) == []
