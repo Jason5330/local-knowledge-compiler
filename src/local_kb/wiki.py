@@ -69,20 +69,15 @@ def _validate_body(value: str, label: str) -> None:
     if (not isinstance(value, str) or not value.strip()
             or any((ord(char) < 32 and char not in {"\t", "\n"}) or ord(char) == 127 for char in value)):
         raise ValueError(f"{label} must be non-empty safe text")
+    if re.search(r"<h2\b[^>]*>.*?</h2\s*>", value, re.IGNORECASE | re.DOTALL):
+        raise ValueError(f"{label} may not contain a reserved H2 heading")
     lines = value.splitlines()
-    reserved = {heading.casefold() for heading in _HEADINGS}
     for index, line in enumerate(lines):
-        plain: str | None = None
-        atx = re.fullmatch(r" {0,3}##[ \t]+(.+?)(?:[ \t]+#+[ \t]*)?", line)
-        html = re.fullmatch(r"\s*<h2(?:\s[^>]*)?>(.*?)</h2>\s*", line, re.IGNORECASE)
-        if atx:
-            plain = atx.group(1)
-        elif html:
-            plain = re.sub(r"<[^>]+>", "", html.group(1))
-        elif index and re.fullmatch(r" {0,3}-{3,}\s*", line):
-            plain = lines[index - 1].strip()
-        if plain is not None and re.sub(r"\s+", " ", plain.strip()).casefold() in reserved:
-            raise ValueError(f"{label} may not inject a reserved section heading")
+        candidate = re.sub(r"^(?: {0,3}(?:>\s*|[-+*]\s+|\d+[.)]\s+))+", "", line)
+        if re.match(r"^ {0,3}##(?:[ \t]+|$)", candidate):
+            raise ValueError(f"{label} may not contain a reserved H2 heading")
+        if index and lines[index - 1].strip() and re.fullmatch(r" {0,3}-{3,}[ \t]*", candidate):
+            raise ValueError(f"{label} may not contain a reserved H2 heading")
 
 
 def _validate_timestamp(value: str) -> None:

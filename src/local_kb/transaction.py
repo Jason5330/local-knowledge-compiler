@@ -140,6 +140,16 @@ def _recover_journal(vault: Path, journal: Path) -> None:
                 if (_is_reparse(candidate) or not stat.S_ISREG(info.st_mode) or info.st_nlink not in links
                         or not isinstance(expected, dict) or _fingerprint(candidate) != expected):
                     raise RuntimeError("corrupt transaction journal file")
+        requires_owned_target = backup.exists() or not bool(item["existed"])
+        if requires_owned_target and target.exists():
+            same_binding = os.path.samefile(target, new_path)
+            target_fp = _fingerprint(target)
+            expected_fp = item.get("new_fingerprint")
+            same_bytes = (isinstance(expected_fp, dict)
+                          and target_fp["sha256"] == expected_fp.get("sha256")
+                          and target_fp["size"] == expected_fp.get("size"))
+            if not (same_binding or same_bytes):
+                raise ConflictError(f"recovery target conflict: {item['relative']}")
         validated.append((item, target, new_path, backup))
     created = manifest.get("created_live_dirs", [])
     if not isinstance(created, list) or any(not isinstance(value, dict) for value in created):
@@ -169,14 +179,6 @@ def _recover_journal(vault: Path, journal: Path) -> None:
                 os.replace(backup, target)
                 _fsync_file(target); _fsync_dir(target.parent)
             elif not bool(item["existed"]) and target.exists():
-                same_binding = new_path.exists() and os.path.samefile(target, new_path)
-                target_fp = _fingerprint(target)
-                expected_fp = item.get("new_fingerprint")
-                same_bytes = (isinstance(expected_fp, dict)
-                              and target_fp["sha256"] == expected_fp.get("sha256")
-                              and target_fp["size"] == expected_fp.get("size"))
-                if not (same_binding or same_bytes):
-                    raise ConflictError(f"recovery target conflict: {item['relative']}")
                 target.unlink(); _fsync_dir(target.parent)
         for created_item in reversed(created):
             relative = str(created_item["relative"])
@@ -514,6 +516,8 @@ class ChangeTransaction:
                                 os.chmod(target, int(base["mode"]))
                                 os.utime(target, ns=(target.stat().st_atime_ns, int(base["mtime_ns"])))
                 except BaseException as recovery_error:
+                    if isinstance(recovery_error, ConflictError):
+                        raise recovery_error from original
                     raise RollbackError(original, [recovery_error]) from original
                 raise
             cleanup_error: OSError | None = None

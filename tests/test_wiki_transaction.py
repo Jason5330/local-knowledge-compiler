@@ -64,6 +64,20 @@ def test_reserved_h2_commonmark_variants(body: str) -> None:
             render_page(page(current_state=body))
 
 
+@pytest.mark.parametrize("body", [
+    "## **Arbitrary**", "  ## [Link](https://example.test)", "Title\n---",
+    "<H2 class='x'>anything</H2>", "<h2 class='x'>\nmultiline\n</H2>",
+    "> ## nested", "- ## listed",
+])
+def test_body_rejects_every_h2_variant(body: str) -> None:
+    with pytest.raises(ValueError, match="H2"):
+        render_page(page(current_state=body))
+
+
+def test_body_keeps_regular_markdown_and_h3() -> None:
+    render_page(page(current_state="**bold** and [link](https://example.test)\n\n### H3 is fine"))
+
+
 @pytest.mark.parametrize("changes", [
     {"source_ids": ()}, {"source_ids": ("source-1", "source-1")},
     {"source_ids": ("bad\nsource",)}, {"title": "bad\ntitle"},
