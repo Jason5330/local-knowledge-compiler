@@ -12,6 +12,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import subprocess
 from typing import Any
 from uuid import uuid4
 
@@ -363,13 +364,46 @@ class IngestService:
                 except (OSError, ValueError) as error:
                     raise ValueError("compilation receipt live target is unsafe") from error
             changed.append(page)
-        if changed:
+        if validated["pages"]:
             transaction = ChangeTransaction(self.vault.root)
             for page in changed:
                 transaction.stage(page["path"], page["content"])
             transaction.publish(lambda _: None)
             transaction.commit_git(f"kb: compile {source.version_id}")
+            self._verify_receipt_git_head(validated)
         return paths
+
+    def _verify_receipt_git_head(self, receipt: dict[str, Any]) -> None:
+        """Require every receipt page to be an exact tracked blob in Git HEAD."""
+        try:
+            if not (self.vault.root / ".git").is_dir():
+                raise RuntimeError("Git HEAD does not exist")
+            top = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=self.vault.root, capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            if Path(top).resolve() != self.vault.root.resolve():
+                raise RuntimeError("Git HEAD belongs to a different repository")
+            subprocess.run(
+                ["git", "rev-parse", "--verify", "HEAD"],
+                cwd=self.vault.root, capture_output=True, check=True,
+            )
+            for page in receipt["pages"]:
+                relative = page["path"]
+                committed = subprocess.run(
+                    ["git", "cat-file", "blob", f"HEAD:{relative}"],
+                    cwd=self.vault.root, capture_output=True, check=True,
+                ).stdout
+                if (hashlib.sha256(committed).hexdigest() != page["sha256"]
+                        or committed != page["content"].encode("utf-8")):
+                    raise RuntimeError(
+                        f"Git HEAD does not exactly contain receipt page: {relative}"
+                    )
+        except (OSError, subprocess.CalledProcessError) as error:
+            detail = getattr(error, "stderr", b"")
+            if isinstance(detail, bytes):
+                detail = detail.decode("utf-8", errors="replace")
+            raise RuntimeError(f"Git HEAD cannot verify compilation receipt: {detail or error}") from error
 
     def _complete_compilation(self, job_id: str, source: SourceVersion) -> None:
         def complete(current: Job) -> None:

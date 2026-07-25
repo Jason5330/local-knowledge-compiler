@@ -205,6 +205,16 @@ def test_manual_compiler_writes_complete_unique_no_clobber_handoffs(tmp_path):
     assert packet["output_schema"]["required"] == ["changes"]
 
 
+def test_manual_compiler_single_argument_uses_absolute_outbox_parent_as_trusted_root(tmp_path):
+    from local_kb.compiler import ManualCompiler
+
+    outbox = (tmp_path / "manual").absolute()
+    handoff = ManualCompiler(outbox).compile("single argument evidence")
+
+    assert handoff.parent == outbox
+    assert json.loads(handoff.read_text(encoding="utf-8"))["evidence"] == "single argument evidence"
+
+
 def test_manual_compiler_rejects_posix_symlinked_outbox_ancestor_without_writing_outside(tmp_path):
     if os.name == "nt":
         pytest.skip("POSIX symlink test")
@@ -220,6 +230,8 @@ def test_manual_compiler_rejects_posix_symlinked_outbox_ancestor_without_writing
         ManualCompiler(
             trusted / "redirect" / "manual", trusted_root=trusted,
         ).compile("secret evidence")
+    with pytest.raises((OSError, ValueError), match="safe|link|trusted|directory"):
+        ManualCompiler(trusted / "redirect" / "manual").compile("secret evidence")
     assert list(outside.iterdir()) == []
 
 
@@ -244,6 +256,8 @@ def test_manual_compiler_rejects_windows_junction_without_writing_outside(tmp_pa
         ManualCompiler(
             junction / "manual", trusted_root=trusted,
         ).compile("secret evidence")
+    with pytest.raises((OSError, ValueError), match="safe|reparse|trusted"):
+        ManualCompiler(junction / "manual").compile("secret evidence")
     assert list(outside.iterdir()) == []
 
 
@@ -700,6 +714,9 @@ def test_process_replays_durable_receipt_without_calling_model_after_publish_mar
     monkeypatch.setattr(ChangeTransaction, "commit_git", commit_then_fail_marker)
     with pytest.raises(OSError, match="complete marker"):
         service.process(job.job_id, space="work")
+    first_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=vault.root, text=True, capture_output=True, check=True,
+    ).stdout.strip()
 
     retrying = queue.get(job.job_id)
     assert retrying.metadata["compiler_status"] == "ready"
@@ -713,6 +730,182 @@ def test_process_replays_durable_receipt_without_calling_model_after_publish_mar
     assert completed.metadata["compiler_status"] == "completed"
     assert (vault.wiki / "work" / "first.md").is_file()
     assert not (vault.wiki / "work" / "second.md").exists()
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=vault.root, text=True, capture_output=True, check=True,
+    ).stdout.strip() == first_head
+
+
+def test_process_reconciles_git_after_publish_succeeded_but_first_commit_failed(
+    tmp_path, monkeypatch
+):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+    from local_kb.transaction import ChangeTransaction
+
+    class Compiler:
+        calls = 0
+
+        def compile(self, evidence):
+            self.calls += 1
+            source_id = evidence.split(" locator=", 1)[0].removeprefix("source_id=")
+            return {"changes": [_valid_change(
+                path="20_wiki/work/only.md", title="Only", source_ids=[source_id],
+            )]}
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue, max_retries=5)
+    compiler = Compiler()
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"), compiler=compiler)
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("git reconcile", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="git-reconcile")
+    original_commit = ChangeTransaction.commit_git
+    attempts = 0
+
+    def fail_first_commit(transaction, message):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("simulated git failure")
+        return original_commit(transaction, message)
+
+    monkeypatch.setattr(ChangeTransaction, "commit_git", fail_first_commit)
+    with pytest.raises(RuntimeError, match="simulated git failure"):
+        service.process(job.job_id, space="work")
+    assert (vault.wiki / "work" / "only.md").is_file()
+    assert not (vault.root / ".git").exists()
+    assert list(vault.staging.iterdir()) == []
+
+    service.process(job.job_id, space="work")
+
+    expected = (vault.wiki / "work" / "only.md").read_bytes()
+    committed = subprocess.run(
+        ["git", "show", "HEAD:20_wiki/work/only.md"],
+        cwd=vault.root, capture_output=True, check=True,
+    ).stdout
+    assert committed == expected
+    assert compiler.calls == 1
+    assert attempts == 2
+    assert queue.get(job.job_id).state == "published"
+    assert list(vault.staging.iterdir()) == []
+
+
+def test_process_does_not_complete_while_git_commit_keeps_failing(tmp_path, monkeypatch):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+    from local_kb.transaction import ChangeTransaction
+
+    class Compiler:
+        def compile(self, evidence):
+            source_id = evidence.split(" locator=", 1)[0].removeprefix("source_id=")
+            return {"changes": [_valid_change(source_ids=[source_id])]}
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue, max_retries=5)
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"), compiler=Compiler())
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("persistent git failure", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="git-always-fails")
+    monkeypatch.setattr(
+        ChangeTransaction, "commit_git",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("git stays down")),
+    )
+
+    with pytest.raises(RuntimeError, match="git stays down"):
+        service.process(job.job_id)
+    with pytest.raises(RuntimeError, match="git stays down"):
+        service.process(job.job_id)
+
+    current = queue.get(job.job_id)
+    assert current.state != "published"
+    assert current.metadata["compiler_status"] == "ready"
+    assert list(vault.staging.iterdir()) == []
+
+
+@pytest.mark.parametrize("git_state", ["missing_head", "untracked", "wrong_head", "ignored"])
+def test_process_rejects_unverified_git_head_for_receipt(tmp_path, monkeypatch, git_state):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+    from local_kb.transaction import ChangeTransaction
+
+    class Compiler:
+        def compile(self, evidence):
+            source_id = evidence.split(" locator=", 1)[0].removeprefix("source_id=")
+            return {"changes": [_valid_change(source_ids=[source_id])]}
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue, max_retries=5)
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"), compiler=Compiler())
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text(f"bad head {git_state}", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id=f"bad-head-{git_state}")
+    monkeypatch.setattr(
+        ChangeTransaction, "commit_git",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("first commit failed")),
+    )
+    with pytest.raises(RuntimeError, match="first commit failed"):
+        service.process(job.job_id)
+
+    page = vault.wiki / "work" / "testing.md"
+    expected = page.read_bytes()
+    if git_state != "missing_head":
+        subprocess.run(["git", "init"], cwd=vault.root, capture_output=True, check=True)
+    if git_state == "wrong_head":
+        page.write_text("wrong committed bytes", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "20_wiki/work/testing.md"], cwd=vault.root, capture_output=True, check=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@local",
+             "-c", "commit.gpgsign=false", "commit", "-m", "wrong"],
+            cwd=vault.root, capture_output=True, check=True,
+        )
+        page.write_bytes(expected)
+    elif git_state == "ignored":
+        (vault.root / ".gitignore").write_text("20_wiki/\n", encoding="utf-8")
+        subprocess.run(["git", "add", ".gitignore"], cwd=vault.root, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@local",
+             "-c", "commit.gpgsign=false", "commit", "-m", "ignore"],
+            cwd=vault.root, capture_output=True, check=True,
+        )
+
+    monkeypatch.setattr(ChangeTransaction, "commit_git", lambda *_args, **_kwargs: False)
+    with pytest.raises(RuntimeError, match="Git HEAD"):
+        service.process(job.job_id)
+    assert queue.get(job.job_id).state != "published"
+
+
+def test_empty_compilation_receipt_completes_without_creating_git_repository(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    class EmptyCompiler:
+        def compile(self, evidence):
+            return {"changes": []}
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue)
+    service = IngestService(
+        vault, queue, Catalog(vault.index / "catalog.sqlite3"), compiler=EmptyCompiler(),
+    )
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("insufficient evidence", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="empty-receipt")
+
+    service.process(job.job_id)
+
+    assert queue.get(job.job_id).state == "published"
+    assert not (vault.root / ".git").exists()
+    assert list(vault.staging.iterdir()) == []
 
 
 def test_process_fails_closed_when_durable_compilation_receipt_is_tampered(tmp_path, monkeypatch):

@@ -259,9 +259,16 @@ def _run_bounded_process(
 class ManualCompiler:
     """Create a durable handoff packet without claiming any wiki was updated."""
 
-    def __init__(self, outbox: Path | str, *, trusted_root: Path | str) -> None:
-        supplied_root = Path(trusted_root)
+    def __init__(
+        self, outbox: Path | str, *, trusted_root: Path | str | None = None
+    ) -> None:
         supplied_outbox = Path(outbox)
+        if trusted_root is None:
+            absolute_outbox = Path(os.path.abspath(os.fspath(supplied_outbox)))
+            supplied_root = absolute_outbox.parent
+            supplied_outbox = absolute_outbox
+        else:
+            supplied_root = Path(trusted_root)
         if not supplied_root.is_absolute() or not supplied_outbox.is_absolute():
             raise ValueError("manual compiler paths must be absolute")
         self.trusted_root = Path(os.path.abspath(os.fspath(supplied_root)))
