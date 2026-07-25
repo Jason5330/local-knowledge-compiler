@@ -286,7 +286,51 @@ def test_processed_same_bytes_is_recovered_without_leaving_incoming_for_watch(tm
     actual = vault.root / completed.metadata["processed_path"]
     assert not incoming.exists()
     assert actual.is_file()
-    assert actual != target
+    assert actual == target
+    assert actual.read_text(encoding="utf-8") == "same"
+
+
+def test_processed_job_junction_is_rejected_without_writing_outside_vault(tmp_path):
+    vault, queue, _catalog, service = make_service(tmp_path)
+    incoming = vault.inbox / "junction.txt"
+    incoming.write_text("safe", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="junction-job")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    junction = vault.trash / "processed-inbox" / job.job_id
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        pytest.skip("junctions unavailable")
+
+    with pytest.raises((OSError, ValueError), match="link|junction|safe"):
+        service.process(job.job_id)
+    assert not (outside / "junction.txt").exists()
+    assert incoming.exists()
+    assert queue.get(job.job_id).state == "retrying"
+
+
+def test_processed_publish_rehashes_incoming_after_archive_before_removal(tmp_path, monkeypatch):
+    vault, queue, catalog, service = make_service(tmp_path)
+    incoming = vault.inbox / "changed-after-archive.txt"
+    incoming.write_text("A", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="changed-after-archive")
+    original_cache = service._write_cache
+
+    def change_then_cache(source, extraction):
+        incoming.write_text("B", encoding="utf-8")
+        original_cache(source, extraction)
+
+    monkeypatch.setattr(service, "_write_cache", change_then_cache)
+    with pytest.raises(ValueError, match="checksum|changed"):
+        service.process(job.job_id)
+    assert incoming.read_text(encoding="utf-8") == "B"
+    assert not (vault.trash / "processed-inbox" / job.job_id / incoming.name).exists()
+    assert catalog.latest_source("unclassified", incoming.name) is not None
+    assert queue.get(job.job_id).state == "retrying"
 
 
 def test_ingest_rejects_untrusted_resume_metadata(tmp_path):

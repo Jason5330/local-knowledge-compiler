@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, replace
-import errno
+import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 from typing import Any
 from uuid import uuid4
@@ -17,7 +17,7 @@ from .extractors import registry as default_registry
 from .models import Job, SourceVersion
 from .paths import VaultPaths
 from .queue import DiskQueue
-from .source_store import SourceStore, file_sha256
+from .source_store import SourceStore
 
 
 class IngestService:
@@ -140,43 +140,177 @@ class IngestService:
 
     def _move_processed(self, job: Job, source: SourceVersion) -> Path:
         self.queue._validate_job_id(job.job_id)
-        name = Path(job.source_path).name
+        name = source.original_name
         if not name or name in {".", ".."}:
             raise ValueError("source path must have a safe filename")
-        target = self.vault.trash / "processed-inbox" / job.job_id / name
-        target.parent.mkdir(parents=True, exist_ok=True)
+        job_directory = self._safe_processed_job_directory(job.job_id)
+        target = job_directory / name
         incoming = Path(job.source_path)
-        if target.exists():
-            self._safe_regular_under(self.vault.trash, target)
-            if file_sha256(target) != source.sha256:
-                raise FileExistsError("processed target contains different file")
-            if not incoming.exists():
+        # Keeping these handles open prevents a Windows directory replacement
+        # while the path below is resolved; POSIX gets a no-follow directory fd.
+        with self._pinned_processed_directory(job_directory):
+            if os.path.lexists(target):
+                if self._hash_pinned_regular(target) != source.sha256:
+                    raise FileExistsError("processed target contains different file")
+                if not incoming.exists():
+                    return target
+                incoming_hash, identity = self._hash_pinned_regular(incoming, identity=True)
+                if incoming_hash != source.sha256:
+                    raise ValueError("incoming changed after archive; checksum does not match source")
+                self._remove_if_unchanged(incoming, identity)
                 return target
-            recovered = target.parent / f"recovered-{uuid4().hex}-{name}"
-            self._move_no_clobber(incoming, recovered)
-            return recovered
-        if not incoming.exists():
-            raise FileNotFoundError(f"incoming file is missing: {incoming}")
-        self._move_no_clobber(incoming, target)
-        return target
+            if not incoming.exists():
+                raise FileNotFoundError(f"incoming file is missing: {incoming}")
+            identity = self._copy_pinned_no_replace(incoming, target, source.sha256)
+            self._remove_if_unchanged(incoming, identity)
+            return target
 
-    def _move_no_clobber(self, incoming: Path, target: Path) -> None:
-        """Publish a processed copy without replacing an existing target."""
-        try:
-            os.link(incoming, target)
-        except OSError as error:
-            if error.errno != errno.EXDEV:
-                raise
-            temporary = target.parent / f".{target.name}.{uuid4().hex}.tmp"
+    @contextmanager
+    def _pinned_processed_directory(self, job_directory: Path):
+        """Hold the verified processed namespace while publishing its child."""
+        if os.name != "nt":
+            descriptor = os.open(
+                job_directory,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
             try:
-                shutil.copyfile(incoming, temporary)
-                with temporary.open("rb") as stream:
-                    os.fsync(stream.fileno())
-                os.link(temporary, target)
+                if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    raise ValueError("processed path is not a directory")
+                yield descriptor
             finally:
-                temporary.unlink(missing_ok=True)
-        incoming.unlink()
-        self._sync_directory(target.parent)
+                os.close(descriptor)
+            return
+        # SourceStore already carries the Windows handle implementation used for
+        # immutable raw publishing.  Its handles deny DELETE sharing, which pins
+        # every directory binding until this transaction finishes.
+        from .source_store import _windows_close_handle, _windows_open_directory
+
+        paths = [
+            self.vault.root,
+            self.vault.trash,
+            self.vault.trash / "processed-inbox",
+            job_directory,
+        ]
+        handles: list[int] = []
+        try:
+            for path in paths:
+                handles.append(_windows_open_directory(path, self.vault.root))
+            yield None
+        finally:
+            for handle in reversed(handles):
+                _windows_close_handle(handle)
+
+    def _safe_processed_job_directory(self, job_id: str) -> Path:
+        """Create only verified non-link children below the vault trash root."""
+        self._safe_directory(self.vault.root)
+        trash = self._safe_child_directory(self.vault.root, "99_trash")
+        processed = self._safe_child_directory(trash, "processed-inbox")
+        return self._safe_child_directory(processed, job_id)
+
+    def _safe_child_directory(self, parent: Path, name: str) -> Path:
+        self._safe_directory(parent)
+        child = parent / name
+        if os.path.lexists(child):
+            self._safe_directory(child)
+            return child
+        try:
+            os.mkdir(child)
+        except FileExistsError:
+            pass
+        self._safe_directory(child)
+        return child
+
+    @staticmethod
+    def _safe_directory(path: Path) -> None:
+        info = os.lstat(path)
+        junction = getattr(path, "is_junction", None)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or (callable(junction) and junction())
+        ):
+            raise ValueError("processed path contains a link or unsafe directory")
+
+    def _copy_pinned_no_replace(
+        self, incoming: Path, target: Path, expected_hash: str
+    ) -> tuple[int, int, int, int]:
+        """Copy from a no-follow regular descriptor, then link-publish exact target."""
+        temporary = target.parent / f".{target.name}.{uuid4().hex}.tmp"
+        identity: tuple[int, int, int, int] | None = None
+        try:
+            with self._open_pinned_regular(incoming) as (input_fd, identity):
+                output_fd = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                    0o600,
+                )
+                digest = hashlib.sha256()
+                try:
+                    while chunk := os.read(input_fd, 1024 * 1024):
+                        digest.update(chunk)
+                        offset = 0
+                        while offset < len(chunk):
+                            offset += os.write(output_fd, chunk[offset:])
+                    os.fsync(output_fd)
+                finally:
+                    os.close(output_fd)
+                if digest.hexdigest() != expected_hash:
+                    raise ValueError("incoming changed after archive; checksum does not match source")
+                self._assert_unchanged(incoming, identity)
+                os.link(temporary, target)
+                self._sync_directory(target.parent)
+                return identity
+        finally:
+            # The random temp belongs to this operation; never touch the target.
+            temporary.unlink(missing_ok=True)
+
+    def _hash_pinned_regular(
+        self, path: Path, *, identity: bool = False
+    ) -> str | tuple[str, tuple[int, int, int, int]]:
+        with self._open_pinned_regular(path) as (descriptor, token):
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            self._assert_unchanged(path, token)
+        result = digest.hexdigest()
+        return (result, token) if identity else result
+
+    @contextmanager
+    def _open_pinned_regular(self, path: Path):
+        before = os.lstat(path)
+        junction = getattr(path, "is_junction", None)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or (callable(junction) and junction())
+        ):
+            raise ValueError("incoming must be a safe regular file")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            token = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != token:
+                raise ValueError("incoming changed while opening")
+            yield descriptor, token
+            after = os.fstat(descriptor)
+            if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != token:
+                raise ValueError("incoming changed while reading")
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _assert_unchanged(path: Path, token: tuple[int, int, int, int]) -> None:
+        current = os.lstat(path)
+        if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != token:
+            raise ValueError("incoming changed while reading")
+
+    def _remove_if_unchanged(self, path: Path, token: tuple[int, int, int, int]) -> None:
+        self._assert_unchanged(path, token)
+        path.unlink()
+        self._sync_directory(path.parent)
 
     @staticmethod
     def _safe_regular_under(root: Path, candidate: Path) -> None:
