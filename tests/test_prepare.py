@@ -101,6 +101,18 @@ def test_prepare_stably_deduplicates_results_and_rejects_unsafe_inputs(seeded_ca
     assert service.prepare("   ", {"work"})["status"] == "insufficient_evidence"
 
 
+def test_spaces_iterator_is_bounded_to_seventeen_items(seeded_catalog):
+    from local_kb.query import QueryService
+    consumed=[]
+    def infinite():
+        number=0
+        while True:
+            consumed.append(number); yield f"project:p-{number}"; number+=1
+    with pytest.raises(ValueError,match="too many"):
+        QueryService(seeded_catalog).prepare("x",infinite())
+    assert len(consumed) == 17
+
+
 def test_prepare_includes_bounded_pending_job_metadata(seeded_catalog, tmp_path):
     from local_kb.query import QueryService
     from local_kb.queue import DiskQueue
@@ -305,7 +317,7 @@ def test_pending_counts_separate_matched_and_unknown(seeded_catalog, tmp_path):
 
 def test_pending_empty_and_unavailable_have_fixed_schema(seeded_catalog):
     from local_kb.query import QueryService
-    keys={"scope","jobs","total","shown","truncated","related_total","related_shown","unknown_total","unknown_shown"}
+    keys={"scope","jobs","total","shown","truncated","related_total","related_shown","unknown_total","unknown_shown","queue_scan_truncated","counts_are_lower_bound"}
     assert set(QueryService(seeded_catalog).prepare("Aurora",{"work"})["pending_jobs"]) == keys
     class Broken:
         def iter_jobs(self): raise ValueError("broken")

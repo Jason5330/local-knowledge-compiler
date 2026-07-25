@@ -49,16 +49,22 @@ def validate_spaces(spaces: Collection[str]) -> tuple[str, ...]:
     if isinstance(spaces, str):
         raise TypeError("spaces must be a collection of strings, not a string")
     try:
-        supplied = tuple(spaces)
+        iterator = iter(spaces)
+        supplied = []
+        for _ in range(17):
+            try:
+                supplied.append(next(iterator))
+            except StopIteration:
+                break
     except TypeError as error:
         raise TypeError("spaces must be a collection of strings") from error
+    if len(supplied) > 16:
+        raise ValueError("too many spaces")
     if not all(isinstance(space, str) for space in supplied):
         raise TypeError("spaces must contain only strings")
     canonical = tuple(sorted(set(supplied)))
     if not canonical:
         raise ValueError("at least one space is required")
-    if len(canonical) > 16:
-        raise ValueError("too many spaces")
     for space in canonical:
         if not isinstance(space, str) or not space or len(space) > 80 or _CONTROL.search(space):
             raise ValueError("space must be a safe non-empty string")
@@ -101,15 +107,21 @@ def ranked_search(
                 # length bonus makes longer, more specific fallbacks win stable ties.
                 score=float(hit.score) + len(route) / 1_000_000, route=f"fallback:{route}",
             ))
-    selected = _deduplicate(combined, limit)
     routes = _fallback_queries(checked_question)
+    grouped: dict[tuple[str,str], list[EvidenceHit]] = {}
+    for hit in combined:
+        grouped.setdefault((hit.version_id,hit.locator),[]).append(hit)
     enriched = []
-    for hit in selected:
+    for candidates in grouped.values():
+        hit=max(candidates,key=lambda item:item.score)
         covered = tuple(route for route in routes if route.casefold() in hit.text.casefold())[:16]
+        priority=2 if any(item.route=="full_question" for item in candidates) else 1
+        specificity=max((len(route) for route in covered),default=0)
+        bm25=max(item.score-(1.0 if item.route=="full_question" else 0.0) for item in candidates)
         enriched.append(EvidenceHit(
             source_id=hit.source_id, version_id=hit.version_id, space=hit.space,
             relative_path=hit.relative_path, locator=hit.locator, text=hit.text,
-            score=hit.score + len(covered) / 10_000, route=hit.route,
+            score=priority*100 + len(covered)*10 + specificity/1000 + bm25/1000000, route="full_question" if priority==2 else hit.route,
             routes=covered, coverage=len(covered),
         ))
     return sorted(enriched, key=lambda hit: (-hit.score, hit.space, hit.source_id, hit.version_id, hit.locator))[:limit]
@@ -146,7 +158,7 @@ def exact_routes(
     return _deduplicate([
         EvidenceHit(
             source_id=row["source_id"], version_id=row["version_id"], space=row["space"],
-            relative_path=row["relative_path"], locator=row["locator"], text=row["text"], score=1.0,
+            relative_path=row["relative_path"], locator=row["locator"], text=row["text"], score=300.0,
             route="exact_identifier",
         )
         for row in rows

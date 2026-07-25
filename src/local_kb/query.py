@@ -108,7 +108,7 @@ def _pinned_directory(root: Path, directory: Path):
     from .compiler import ManualCompiler
     _safe_existing_tree(root, directory)
     locker = ManualCompiler(directory, trusted_root=root)
-    with locker._pinned_outbox() as descriptor:
+    with locker._pinned_outbox(create=False) as descriptor:
         yield descriptor
 
 
@@ -233,28 +233,6 @@ def _safe_read_wiki(catalog: Catalog, vault: VaultPaths, question: str, spaces: 
     return public[:MAX_RESULTS], scan_state["truncated"], warning_summary
 
 
-def _valid_wiki_provenance(catalog: Catalog, vault: VaultPaths, source_ids: list[str]) -> bool:
-    if not source_ids or len(source_ids) > 32:
-        return False
-    marks = ", ".join("?" for _ in source_ids)
-    with catalog.connection() as connection:
-        rows = connection.execute(
-            f"SELECT source_id, relative_path FROM sources WHERE source_id IN ({marks})", source_ids
-        ).fetchall()
-    if {row["source_id"] for row in rows} != set(source_ids):
-        return False
-    for row in rows:
-        candidate = vault.root / row["relative_path"]
-        try:
-            _safe_existing_tree(vault.raw, candidate)
-            with _open_pinned_regular(candidate) as (descriptor, _):
-                if os.read(descriptor, 1) is not None:
-                    return True
-        except (OSError, ValueError):
-            continue
-    return False
-
-
 def _valid_wiki_provenance_paths(vault: VaultPaths, source_ids: list[str], paths_by_source: dict[str, list[tuple[str, str]]], space: str) -> bool:
     if not source_ids or any(source_id not in paths_by_source for source_id in source_ids):
         return False
@@ -268,11 +246,11 @@ def _valid_wiki_provenance_paths(vault: VaultPaths, source_ids: list[str], paths
                 continue
             candidate = vault.root / relative
             try:
-                _safe_existing_tree(vault.raw, candidate)
-                with _open_pinned_regular(candidate) as (descriptor, _):
-                    os.read(descriptor, 1)
-                    readable = True
-                    break
+                with _pinned_directory(vault.raw, candidate.parent) as parent_fd:
+                    with _open_pinned_regular(candidate, parent_fd=parent_fd, name=candidate.name) as (descriptor, _):
+                        os.read(descriptor, 1)
+                        readable = True
+                        break
             except (OSError, ValueError):
                 continue
         if not readable:
@@ -331,13 +309,13 @@ def _short(value: object) -> str | None:
 
 def _pending_jobs(queue: DiskQueue | None, spaces: tuple[str, ...], question: str) -> dict[str, object]:
     if queue is None:
-        return {"scope": "selected_spaces", "jobs": [], "total": 0, "shown": 0, "truncated": False, "related_total": 0, "related_shown": 0, "unknown_total": 0, "unknown_shown": 0}
+        return {"scope": "selected_spaces", "jobs": [], "total": 0, "shown": 0, "truncated": False, "related_total": 0, "related_shown": 0, "unknown_total": 0, "unknown_shown": 0, "queue_scan_truncated": False, "counts_are_lower_bound": False}
     jobs: list[dict[str, object]] = []
     unknown_space = False
     try:
-        candidates = queue.iter_jobs()
-    except (OSError, ValueError):
-        return {"scope": "all-active", "jobs": [], "total": 0, "shown": 0, "truncated": True, "related_total": 0, "related_shown": 0, "unknown_total": 0, "unknown_shown": 0, "error": "queue_unavailable"}
+        candidates, queue_scan_truncated = queue.iter_jobs_bounded(1000)
+    except (OSError, ValueError, AttributeError):
+        return {"scope": "all-active", "jobs": [], "total": 0, "shown": 0, "truncated": True, "related_total": 0, "related_shown": 0, "unknown_total": 0, "unknown_shown": 0, "queue_scan_truncated": True, "counts_are_lower_bound": True, "error": "queue_unavailable"}
     for job in candidates:
         source_metadata = job.metadata.get("source")
         source_values = source_metadata if isinstance(source_metadata, dict) else {}
@@ -371,13 +349,14 @@ def _pending_jobs(queue: DiskQueue | None, spaces: tuple[str, ...], question: st
                        or _short(source_values.get("original_name")) or _short(job.source_path)),
             "space": space, "error": _short(job.error),
         })
-    jobs.sort(key=lambda item: str(item["job_id"]))
+    jobs.sort(key=lambda item: (item["relation"] != "matched_metadata", str(item["job_id"])))
     shown = jobs[:MAX_PENDING_JOBS]
     related = [item for item in jobs if item["relation"] == "matched_metadata"]
     unknown = [item for item in jobs if item["relation"] != "matched_metadata"]
-    return {"scope": "selected_spaces_plus_unknown" if unknown_space else "selected_spaces", "jobs": shown, "total": len(jobs), "shown": len(shown), "truncated": len(jobs) > MAX_PENDING_JOBS,
+    return {"scope": "selected_spaces_plus_unknown" if unknown_space else "selected_spaces", "jobs": shown, "total": len(jobs), "shown": len(shown), "truncated": len(jobs) > MAX_PENDING_JOBS or queue_scan_truncated,
             "related_total": len(related), "related_shown": sum(item["relation"] == "matched_metadata" for item in shown),
-            "unknown_total": len(unknown), "unknown_shown": sum(item["relation"] != "matched_metadata" for item in shown)}
+            "unknown_total": len(unknown), "unknown_shown": sum(item["relation"] != "matched_metadata" for item in shown),
+            "queue_scan_truncated": queue_scan_truncated, "counts_are_lower_bound": queue_scan_truncated}
 
 
 class QueryService:

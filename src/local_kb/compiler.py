@@ -352,7 +352,7 @@ class ManualCompiler:
         raise RuntimeError("unable to allocate a unique manual handoff path")
 
     @contextmanager
-    def _pinned_outbox(self):
+    def _pinned_outbox(self, *, create: bool = True):
         if os.name == "nt":
             from .source_store import _windows_close_handle, _windows_open_directory
 
@@ -368,8 +368,10 @@ class ManualCompiler:
                         if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
                                 or (callable(junction) and junction())):
                             raise ValueError("manual outbox path is unsafe")
-                    else:
+                    elif create:
                         os.mkdir(cursor)
+                    else:
+                        raise FileNotFoundError(cursor)
                     handles.append(_windows_open_directory(cursor, self.trusted_root))
                 yield None
             finally:
@@ -392,6 +394,8 @@ class ManualCompiler:
                 try:
                     child = os.open(component, flags, dir_fd=descriptor)
                 except FileNotFoundError:
+                    if not create:
+                        raise
                     os.mkdir(component, 0o700, dir_fd=descriptor)
                     os.fsync(descriptor)
                     child = os.open(component, flags, dir_fd=descriptor)

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import time
 from typing import Callable, Iterator, get_args
 from uuid import uuid4
@@ -17,6 +18,18 @@ from .models import Job, JobState
 
 _JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _JOB_STATES = frozenset(get_args(JobState))
+MAX_JOB_BYTES = 4 * 1024 * 1024
+
+
+def _bounded_json(value: object) -> str:
+    chunks=[]; size=0
+    encoder=json.JSONEncoder(ensure_ascii=False,sort_keys=True,separators=(",", ":"),allow_nan=False)
+    for chunk in encoder.iterencode(value):
+        size += len(chunk.encode("utf-8"))
+        if size > MAX_JOB_BYTES:
+            raise ValueError("job JSON exceeds size limit")
+        chunks.append(chunk)
+    return "".join(chunks)
 
 
 class DiskQueue:
@@ -67,6 +80,24 @@ class DiskQueue:
     def iter_jobs(self) -> list[Job]:
         with self._locked():
             return [self._read(path) for path in sorted(self.root.glob("*.json"))]
+
+    def iter_jobs_bounded(self, max_jobs: int) -> tuple[list[Job], bool]:
+        if isinstance(max_jobs, bool) or not isinstance(max_jobs, int) or max_jobs < 1:
+            raise ValueError("max_jobs must be a positive integer")
+        with self._locked():
+            paths: list[Path] = []
+            scanned=0
+            with os.scandir(self.root) as entries:
+                for entry in entries:
+                    scanned += 1
+                    if scanned > max_jobs + 1:
+                        return [self._read(path) for path in sorted(paths)], True
+                    if not entry.name.endswith(".json"):
+                        continue
+                    if len(paths) >= max_jobs:
+                        return [self._read(path) for path in sorted(paths)], True
+                    paths.append(Path(entry.path))
+            return [self._read(path) for path in sorted(paths)], False
 
     def active_for_source(self, source_path: Path | str) -> Job | None:
         wanted = os.path.normcase(os.path.abspath(os.fspath(source_path)))
@@ -139,11 +170,26 @@ class DiskQueue:
 
     def _read(self, path: Path) -> Job:
         try:
-            with path.open("r", encoding="utf-8") as stream:
-                data = json.load(stream)
+            before=os.lstat(path)
+            if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_size > MAX_JOB_BYTES:
+                raise ValueError(f"corrupt job JSON: {path.name}")
+            fd=os.open(path,os.O_RDONLY|getattr(os,"O_BINARY",0)|getattr(os,"O_NOFOLLOW",0))
+            try:
+                opened=os.fstat(fd)
+                if (opened.st_dev,opened.st_ino,opened.st_size)!=(before.st_dev,before.st_ino,before.st_size) or not stat.S_ISREG(opened.st_mode):
+                    raise ValueError(f"corrupt job JSON: {path.name}")
+                chunks=[]; remaining=MAX_JOB_BYTES+1
+                while remaining and (chunk:=os.read(fd,min(65536,remaining))):
+                    chunks.append(chunk); remaining-=len(chunk)
+                encoded=b"".join(chunks)
+            finally:
+                os.close(fd)
+            if len(encoded) > MAX_JOB_BYTES:
+                raise ValueError(f"corrupt job JSON: {path.name}")
+            data = json.loads(encoded.decode("utf-8"))
         except FileNotFoundError:
             raise
-        except (OSError, json.JSONDecodeError) as error:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError(f"corrupt job JSON: {path.name}") from error
         if not isinstance(data, dict):
             raise ValueError(f"corrupt job JSON: {path.name}")
@@ -159,7 +205,7 @@ class DiskQueue:
 
     def _write(self, path: Path, job: Job) -> None:
         self._validate_job(job, path.name)
-        payload = json.dumps(job.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        payload = _bounded_json(job.to_dict())
         temporary = self.root / f".{path.name}.{uuid4().hex}.tmp"
         try:
             with temporary.open("x", encoding="utf-8", newline="\n") as stream:
@@ -220,7 +266,7 @@ class DiskQueue:
 
     @staticmethod
     def _copy(job: Job) -> Job:
-        return Job(**json.loads(json.dumps(job.to_dict())))
+        return Job(**json.loads(_bounded_json(job.to_dict())))
 
     def _validate_job(self, job: Job, filename: str) -> None:
         if (
@@ -239,6 +285,6 @@ class DiskQueue:
         if filename != f"{job.job_id}.json":
             raise ValueError(f"corrupt job JSON: {filename}")
         try:
-            json.dumps(job.to_dict(), allow_nan=False)
+            _bounded_json(job.to_dict())
         except (TypeError, ValueError) as error:
             raise ValueError(f"corrupt job JSON: {filename}") from error
