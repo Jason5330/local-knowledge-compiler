@@ -171,6 +171,7 @@ def test_prepare_packet_json_is_stable_and_cli_writes_inside_vault(tmp_path, cap
     packet = json.loads(output.read_text(encoding="utf-8"))
     assert packet["schema_version"] == 1
     assert packet["status"] == "ready"
+    assert any("evidence_sha256" in instruction for instruction in packet["instructions"])
     assert main(["prepare", "CLI proof", "--vault", str(vault.root), "--space", "work", "--output", ".kb/packet.json"]) == 0
     assert main(["prepare", "CLI proof", "--vault", str(vault.root), "--space", "work", "--output", "../outside.json"]) == 1
     assert not (tmp_path / "outside.json").exists()
@@ -215,13 +216,17 @@ def test_prepare_wiki_title_route_is_secondary_and_bounded(tmp_path):
     packet = QueryService(catalog, vault=vault).prepare("Aurora", {"work"})
     assert packet["evidence"][0]["kind"] == "raw_fragment"
     derived = [item for item in packet["evidence"] if item["kind"] == "derived_wiki"]
-    assert derived == [{
+    assert len(derived) == 1
+    assert len(derived[0]["evidence_sha256"]) == 64
+    without_digest = dict(derived[0])
+    without_digest.pop("evidence_sha256")
+    assert without_digest == {
         "kind": "derived_wiki", "evidence_class": "derived", "space": "work",
         "path": "20_wiki/work/aurora.md", "locator": "Current State",
         "text": "Derived summary only.", "source_ids": ["src-raw"], "score": 2.0,
         "route": "direct_wiki", "routes": ["Aurora"], "coverage": 1, "match_kind": "direct",
         "truncated": False,
-    }]
+    }
 
 
 def test_prepare_derived_only_result_is_ready_without_raw_no_match_reason(tmp_path):

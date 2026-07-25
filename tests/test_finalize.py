@@ -6,7 +6,9 @@ import pytest
 
 
 def _packet() -> dict:
-    return {
+    from local_kb.query import evidence_sha256
+
+    packet = {
         "schema_version": 1,
         "question": "應該採用哪一個方案？",
         "evidence": [
@@ -29,13 +31,22 @@ def _packet() -> dict:
             },
         ],
     }
+    for item in packet["evidence"]:
+        item["evidence_sha256"] = evidence_sha256(item)
+    return packet
 
 
 def _answer(citations=None) -> dict:
+    packet = _packet()
     return {
         "conclusion": "採用 B 方案。",
         "citations": (
-            [{"source_id": "src-ok", "version_id": "ver-1", "locator": "line:7"}]
+            [{
+                "source_id": "src-ok",
+                "version_id": "ver-1",
+                "locator": "line:7",
+                "evidence_sha256": packet["evidence"][0]["evidence_sha256"],
+            }]
             if citations is None
             else citations
         ),
@@ -84,8 +95,13 @@ def test_finalize_saves_answer_with_exact_provenance(tmp_path):
 def test_finalize_requires_an_exact_packet_evidence_identity(tmp_path, citation):
     from local_kb.finalize import finalize_answer
 
+    packet = _packet()
+    if "source_id" in citation:
+        citation["evidence_sha256"] = packet["evidence"][0]["evidence_sha256"]
+    else:
+        citation["evidence_sha256"] = packet["evidence"][1]["evidence_sha256"]
     with pytest.raises(ValueError, match="unknown citation"):
-        finalize_answer(tmp_path, _packet(), _answer([citation]))
+        finalize_answer(tmp_path, packet, _answer([citation]))
 
 
 @pytest.mark.parametrize(
@@ -171,6 +187,72 @@ def test_finalize_rejects_multiline_locator_even_when_packet_matches(tmp_path):
         finalize_answer(tmp_path, packet, answer)
 
 
+def test_finalize_citation_block_cannot_be_closed_by_backticks_or_raw_html(tmp_path):
+    from local_kb.finalize import finalize_answer
+    from local_kb.query import evidence_sha256
+
+    packet = _packet()
+    locator = "section ````` <img src=x onerror=alert(1)>"
+    packet["evidence"][0]["locator"] = locator
+    packet["evidence"][0]["evidence_sha256"] = evidence_sha256(packet["evidence"][0])
+    answer = _answer([{
+        "source_id": "src-ok",
+        "version_id": "ver-1",
+        "locator": locator,
+        "evidence_sha256": packet["evidence"][0]["evidence_sha256"],
+    }])
+    text = finalize_answer(tmp_path, packet, answer).read_text(encoding="utf-8")
+
+    assert "<img" not in text
+    assert "&lt;img" in text
+    assert "\n``````json\n" in text
+    assert "\n``````\n" in text
+
+
+def test_finalize_requires_packet_generated_wiki_digest_and_persists_it(tmp_path):
+    from local_kb.finalize import finalize_answer
+    from local_kb.query import evidence_sha256
+
+    packet = _packet()
+    wiki = packet["evidence"][1]
+    wiki["evidence_sha256"] = evidence_sha256(wiki)
+    citation = {
+        "path": wiki["path"],
+        "locator": wiki["locator"],
+        "source_ids": wiki["source_ids"],
+        "evidence_sha256": wiki["evidence_sha256"],
+    }
+    path = finalize_answer(tmp_path, packet, _answer([citation]))
+
+    assert wiki["evidence_sha256"] in path.read_text(encoding="utf-8")
+    forged = dict(packet)
+    forged["evidence"] = [dict(wiki, evidence_sha256="0" * 64)]
+    with pytest.raises(ValueError, match="evidence_sha256"):
+        finalize_answer(tmp_path, forged, _answer([dict(citation, evidence_sha256="0" * 64)]))
+
+
+def test_finalize_keeps_packet_wiki_digest_after_live_wiki_changes(tmp_path):
+    from local_kb.finalize import finalize_answer
+    from local_kb.query import evidence_sha256
+
+    packet = _packet()
+    wiki = packet["evidence"][1]
+    wiki["evidence_sha256"] = evidence_sha256(wiki)
+    live = tmp_path / wiki["path"]
+    live.parent.mkdir(parents=True)
+    live.write_text("changed after prepare", encoding="utf-8")
+    citation = {
+        "path": wiki["path"],
+        "locator": wiki["locator"],
+        "source_ids": wiki["source_ids"],
+        "evidence_sha256": wiki["evidence_sha256"],
+    }
+
+    text = finalize_answer(tmp_path, packet, _answer([citation])).read_text(encoding="utf-8")
+    assert wiki["evidence_sha256"] in text
+    assert "changed after prepare" not in text
+
+
 def test_finalize_and_enqueue_carries_only_cited_raw_source_ids(tmp_path):
     from local_kb.cli import build_vault
     from local_kb.finalize import finalize_and_enqueue
@@ -199,6 +281,7 @@ def test_wiki_citation_enqueues_its_backing_raw_source_ids(tmp_path):
         "path": "20_wiki/work/decisions/choice.md",
         "locator": "Current State",
         "source_ids": ["src-wiki"],
+        "evidence_sha256": _packet()["evidence"][1]["evidence_sha256"],
     }
     result = finalize_and_enqueue(vault, DiskQueue(vault.queue), _packet(), _answer([citation]))
 
@@ -234,6 +317,40 @@ def test_queue_failure_leaves_no_saved_answer(tmp_path):
     with pytest.raises(OSError, match="queue unavailable"):
         finalize_and_enqueue(vault, BrokenQueue(), _packet(), _answer())
     assert set(vault.answers.rglob("*.md")) == before
+
+
+def test_queue_after_replace_sync_error_reconciles_exact_committed_job(tmp_path, monkeypatch):
+    from local_kb.cli import build_vault
+    from local_kb.finalize import finalize_and_enqueue
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path)
+    queue = DiskQueue(vault.queue)
+    monkeypatch.setattr(queue, "_sync_directory", lambda: (_ for _ in ()).throw(OSError("sync ambiguous")))
+
+    result = finalize_and_enqueue(vault, queue, _packet(), _answer())
+
+    assert result.path.is_file()
+    assert queue.get(result.job_id).metadata["answer_path"] == result.path.relative_to(vault.root).as_posix()
+
+
+def test_answer_after_link_error_reconciles_exact_committed_file(tmp_path, monkeypatch):
+    import local_kb.finalize as finalize_module
+    from local_kb.cli import build_vault
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path)
+    original_link = finalize_module.os.link
+
+    def link_then_error(*args, **kwargs):
+        original_link(*args, **kwargs)
+        raise OSError("link result ambiguous")
+
+    monkeypatch.setattr(finalize_module.os, "link", link_then_error)
+    result = finalize_module.finalize_and_enqueue(vault, DiskQueue(vault.queue), _packet(), _answer())
+
+    assert result.path.is_file()
+    assert len(list(vault.answers.rglob("*.md"))) == 1
 
 
 def test_answer_write_failure_does_not_enqueue(tmp_path, monkeypatch):
@@ -307,3 +424,45 @@ def test_finalize_cli_rejects_symlink_input(tmp_path, capsys):
         "--packet", str(linked), "--answer", str(answer),
     ]) == 1
     assert "regular file" in capsys.readouterr().err
+
+
+def test_ingest_rejects_saved_answer_without_moving_or_indexing_it(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.finalize import finalize_answer
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path)
+    answer = finalize_answer(vault, _packet(), _answer())
+    queue = DiskQueue(vault.queue)
+    job = queue.enqueue(answer, job_id="derived-direct")
+    catalog = Catalog(vault.index / "catalog.sqlite3")
+
+    with pytest.raises(ValueError, match="derived answer"):
+        IngestService(vault, queue, catalog).process(job.job_id, space="work")
+    assert answer.is_file()
+    catalog.initialize()
+    assert catalog.search("採用", {"work"}) == []
+
+
+def test_ingest_rejects_copied_derived_marker_without_moving_or_indexing_it(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.finalize import finalize_answer
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path)
+    generated = finalize_answer(vault, _packet(), _answer())
+    copied = vault.inbox / "copied-answer.md"
+    copied.write_bytes(generated.read_bytes())
+    queue = DiskQueue(vault.queue)
+    job = queue.enqueue(copied, job_id="derived-copy")
+    catalog = Catalog(vault.index / "catalog.sqlite3")
+
+    with pytest.raises(ValueError, match="derived answer"):
+        IngestService(vault, queue, catalog).process(job.job_id, space="work")
+    assert copied.is_file()
+    catalog.initialize()
+    assert catalog.search("採用", {"work"}) == []

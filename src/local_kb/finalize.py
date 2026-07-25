@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import html
 import os
 from pathlib import Path
 import re
@@ -15,7 +16,12 @@ from uuid import uuid4
 from .models import Job
 from .paths import VaultPaths
 from .queue import DiskQueue
-from .query import _is_reparse, _open_pinned_regular, _pinned_directory
+from .query import (
+    _is_reparse,
+    _open_pinned_regular,
+    _pinned_directory,
+    evidence_sha256,
+)
 
 
 MAX_INPUT_BYTES = 256_000
@@ -184,31 +190,47 @@ def _evidence_identity(item: object) -> tuple[tuple[object, ...], dict[str, obje
             return ("legacy", source_id), public, (source_id,)
         version_id = _safe_id(item.get("version_id"), "evidence version_id")
         locator = _safe_locator(item.get("locator"), "evidence locator")
-        public = {"source_id": source_id, "version_id": version_id, "locator": locator}
-        return ("raw", source_id, version_id, locator), public, (source_id,)
+        digest = _verified_evidence_digest(item)
+        public = {
+            "source_id": source_id, "version_id": version_id,
+            "locator": locator, "evidence_sha256": digest,
+        }
+        return ("raw", source_id, version_id, locator, digest), public, (source_id,)
     if kind == "derived_wiki":
         path = _safe_relative_path(item.get("path"), "evidence path", prefix="20_wiki/")
         locator = _safe_locator(item.get("locator"), "evidence locator")
         source_ids = _source_ids(item.get("source_ids"), "evidence source_ids")
-        public = {"path": path, "locator": locator, "source_ids": list(source_ids)}
-        return ("wiki", path, locator, source_ids), public, source_ids
+        digest = _verified_evidence_digest(item)
+        public = {
+            "path": path, "locator": locator, "source_ids": list(source_ids),
+            "evidence_sha256": digest,
+        }
+        return ("wiki", path, locator, source_ids, digest), public, source_ids
     raise ValueError("packet evidence has an unsupported provenance shape")
 
 
 def _citation_identity(citation: dict) -> tuple[tuple[object, ...], dict[str, object]]:
     keys = set(citation)
-    if keys == {"source_id", "version_id", "locator"}:
+    if keys == {"source_id", "version_id", "locator", "evidence_sha256"}:
         source_id = _safe_id(citation["source_id"], "citation source_id")
         version_id = _safe_id(citation["version_id"], "citation version_id")
         locator = _safe_locator(citation["locator"], "citation locator")
-        public = {"source_id": source_id, "version_id": version_id, "locator": locator}
-        return ("raw", source_id, version_id, locator), public
-    if keys == {"path", "locator", "source_ids"}:
+        digest = _safe_digest(citation["evidence_sha256"], "citation evidence_sha256")
+        public = {
+            "source_id": source_id, "version_id": version_id,
+            "locator": locator, "evidence_sha256": digest,
+        }
+        return ("raw", source_id, version_id, locator, digest), public
+    if keys == {"path", "locator", "source_ids", "evidence_sha256"}:
         path = _safe_relative_path(citation["path"], "citation path", prefix="20_wiki/")
         locator = _safe_locator(citation["locator"], "citation locator")
         source_ids = _source_ids(citation["source_ids"], "citation source_ids")
-        public = {"path": path, "locator": locator, "source_ids": list(source_ids)}
-        return ("wiki", path, locator, source_ids), public
+        digest = _safe_digest(citation["evidence_sha256"], "citation evidence_sha256")
+        public = {
+            "path": path, "locator": locator, "source_ids": list(source_ids),
+            "evidence_sha256": digest,
+        }
+        return ("wiki", path, locator, source_ids, digest), public
     raise ValueError("citation must contain an exact provenance identity")
 
 
@@ -225,6 +247,19 @@ def _safe_id(value: object, label: str) -> str:
     if not isinstance(value, str) or _SAFE_ID.fullmatch(value) is None:
         raise ValueError(f"{label} is invalid")
     return value
+
+
+def _safe_digest(value: object, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
+def _verified_evidence_digest(item: dict[str, object]) -> str:
+    supplied = _safe_digest(item.get("evidence_sha256"), "evidence_sha256")
+    if supplied != evidence_sha256(item):
+        raise ValueError("evidence_sha256 does not match packet evidence")
+    return supplied
 
 
 def _safe_text(value: object, label: str, limit: int, *, allow_empty: bool = True) -> str:
@@ -268,13 +303,15 @@ def _markdown(value: str) -> str:
 def _render(answer: _ValidatedAnswer) -> str:
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     question_yaml = json.dumps(answer.question, ensure_ascii=False)
-    citations = (
-        "\n".join(
-            f"- `{json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}`"
-            for item in answer.citations
+    if answer.citations:
+        payload = json.dumps(
+            list(answer.citations), ensure_ascii=False, sort_keys=True, indent=2
         )
-        or "- 無可用來源"
-    )
+        longest = max((len(run) for run in re.findall(r"`+", payload)), default=0)
+        fence = "`" * max(3, longest + 1)
+        citations = f"{fence}json\n{html.escape(payload, quote=False)}\n{fence}"
+    else:
+        citations = "- 無可用來源"
     return (
         "---\n"
         "type: derived-answer\n"
@@ -327,17 +364,26 @@ def _write_answer(paths: VaultPaths, content: str) -> tuple[Path, tuple[int, int
                 os.close(descriptor)
                 descriptor = None
                 if directory_fd is not None:
-                    os.link(
-                        temporary_name,
-                        name,
-                        src_dir_fd=directory_fd,
-                        dst_dir_fd=directory_fd,
-                        follow_symlinks=False,
-                    )
+                    try:
+                        os.link(
+                            temporary_name,
+                            name,
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                        os.fsync(directory_fd)
+                    except OSError:
+                        if _answer_identity_matches(year / name, identity, directory_fd):
+                            return year / name, identity
+                        raise
                 else:
-                    os.link(year / temporary_name, year / name)
-                if directory_fd is not None:
-                    os.fsync(directory_fd)
+                    try:
+                        os.link(year / temporary_name, year / name)
+                    except OSError:
+                        if _answer_identity_matches(year / name, identity, None):
+                            return year / name, identity
+                        raise
                 return year / name, identity
             except FileExistsError:
                 continue
@@ -352,6 +398,24 @@ def _write_answer(paths: VaultPaths, content: str) -> tuple[Path, tuple[int, int
                 except FileNotFoundError:
                     pass
     raise RuntimeError("unable to allocate a unique answer path")
+
+
+def _answer_identity_matches(
+    path: Path, identity: tuple[int, int, int, int], directory_fd: int | None
+) -> bool:
+    try:
+        info = (
+            os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+            if directory_fd is not None
+            else os.lstat(path)
+        )
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) == identity
+    )
 
 
 def _enqueue_derived_update(
@@ -376,7 +440,16 @@ def _enqueue_derived_update(
         path = queue._job_path(identifier)
         if path.exists():
             raise FileExistsError(f"job already exists: {identifier}")
-        queue._write(path, job)
+        try:
+            queue._write(path, job)
+        except BaseException:
+            try:
+                committed = queue._read(path)
+            except BaseException:
+                raise
+            if committed.to_dict() != job.to_dict():
+                raise
+            return queue._copy(committed)
     return queue._copy(job)
 
 

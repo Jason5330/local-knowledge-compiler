@@ -45,6 +45,8 @@ _RECEIPT_SCHEMA_VERSION = 1
 _MAX_RECEIPT_BYTES = 2_000_000
 _MAX_GIT_METADATA_BYTES = 4_096
 _GIT_TIMEOUT_SECONDS = 30.0
+_DERIVED_HEADER_BYTES = 8_192
+_DERIVED_TYPE = re.compile(r'(?m)^type:\s*(?:"derived-answer"|derived-answer)\s*$')
 
 
 def _safe_wiki_path(value: object) -> str:
@@ -115,6 +117,7 @@ class IngestService:
         """Process one job; persist each recoverable boundary before advancing."""
         job = self.queue.get(job_id)
         try:
+            self._reject_derived_input(job)
             self.catalog.initialize()
             if "compilation_receipt" in job.metadata:
                 final, receipt = self._receipt_resume_inputs(job)
@@ -165,6 +168,41 @@ class IngestService:
         except BaseException as error:
             self.queue.fail(job_id, error)
             raise
+
+    def _reject_derived_input(self, job: Job) -> None:
+        """Keep generated answers out of the immutable raw evidence pipeline."""
+        candidates: list[Path] = []
+        for value in (
+            job.source_path,
+            job.metadata.get("original_source_path"),
+            job.metadata.get("claimed_path"),
+        ):
+            if isinstance(value, str) and value:
+                candidate = Path(os.path.abspath(value))
+                if candidate not in candidates:
+                    candidates.append(candidate)
+        answers = Path(os.path.abspath(os.fspath(self.vault.answers)))
+        for candidate in candidates:
+            if candidate.is_relative_to(answers):
+                raise ValueError("derived answer cannot be ingested as a raw source")
+            if candidate.suffix.casefold() not in {".md", ".markdown"}:
+                continue
+            try:
+                with self._open_pinned_regular(candidate) as (descriptor, _):
+                    data = os.read(descriptor, _DERIVED_HEADER_BYTES + 1)
+            except FileNotFoundError:
+                continue
+            if len(data) > _DERIVED_HEADER_BYTES or not data.startswith(b"---\n"):
+                continue
+            marker = data.find(b"\n---\n", 4)
+            if marker < 0:
+                continue
+            try:
+                header = data[4:marker].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if _DERIVED_TYPE.search(header):
+                raise ValueError("derived answer cannot be ingested as a raw source")
 
     def compile_extraction(self, source: SourceVersion, extraction: dict[str, Any]) -> list[str]:
         """Public compatibility wrapper: return pages, never a manual handoff path."""

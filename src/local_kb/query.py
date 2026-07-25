@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Collection
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,24 @@ MAX_PACKET_BYTES = 256_000
 MAX_PENDING_JOBS = 40
 MAX_JOB_TEXT = 256
 _FRONTMATTER_LINE = re.compile(r"^([a-z_]+):\s*(.*)$")
+
+
+def evidence_sha256(item: dict[str, object]) -> str:
+    """Hash the immutable evidence identity and exact text, not mutable ranking."""
+    if not isinstance(item, dict):
+        raise TypeError("evidence must be an object")
+    kind = item.get("kind")
+    if kind == "raw_fragment":
+        fields = ("kind", "source_id", "version_id", "locator", "text")
+    elif kind == "derived_wiki":
+        fields = ("kind", "path", "locator", "source_ids", "text")
+    else:
+        raise ValueError("unsupported evidence kind")
+    canonical = {field: item.get(field) for field in fields}
+    encoded = json.dumps(
+        canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _now() -> str:
@@ -182,7 +201,7 @@ def _safe_read_wiki(catalog: Catalog, vault: VaultPaths, question: str, spaces: 
         if not current:
             continue
         source_ids = _frontmatter_list(header, "source_ids")
-        candidates.append({
+        candidate = {
             "kind": "derived_wiki", "evidence_class": "derived", "space": space, "path": path.relative_to(vault.root).as_posix(),
             "locator": "Current State", "text": current[:MAX_EVIDENCE_TEXT],
             "source_ids": source_ids, "score": float(len(direct_routes) + sum(route.casefold() in title_and_aliases for route in direct_routes)),
@@ -191,7 +210,9 @@ def _safe_read_wiki(catalog: Catalog, vault: VaultPaths, question: str, spaces: 
             "related": _frontmatter_list(header, "related"), "page_type": values.get("type", ""),
             "updated_at": values.get("updated_at", ""),
             "truncated": len(current) > MAX_EVIDENCE_TEXT,
-        })
+        }
+        candidate["evidence_sha256"] = evidence_sha256(candidate)
+        candidates.append(candidate)
     all_ids = list(dict.fromkeys(source_id for item in candidates for source_id in item["source_ids"]))[:128]
     paths_by_source: dict[str, list[str]] = {}
     if all_ids:
@@ -290,14 +311,16 @@ def _significant_routes(question: str) -> tuple[str, ...]:
 def _raw_evidence(hits: list[EvidenceHit]) -> list[dict[str, object]]:
     evidence: list[dict[str, object]] = []
     for hit in hits:
-        evidence.append({
+        item = {
             "kind": "raw_fragment", "source_id": hit.source_id, "version_id": hit.version_id,
             "space": hit.space, "path": hit.relative_path, "locator": hit.locator,
             "text": hit.text[:MAX_EVIDENCE_TEXT], "score": round(hit.score, 6),
             "route": hit.route,
             "routes": list(hit.routes), "coverage": hit.coverage,
             "truncated": len(hit.text) > MAX_EVIDENCE_TEXT,
-        })
+        }
+        item["evidence_sha256"] = evidence_sha256(item)
+        evidence.append(item)
     return evidence
 
 
@@ -407,7 +430,7 @@ class QueryService:
             "status": "ready" if evidence else "insufficient_evidence",
             "instructions": [
                 "只能依據 evidence 回答，不可補造事實。",
-                "raw_fragment 要引用 source_id、version_id、locator；derived_wiki 要引用 path、locator、source_ids，且不可當成原文。",
+                "raw_fragment 要引用 source_id、version_id、locator、evidence_sha256；derived_wiki 要引用 path、locator、source_ids、evidence_sha256，且不可當成原文。",
                 "遇到衝突、未知或證據不足時，明確說明並降低信心。",
                 "不要把 pending_jobs 當成已完成或已驗證的證據。",
             ],
