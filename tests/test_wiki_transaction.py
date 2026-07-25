@@ -156,6 +156,8 @@ def test_committed_partial_cleanup_recovers_from_live_evidence(vault: Path, monk
     monkeypatch.setattr("local_kb.transaction.shutil.rmtree", partial_then_fail)
     tx.publish(lambda _: None)
     assert tx.cleanup_warning and (vault / "20_wiki/page.md").read_text(encoding="utf-8") == "new"
+    assert not tx.stage_root.exists()
+    assert list((vault / ".kb/cleanup").glob("*.committed"))
     recover_pending_transactions(vault)
     assert not list((vault / ".kb/staging").iterdir())
     followup = ChangeTransaction(vault)
@@ -163,15 +165,17 @@ def test_committed_partial_cleanup_recovers_from_live_evidence(vault: Path, monk
     followup.publish(lambda _: None)
 
 
-def test_committed_partial_journal_rejects_changed_live(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_committed_tombstone_cleanup_never_touches_changed_live(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     tx = ChangeTransaction(vault)
     tx.stage("20_wiki/page.md", "new")
+    real_rmtree = __import__("local_kb.transaction", fromlist=["shutil"]).shutil.rmtree
     monkeypatch.setattr("local_kb.transaction.shutil.rmtree", lambda *a, **k: (_ for _ in ()).throw(OSError("blocked")))
     tx.publish(lambda _: None)
     (vault / "20_wiki/page.md").write_text("foreign", encoding="utf-8")
-    with pytest.raises(Exception, match="committed live target changed"):
-        recover_pending_transactions(vault)
-    assert tx.stage_root.exists()
+    monkeypatch.setattr("local_kb.transaction.shutil.rmtree", real_rmtree)
+    recover_pending_transactions(vault)
+    assert (vault / "20_wiki/page.md").read_text(encoding="utf-8") == "foreign"
+    assert not tx.cleanup_tombstone.exists()
 
 
 def test_publish_rolls_back_existing_and_new_files_on_replace_failure(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:

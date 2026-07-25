@@ -157,7 +157,7 @@ def _recover_journal(vault: Path, journal: Path) -> None:
                 shutil.rmtree(journal)
                 cleanup_error = None
                 break
-            except OSError as exc:
+            except (OSError, RuntimeError) as exc:
                 cleanup_error = exc
         if cleanup_error is not None:
             raise cleanup_error
@@ -193,6 +193,7 @@ def _recover_journal(vault: Path, journal: Path) -> None:
 
 
 def _recover_locked(vault: Path, *, exclude: Path | None = None) -> None:
+    _recover_cleanup_tombstones(vault)
     staging = vault / ".kb" / "staging"
     if not staging.exists():
         return
@@ -204,6 +205,42 @@ def _recover_locked(vault: Path, *, exclude: Path | None = None) -> None:
         if not (journal / "manifest.json").exists():
             continue
         _recover_journal(vault, journal)
+
+
+def _cleanup_directory(vault: Path) -> Path:
+    runtime = vault / ".kb"
+    if _is_reparse(runtime) or not runtime.is_dir():
+        raise RuntimeError("unsafe .kb runtime directory")
+    aliases = [entry for entry in runtime.iterdir() if entry.name.casefold() == "cleanup"]
+    if any(entry.name != "cleanup" for entry in aliases):
+        raise RuntimeError("cleanup directory case alias")
+    cleanup = runtime / "cleanup"
+    if cleanup.exists():
+        if _is_reparse(cleanup) or not cleanup.is_dir():
+            raise RuntimeError("unsafe cleanup directory")
+    else:
+        cleanup.mkdir()
+        _fsync_dir(runtime)
+    return cleanup
+
+
+def _recover_cleanup_tombstones(vault: Path) -> None:
+    runtime = vault / ".kb"
+    if not runtime.exists():
+        return
+    cleanup = _cleanup_directory(vault)
+    for tombstone in sorted(cleanup.iterdir()):
+        if (not re.fullmatch(r"[0-9a-f]{32}\.committed", tombstone.name)
+                or _is_reparse(tombstone) or not tombstone.is_dir()
+                or tombstone.parent != cleanup):
+            raise RuntimeError("unsafe cleanup tombstone")
+        for _ in range(2):
+            try:
+                shutil.rmtree(tombstone)
+                _fsync_dir(cleanup)
+                break
+            except OSError:
+                continue
 
 
 def recover_pending_transactions(vault: str | Path, *, lock_timeout: float = 30.0) -> None:
@@ -226,6 +263,7 @@ class ChangeTransaction:
         self._created_live_dirs: list[Path] = []
         self.cleanup_warning: str | None = None
         self.lock_timeout = lock_timeout
+        self.cleanup_tombstone = self.vault / ".kb" / "cleanup" / f"{self.transaction_id}.committed"
 
     def _relative(self, relative_path: str | Path) -> str:
         raw = str(relative_path)
@@ -479,9 +517,21 @@ class ChangeTransaction:
                     raise RollbackError(original, [recovery_error]) from original
                 raise
             cleanup_error: OSError | None = None
+            try:
+                cleanup_root = _cleanup_directory(self.vault)
+                if self.cleanup_tombstone.exists():
+                    raise RuntimeError("cleanup tombstone already exists")
+                os.rename(self.stage_root, self.cleanup_tombstone)
+                _fsync_dir(self.stage_root.parent)
+                _fsync_dir(cleanup_root)
+            except OSError as exc:
+                self.cleanup_warning = f"committed; tombstone move pending: {exc}"
+                self._staged.clear()
+                return
             for _ in range(2):
                 try:
-                    shutil.rmtree(self.stage_root)
+                    shutil.rmtree(self.cleanup_tombstone)
+                    _fsync_dir(self.cleanup_tombstone.parent)
                     cleanup_error = None
                     break
                 except OSError as exc:
