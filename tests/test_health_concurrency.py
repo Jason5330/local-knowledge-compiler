@@ -308,7 +308,8 @@ def test_lint_detects_forged_catalog_fragments_and_fts_body(tmp_path):
     vault = _vault(tmp_path)
     source = _seed_cache(vault)
     database = vault.index / "catalog.sqlite3"
-    with sqlite3.connect(database) as connection:
+    connection = sqlite3.connect(database)
+    try:
         connection.execute(
             "UPDATE source_fragments SET text = 'FORGED' WHERE version_id = ?",
             (source.version_id,),
@@ -317,9 +318,138 @@ def test_lint_detects_forged_catalog_fragments_and_fts_body(tmp_path):
             "UPDATE source_fts SET body = 'FORGED' WHERE version_id = ?",
             (source.version_id,),
         )
+        connection.commit()
+    finally:
+        connection.close()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.execute("PRAGMA journal_mode=DELETE")
+    finally:
+        connection.close()
     report = lint(vault)
     assert report["healthy"] is False
     assert f"fragments:{source.version_id}" in report["issues"]["index_content_mismatches"]
+
+
+def test_catalog_snapshot_is_sqlite_consistent_during_wal_commits(tmp_path):
+    from contextlib import closing
+    import sqlite3
+    import threading
+
+    from local_kb.health import CatalogSnapshotUnavailable, _catalog_snapshot
+
+    database = tmp_path / "source.sqlite3"
+    writer = sqlite3.connect(database)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("CREATE TABLE values_table(value INTEGER PRIMARY KEY)")
+    writer.executemany(
+        "INSERT INTO values_table(value) VALUES (?)", [(value,) for value in range(200)]
+    )
+    writer.commit()
+    stop = threading.Event()
+
+    def mutate():
+        connection = sqlite3.connect(database)
+        value = 200
+        while not stop.is_set() and value < 400:
+            connection.execute("INSERT INTO values_table(value) VALUES (?)", (value,))
+            connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            value += 1
+        connection.close()
+
+    thread = threading.Thread(target=mutate)
+    thread.start()
+    try:
+        with pytest.raises(CatalogSnapshotUnavailable):
+            with _catalog_snapshot(database):
+                pass
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        writer.close()
+
+
+def test_catalog_snapshot_without_wal_does_not_change_source_files(tmp_path):
+    from contextlib import closing
+    import sqlite3
+
+    from local_kb.health import _catalog_snapshot
+
+    database = tmp_path / "source.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE values_table(value)")
+        connection.execute("INSERT INTO values_table VALUES (1)")
+    before = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.iterdir()
+    }
+    with _catalog_snapshot(database) as snapshot:
+        with closing(sqlite3.connect(snapshot)) as connection:
+            assert connection.execute("SELECT value FROM values_table").fetchone()[0] == 1
+    after = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.iterdir()
+    }
+    assert after == before
+
+
+def test_catalog_snapshot_with_wal_does_not_change_source_sidecars(tmp_path):
+    from contextlib import closing
+    import sqlite3
+
+    from local_kb.health import CatalogBusy, _catalog_snapshot
+
+    database = tmp_path / "source.sqlite3"
+    writer = sqlite3.connect(database)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("CREATE TABLE values_table(value)")
+    writer.execute("INSERT INTO values_table VALUES (1)")
+    writer.commit()
+    before = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.iterdir()
+    }
+    with pytest.raises(CatalogBusy):
+        with _catalog_snapshot(database):
+            pass
+    after = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.iterdir()
+    }
+    writer.close()
+    assert after == before
+
+
+def test_lint_fails_closed_without_touching_live_wal(tmp_path):
+    import sqlite3
+
+    from local_kb.health import lint
+
+    vault = _vault(tmp_path)
+    source = _seed_cache(vault)
+    database = vault.index / "catalog.sqlite3"
+    writer = sqlite3.connect(database)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute(
+        "UPDATE source_fragments SET text = 'live WAL' WHERE version_id = ?",
+        (source.version_id,),
+    )
+    writer.commit()
+    before = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in vault.index.iterdir() if path.is_file()
+    }
+    report = lint(vault)
+    after = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in vault.index.iterdir() if path.is_file()
+    }
+    writer.close()
+    assert report["healthy"] is False
+    assert "catalog_busy" in report["issues"]["index_raw_mismatches"]
+    assert after == before
 
 
 def test_rebuild_respects_the_single_writer_lock(tmp_path):

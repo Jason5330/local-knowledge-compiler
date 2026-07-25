@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import closing, contextmanager
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import re
 import sqlite3
 import stat
 import tempfile
+import time
 from uuid import uuid4
 
 from .catalog import Catalog
@@ -32,6 +34,14 @@ MAX_CACHE_FILES = 100_000
 MAX_WIKI_BYTES = 4 * 1024 * 1024
 MAX_QUEUE_ENTRIES = 10_000
 MAX_CATALOG_FILE_BYTES = 256 * 1024 * 1024
+
+
+class CatalogSnapshotUnavailable(RuntimeError):
+    """The live catalog could not be snapshotted without touching its files."""
+
+
+class CatalogBusy(CatalogSnapshotUnavailable):
+    """A live WAL/SHM requires mutable SQLite reader locks; retry later."""
 
 
 def rebuild_catalog(vault: VaultPaths | Path | str) -> int:
@@ -196,7 +206,7 @@ def lint(vault: VaultPaths | Path | str) -> dict[str, object]:
         elif any(str(raw[key]) != str(indexed[key]) for key in ("source_id", "space", "relative_path", "sha256")):
             index_raw.append(f"metadata:{version_id}")
     if catalog_error:
-        index_raw.append("catalog_unavailable_or_invalid")
+        index_raw.append(catalog_error)
     if raw_error:
         index_raw.append("raw_inventory_invalid")
     issues["index_raw_mismatches"] = index_raw
@@ -341,10 +351,10 @@ def _catalog_inventory(
     dict[str, dict[str, object]],
     dict[str, list[tuple[str, str]]],
     dict[str, list[tuple[str, str, str, str, str]]],
-    bool,
+    str | None,
 ]:
     if not path.is_file():
-        return {}, {}, {}, True
+        return {}, {}, {}, "catalog_unavailable_or_invalid"
     try:
         # SQLite may create -shm even for mode=ro.  Inspect a bounded private
         # snapshot so lint observes WAL commits without changing the vault.
@@ -384,29 +394,94 @@ def _catalog_inventory(
             values.sort()
         for values in fts.values():
             values.sort()
-        return sources, fragments, fts, False
+        return sources, fragments, fts, None
+    except CatalogBusy:
+        return {}, {}, {}, "catalog_busy"
+    except CatalogSnapshotUnavailable:
+        return {}, {}, {}, "catalog_snapshot_unavailable"
     except (OSError, ValueError, sqlite3.Error):
-        return {}, {}, {}, True
+        return {}, {}, {}, "catalog_unavailable_or_invalid"
 
 
 @contextmanager
 def _catalog_snapshot(path: Path):
     with tempfile.TemporaryDirectory(prefix="local-kb-lint-") as directory:
         destination = Path(directory) / path.name
-        with _pinned_directory(path.parent, path.parent) as parent_fd:
-            for suffix in ("", "-wal", "-shm"):
-                name = path.name + suffix
-                source = path.parent / name
-                try:
-                    payload = _read_bytes(
-                        source, parent_fd, name, MAX_CATALOG_FILE_BYTES
-                    )
-                except FileNotFoundError:
-                    if not suffix:
-                        raise
-                    continue
-                (Path(directory) / name).write_bytes(payload)
+        try:
+            before = _catalog_file_state(path)
+        except (OSError, ValueError) as error:
+            raise CatalogSnapshotUnavailable("catalog changed before snapshot") from error
+        if any(
+            name.endswith(("-wal", "-shm")) and token["size"]
+            for name, token in before.items()
+        ):
+            raise CatalogBusy("catalog has a live WAL/SHM; retry after the writer stops")
+        uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+        started = time.monotonic()
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as source:
+            source.execute("PRAGMA query_only=ON")
+            source.execute("BEGIN")
+            source.execute("SELECT count(*) FROM sqlite_schema").fetchone()
+            page_size = int(source.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(source.execute("PRAGMA page_count").fetchone()[0])
+            if page_size <= 0 or page_count < 0 or page_size * page_count > MAX_CATALOG_FILE_BYTES:
+                raise ValueError("catalog exceeds snapshot size limit")
+
+            def progress(_status: int, _remaining: int, total: int) -> None:
+                if total * page_size > MAX_CATALOG_FILE_BYTES:
+                    raise ValueError("catalog exceeds snapshot size limit")
+                if time.monotonic() - started > 10:
+                    raise TimeoutError("catalog snapshot timed out")
+
+            with closing(sqlite3.connect(destination)) as target:
+                source.backup(target, pages=256, progress=progress, sleep=0.01)
+                if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise CatalogSnapshotUnavailable("catalog snapshot failed integrity check")
+            source.rollback()
+        try:
+            after = _catalog_file_state(path)
+        except (OSError, ValueError) as error:
+            raise CatalogSnapshotUnavailable("catalog changed during snapshot") from error
+        if after != before:
+            raise CatalogSnapshotUnavailable("catalog changed during snapshot")
         yield destination
+
+
+def _catalog_file_state(path: Path) -> dict[str, dict[str, object]]:
+    state: dict[str, dict[str, object]] = {}
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            if candidate == path:
+                raise
+            continue
+        if not stat.S_ISREG(info.st_mode) or candidate.is_symlink():
+            raise ValueError("catalog path is unsafe")
+        if info.st_size > MAX_CATALOG_FILE_BYTES:
+            raise ValueError("catalog file exceeds snapshot size limit")
+        digest = hashlib.sha256()
+        with _pinned_directory(path.parent, path.parent) as parent_fd:
+            with _open_pinned_regular(
+                candidate, parent_fd=parent_fd, name=candidate.name
+            ) as (descriptor, _):
+                total = 0
+                while chunk := os.read(descriptor, 65_536):
+                    total += len(chunk)
+                    if total > MAX_CATALOG_FILE_BYTES:
+                        raise ValueError("catalog file exceeds snapshot size limit")
+                    digest.update(chunk)
+        current = candidate.lstat()
+        if (
+            current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns
+        ) != (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns):
+            raise ValueError("catalog file changed while hashing")
+        state[candidate.name] = {
+            "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+            "sha256": digest.hexdigest(),
+        }
+    return state
 
 
 def _paths(vault: VaultPaths | Path | str) -> VaultPaths:
