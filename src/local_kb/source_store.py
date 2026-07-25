@@ -59,6 +59,41 @@ def _open_posix_directory_at(parent_fd: int, component: str) -> int:
         raise
 
 
+def _posix_fstat(descriptor: int):
+    return os.fstat(descriptor)
+
+
+def _posix_stat_at(
+    component: str, *, dir_fd: int, follow_symlinks: bool
+):
+    return os.stat(
+        component,
+        dir_fd=dir_fd,
+        follow_symlinks=follow_symlinks,
+    )
+
+
+def _verify_posix_directory_binding(
+    parent_fd: int, component: str, child_fd: int
+) -> None:
+    try:
+        pinned = _posix_fstat(child_fd)
+        current = _posix_stat_at(
+            component,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise ValueError("source directory binding is missing") from error
+    if not stat.S_ISDIR(current.st_mode):
+        raise ValueError("source directory binding is not a directory")
+    if (pinned.st_dev, pinned.st_ino) != (
+        current.st_dev,
+        current.st_ino,
+    ):
+        raise ValueError("source directory binding changed during archive")
+
+
 def _posix_rename_noreplace(
     old_parent_fd: int,
     old_name: str,
@@ -483,6 +518,11 @@ class SourceStore:
                     )
                     self._write_posix_manifest(stage_fd, source)
                     self._sync_pinned_directory(stage_fd)
+                    _verify_posix_directory_binding(
+                        space_fd,
+                        source.source_id,
+                        source_fd,
+                    )
                     _posix_rename_noreplace(
                         source_fd,
                         stage_name,
@@ -491,6 +531,11 @@ class SourceStore:
                     )
                     published = True
                     self._sync_pinned_directory(source_fd)
+                    _verify_posix_directory_binding(
+                        space_fd,
+                        source.source_id,
+                        source_fd,
+                    )
                 except BaseException:
                     if stage_fd is not None:
                         os.close(stage_fd)

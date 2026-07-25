@@ -625,3 +625,102 @@ def test_posix_new_directory_sync_failure_closes_opened_fd(
 
     assert closed == [73]
     assert removed == [("new-source", 41)]
+
+
+def test_posix_directory_binding_rejects_changed_inode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_kb import source_store
+
+    class FakeStat:
+        def __init__(self, device: int, inode: int, mode: int) -> None:
+            self.st_dev = device
+            self.st_ino = inode
+            self.st_mode = mode
+
+    monkeypatch.setattr(
+        source_store,
+        "_posix_fstat",
+        lambda descriptor: FakeStat(1, 100, source_store.stat.S_IFDIR),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        source_store,
+        "_posix_stat_at",
+        lambda component, *, dir_fd, follow_symlinks: FakeStat(
+            1, 200, source_store.stat.S_IFDIR
+        ),
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="binding"):
+        source_store._verify_posix_directory_binding(41, "source", 73)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX dir_fd semantics")
+def test_posix_source_rename_to_symlink_during_copy_fails_without_external_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb.source_store import SourceStore
+
+    raw_root = tmp_path / "10_raw"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    incoming = write_file(tmp_path / "race.txt", b"binding race")
+    digest = hashlib.sha256(b"binding race").hexdigest()
+    source_id = f"src_{digest[:16]}"
+    source_dir = raw_root / "work" / source_id
+    moved_dir = source_dir.with_name(f"{source_id}_moved")
+    store = SourceStore(raw_root)
+    original_copy = store._copy_posix_file
+
+    def race_copy(*args, **kwargs) -> None:
+        source_dir.rename(moved_dir)
+        source_dir.symlink_to(outside, target_is_directory=True)
+        original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_copy_posix_file", race_copy)
+
+    with pytest.raises(ValueError, match="binding"):
+        store.archive(incoming, "work")
+
+    assert source_dir.is_symlink()
+    assert moved_dir.is_dir()
+    assert list(moved_dir.iterdir()) == []
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX dir_fd semantics")
+def test_posix_binding_change_after_publish_preserves_recoverable_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb import source_store
+
+    raw_root = tmp_path / "10_raw"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    incoming = write_file(tmp_path / "post-race.txt", b"post publish race")
+    digest = hashlib.sha256(b"post publish race").hexdigest()
+    source_id = f"src_{digest[:16]}"
+    version_id = f"ver_{digest}"
+    source_dir = raw_root / "work" / source_id
+    moved_dir = source_dir.with_name(f"{source_id}_moved")
+    real_rename = source_store._posix_rename_noreplace
+
+    def race_after_publish(*args, **kwargs) -> None:
+        real_rename(*args, **kwargs)
+        source_dir.rename(moved_dir)
+        source_dir.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(
+        source_store, "_posix_rename_noreplace", race_after_publish
+    )
+
+    with pytest.raises(ValueError, match="binding"):
+        source_store.SourceStore(raw_root).archive(incoming, "work")
+
+    recovered = moved_dir / version_id
+    assert (recovered / "post-race.txt").read_bytes() == b"post publish race"
+    assert (recovered / "manifest.json").is_file()
+    assert source_dir.is_symlink()
+    assert list(outside.iterdir()) == []
