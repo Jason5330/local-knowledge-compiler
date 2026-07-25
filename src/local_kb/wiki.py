@@ -69,8 +69,19 @@ def _validate_body(value: str, label: str) -> None:
     if (not isinstance(value, str) or not value.strip()
             or any((ord(char) < 32 and char not in {"\t", "\n"}) or ord(char) == 127 for char in value)):
         raise ValueError(f"{label} must be non-empty safe text")
-    for line in value.splitlines():
-        if line.strip() in {f"## {heading}" for heading in _HEADINGS}:
+    lines = value.splitlines()
+    reserved = {heading.casefold() for heading in _HEADINGS}
+    for index, line in enumerate(lines):
+        plain: str | None = None
+        atx = re.fullmatch(r" {0,3}##[ \t]+(.+?)(?:[ \t]+#+[ \t]*)?", line)
+        html = re.fullmatch(r"\s*<h2(?:\s[^>]*)?>(.*?)</h2>\s*", line, re.IGNORECASE)
+        if atx:
+            plain = atx.group(1)
+        elif html:
+            plain = re.sub(r"<[^>]+>", "", html.group(1))
+        elif index and re.fullmatch(r" {0,3}-{3,}\s*", line):
+            plain = lines[index - 1].strip()
+        if plain is not None and re.sub(r"\s+", " ", plain.strip()).casefold() in reserved:
             raise ValueError(f"{label} may not inject a reserved section heading")
 
 

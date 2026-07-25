@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import errno
+import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -12,6 +14,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from typing import Callable, Iterator
 
@@ -31,6 +34,10 @@ class RollbackError(RuntimeError):
         self.original = original
         self.errors = tuple(errors)
         super().__init__(f"rollback incomplete after {original}: " + "; ".join(str(error) for error in errors))
+
+
+class ConflictError(RuntimeError):
+    """The live namespace changed after the transaction was prepared."""
 
 
 def _is_reparse(path: Path) -> bool:
@@ -57,10 +64,93 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _fingerprint(path: Path) -> dict[str, object]:
+    info = path.stat()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {"sha256": digest, "size": info.st_size, "mode": stat.S_IMODE(info.st_mode),
+            "mtime_ns": info.st_mtime_ns}
+
+
+def _write_manifest(journal: Path, manifest: dict[str, object]) -> None:
+    destination = journal / "manifest.json"
+    fd, name = tempfile.mkstemp(prefix=".manifest-", suffix=".tmp", dir=journal)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as output:
+            json.dump(manifest, output, sort_keys=True, separators=(",", ":"))
+            output.write("\n"); output.flush(); os.fsync(output.fileno())
+        os.replace(temporary, destination)
+        _fsync_dir(journal)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _recover_journal(vault: Path, journal: Path) -> None:
+    manifest_path = journal / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("version") != 1 or manifest.get("state") not in {"prepared", "committed"}:
+            raise ValueError("invalid journal manifest")
+        entries = manifest["entries"]
+        if not isinstance(entries, list):
+            raise ValueError("invalid journal entries")
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"corrupt transaction journal: {journal.name}") from exc
+    # Validate the complete manifest before touching any live namespace.
+    for item in entries:
+        if not isinstance(item, dict):
+            raise RuntimeError("corrupt transaction journal entry")
+        relative = str(item.get("relative", ""))
+        pure = PurePosixPath(relative)
+        backup_rel = str(item.get("backup", ""))
+        new_rel = str(item.get("new", ""))
+        if (str(pure) != relative or pure.is_absolute() or ".." in pure.parts
+                or not ChangeTransaction._managed(relative)
+                or not re.fullmatch(r"backups/[0-9]+\.bak", backup_rel)
+                or not re.fullmatch(r"new/[0-9]+\.new", new_rel)
+                or not isinstance(item.get("existed"), bool)
+                or not isinstance(item.get("published"), bool)):
+            raise RuntimeError("corrupt transaction journal entry")
+    if manifest["state"] == "prepared":
+        for item in reversed(entries):
+            relative = str(item["relative"])
+            pure = PurePosixPath(relative)
+            target = vault / Path(*pure.parts)
+            backup = journal / str(item["backup"])
+            if backup.exists():
+                target.unlink(missing_ok=True)
+                os.replace(backup, target)
+                _fsync_file(target); _fsync_dir(target.parent)
+            elif bool(item.get("published")) and not bool(item["existed"]):
+                target.unlink(missing_ok=True); _fsync_dir(target.parent)
+    shutil.rmtree(journal)
+
+
+def _recover_locked(vault: Path, *, exclude: Path | None = None) -> None:
+    staging = vault / ".kb" / "staging"
+    if not staging.exists():
+        return
+    for journal in sorted(staging.iterdir()):
+        if exclude is not None and journal == exclude:
+            continue
+        if _is_reparse(journal) or not journal.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", journal.name):
+            raise RuntimeError("unsafe transaction journal")
+        if not (journal / "manifest.json").exists():
+            continue
+        _recover_journal(vault, journal)
+
+
+def recover_pending_transactions(vault: str | Path, *, lock_timeout: float = 30.0) -> None:
+    """Recover every durable prepared journal and remove committed journals."""
+    transaction = ChangeTransaction(vault, lock_timeout=lock_timeout)
+    with transaction._writer_lock():
+        _recover_locked(transaction.vault)
+
+
 class ChangeTransaction:
     """A private staging transaction for the vault's generated files only."""
 
-    def __init__(self, vault: str | Path) -> None:
+    def __init__(self, vault: str | Path, *, lock_timeout: float = 30.0) -> None:
         self.vault = Path(vault).resolve(strict=False)
         if not self.vault.exists() or not self.vault.is_dir() or _is_reparse(self.vault):
             raise ValueError("vault must be an existing non-reparse directory")
@@ -69,6 +159,7 @@ class ChangeTransaction:
         self._staged: dict[str, Path] = {}
         self._created_live_dirs: list[Path] = []
         self.cleanup_warning: str | None = None
+        self.lock_timeout = lock_timeout
 
     def _relative(self, relative_path: str | Path) -> str:
         raw = str(relative_path)
@@ -169,7 +260,9 @@ class ChangeTransaction:
         lock_key = str(lock_path.resolve(strict=False)).casefold()
         with _LOCK_GUARD:
             thread_lock = _THREAD_LOCKS.setdefault(lock_key, threading.Lock())
-        with thread_lock:
+        if not thread_lock.acquire(timeout=self.lock_timeout):
+            raise TimeoutError("writer lock timed out")
+        try:
             created = False
             flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
             flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -186,19 +279,29 @@ class ChangeTransaction:
                     handle.write(b"0")
                     handle.flush()
                     os.fsync(handle.fileno())
-                if os.name == "nt":
-                    import msvcrt
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-                    unlock = lambda: msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                    unlock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                deadline = time.monotonic() + self.lock_timeout
+                while True:
+                    try:
+                        if os.name == "nt":
+                            import msvcrt
+                            handle.seek(0)
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                            unlock = lambda: msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            unlock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                        break
+                    except (OSError, BlockingIOError):
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("writer lock timed out")
+                        time.sleep(0.05)
                 try:
                     yield
                 finally:
                     unlock()
+        finally:
+            thread_lock.release()
 
     def _staged_paths(self) -> tuple[tuple[str, Path], ...]:
         return tuple(sorted(((path.relative_to(self.stage_root).as_posix(), path)
@@ -224,75 +327,81 @@ class ChangeTransaction:
             raise
 
     def publish(self, validator: Callable[[tuple[Path, ...]], object]) -> None:
-        """Validate then atomically publish all staged files, or restore every live file."""
+        """Durably journal, publish, mark committed, then remove the journal."""
         if not callable(validator):
             raise ValueError("validator must be callable")
         entries = self._staged_paths()
         with self._writer_lock():
-            # Validation is deliberately before *any* live directory or file mutation.
+            _recover_locked(self.vault, exclude=self.stage_root)
             validator(tuple(staged for _, staged in entries))
-            prepared: list[tuple[Path, Path, bytes | None, os.stat_result | None]] = []
+            manifest_entries: list[dict[str, object]] = []
+            preparation_metadata: list[tuple[Path, dict[str, object]]] = []
             try:
-                for relative, staged in entries:
+                new_root = self.stage_root / "new"
+                backup_root = self.stage_root / "backups"
+                new_root.mkdir(parents=True, exist_ok=True)
+                backup_root.mkdir(exist_ok=True)
+                for index, (relative, staged) in enumerate(entries):
                     target = self.vault / Path(*PurePosixPath(relative).parts)
                     self._case_safe(target)
                     self._safe_parents(target, create=False)
-                    old_stat = target.stat() if target.exists() else None
-                    old_bytes = target.read_bytes() if old_stat is not None else None
-                    prepared.append((target, self._write_live_temp(target, staged), old_bytes, old_stat))
-                # Commit point: the private stage must be gone before any live
-                # replacement; backups are already retained in memory.
-                stage_error: OSError | None = None
-                for _ in range(2):
+                    existed = target.exists()
+                    fingerprint = _fingerprint(target) if existed else None
+                    if fingerprint is not None:
+                        preparation_metadata.append((target, fingerprint))
+                    new_path = new_root / f"{index}.new"
+                    shutil.copyfile(staged, new_path)
+                    _fsync_file(new_path)
+                    manifest_entries.append({"relative": relative, "existed": existed,
+                        "base": fingerprint, "new": f"new/{index}.new", "backup": f"backups/{index}.bak",
+                        "published": False})
+                manifest = {"version": 1, "state": "prepared", "entries": manifest_entries}
+                _write_manifest(self.stage_root, manifest)
+                for index, item in enumerate(manifest_entries):
+                    target = self.vault / Path(*PurePosixPath(str(item["relative"])).parts)
+                    backup = self.stage_root / str(item["backup"])
+                    new_path = self.stage_root / str(item["new"])
+                    self._safe_parents(target, create=True)
+                    if item["existed"]:
+                        if not target.exists():
+                            raise ConflictError(f"live target disappeared: {item['relative']}")
+                        os.replace(target, backup)
+                        _fsync_dir(target.parent); _fsync_dir(backup.parent)
+                        if _fingerprint(backup) != item["base"]:
+                            os.replace(backup, target)
+                            raise ConflictError(f"live target changed: {item['relative']}")
+                    elif target.exists():
+                        raise ConflictError(f"new target appeared: {item['relative']}")
                     try:
-                        shutil.rmtree(self.stage_root, ignore_errors=False)
-                        stage_error = None
-                        break
-                    except OSError as exc:
-                        stage_error = exc
-                if stage_error is not None:
-                    self._cleanup_created_dirs()
-                    raise stage_error
-                published: list[tuple[Path, bytes | None, os.stat_result | None]] = []
+                        os.link(new_path, target)
+                    except FileExistsError as exc:
+                        raise ConflictError(f"target concurrently appeared: {item['relative']}") from exc
+                    _fsync_file(target); _fsync_dir(target.parent)
+                    item["published"] = True
+                    _write_manifest(self.stage_root, manifest)
+                    self._crash_hook("published", index)
+                manifest["state"] = "committed"
+                _write_manifest(self.stage_root, manifest)
+                self._crash_hook("committed", len(manifest_entries))
+            except BaseException as original:
                 try:
-                    for target, temporary, old_bytes, old_stat in prepared:
-                        os.replace(temporary, target)
-                        # A successful replace is externally visible even if the
-                        # following durability check fails, so it must be tracked
-                        # before fsync in order to be rolled back.
-                        published.append((target, old_bytes, old_stat))
-                        _fsync_file(target)
-                        _fsync_dir(target.parent)
-                except BaseException as original:
-                    rollback_errors: list[BaseException] = []
-                    for target, old_bytes, old_stat in reversed(published):
-                        for attempt in range(2):
-                            try:
-                                if old_bytes is None:
-                                    try:
-                                        target.unlink()
-                                    except FileNotFoundError:
-                                        pass
-                                else:
-                                    self._restore(target, old_bytes, old_stat)
-                                break
-                            except BaseException as exc:
-                                if attempt:
-                                    rollback_errors.append(exc)
-                    self._cleanup_created_dirs()
-                    if rollback_errors:
-                        raise RollbackError(original, rollback_errors) from original
-                    raise
-            except BaseException:
-                self._cleanup_created_dirs()
+                    if (self.stage_root / "manifest.json").exists():
+                        _recover_journal(self.vault, self.stage_root)
+                    else:
+                        shutil.rmtree(self.stage_root / "new", ignore_errors=True)
+                        shutil.rmtree(self.stage_root / "backups", ignore_errors=True)
+                        for target, base in preparation_metadata:
+                            if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() == base["sha256"]:
+                                os.chmod(target, int(base["mode"]))
+                                os.utime(target, ns=(target.stat().st_atime_ns, int(base["mtime_ns"])))
+                except BaseException as recovery_error:
+                    raise RollbackError(original, [recovery_error]) from original
                 raise
-            finally:
-                for _, temporary, _, _ in prepared:
-                    try:
-                        temporary.unlink()
-                    except FileNotFoundError:
-                        pass
+            shutil.rmtree(self.stage_root)
             self._staged.clear()
+
+    def _crash_hook(self, point: str, index: int) -> None:
+        """Test seam used by subprocess crash-recovery tests."""
 
     def _cleanup_created_dirs(self) -> None:
         for directory in reversed(self._created_live_dirs):
@@ -352,11 +461,23 @@ class ChangeTransaction:
         if (not isinstance(message, str) or not message.strip() or message != message.strip()
                 or any(ord(char) < 32 or ord(char) == 127 for char in message)):
             raise ValueError("commit message must be a single non-empty safe line")
+        index_path: Path | None = None
+        index_bytes: bytes | None = None
+        index_existed = False
         try:
-            inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=self.vault,
-                                    text=True, capture_output=True, check=False).returncode == 0
-            if not inside:
+            if not (self.vault / ".git").exists():
                 subprocess.run(["git", "init"], cwd=self.vault, text=True, capture_output=True, check=True)
+            top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=self.vault,
+                                 text=True, capture_output=True, check=True).stdout.strip()
+            if Path(top).resolve() != self.vault:
+                raise RuntimeError("vault must be an independent Git repository")
+            raw_index = subprocess.run(["git", "rev-parse", "--git-path", "index"], cwd=self.vault,
+                                       text=True, capture_output=True, check=True).stdout.strip()
+            index_path = Path(raw_index)
+            if not index_path.is_absolute():
+                index_path = self.vault / index_path
+            index_existed = index_path.exists()
+            index_bytes = index_path.read_bytes() if index_existed else None
             pathspecs = [path for path in _MANAGED_ROOTS if (self.vault / path).exists()]
             tracked = subprocess.run(["git", "ls-files", "-z", "--", *_MANAGED_ROOTS], cwd=self.vault,
                                      text=False, capture_output=True, check=True).stdout.split(b"\0")
@@ -385,6 +506,14 @@ class ChangeTransaction:
             subprocess.run(command, cwd=self.vault, text=True, capture_output=True, check=True,
                            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
             return True
-        except (OSError, subprocess.CalledProcessError) as exc:
+        except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+            if index_path is not None:
+                if index_existed and index_bytes is not None:
+                    fd, name = tempfile.mkstemp(prefix=".index-restore-", dir=index_path.parent)
+                    with os.fdopen(fd, "wb") as output:
+                        output.write(index_bytes); output.flush(); os.fsync(output.fileno())
+                    os.replace(name, index_path)
+                elif not index_existed:
+                    index_path.unlink(missing_ok=True)
             detail = getattr(exc, "stderr", "") or str(exc)
             raise RuntimeError(f"git commit failed: {detail}") from exc

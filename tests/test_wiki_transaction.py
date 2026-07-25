@@ -52,6 +52,18 @@ def test_conflicts_is_safe_normalized_multiline_body() -> None:
         render_page(page(conflicts="## Related\ntrick"))
 
 
+@pytest.mark.parametrize("body", [
+    "  ##   Evidence ###", "Evidence\n---", "<H2 class='x'>Evidence</H2>",
+    "### Evidence",
+])
+def test_reserved_h2_commonmark_variants(body: str) -> None:
+    if body.startswith("###"):
+        render_page(page(current_state=body))  # H3 remains ordinary Markdown.
+    else:
+        with pytest.raises(ValueError, match="reserved"):
+            render_page(page(current_state=body))
+
+
 @pytest.mark.parametrize("changes", [
     {"source_ids": ()}, {"source_ids": ("source-1", "source-1")},
     {"source_ids": ("bad\nsource",)}, {"title": "bad\ntitle"},
