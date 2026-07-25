@@ -1,0 +1,6 @@
+.superpowers/
+.brainstorm-server.*
+.kb/
+__pycache__/
+*.pyc
+
