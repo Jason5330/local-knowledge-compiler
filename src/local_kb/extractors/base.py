@@ -43,6 +43,31 @@ class ExtractionError(RuntimeError):
     """A supported local document could not safely be read."""
 
 
+class FragmentCollector:
+    """Build extraction output while enforcing budgets before allocation."""
+
+    def __init__(self) -> None:
+        self._fragments: list[Fragment] = []
+        self._characters = 0
+
+    def append(self, locator: str, text: str) -> None:
+        if len(self._fragments) + 1 > MAX_FRAGMENT_COUNT:
+            raise ExtractionError(
+                f"extraction fragment count exceeds budget of {MAX_FRAGMENT_COUNT}"
+            )
+        next_characters = self._characters + len(text)
+        if next_characters > MAX_EXTRACTION_CHARACTERS:
+            raise ExtractionError(
+                "extraction character count exceeds budget of "
+                f"{MAX_EXTRACTION_CHARACTERS}"
+            )
+        self._fragments.append(Fragment(locator, text))
+        self._characters = next_characters
+
+    def extraction(self, status: str, warning: str | None = None) -> Extraction:
+        return Extraction(status, self._fragments, warning)
+
+
 def enforce_extraction_budget(extraction: Extraction) -> Extraction:
     """Reject extractor output that exceeds the shared evidence budget."""
     if len(extraction.fragments) > MAX_FRAGMENT_COUNT:
@@ -118,7 +143,7 @@ def _open_windows_source(candidate: Path) -> tuple[int, list[int]]:
     from ctypes import wintypes
 
     generic_read = 0x80000000
-    share_read_write = 0x00000001 | 0x00000002  # Deliberately excludes FILE_SHARE_DELETE.
+    share_read_only = 0x00000001  # Deliberately excludes WRITE and DELETE sharing.
     open_existing = 3
     flag_backup_semantics = 0x02000000
     flag_open_reparse_point = 0x00200000
@@ -168,7 +193,7 @@ def _open_windows_source(candidate: Path) -> tuple[int, list[int]]:
         handle = create_file(
             component,
             generic_read,
-            share_read_write,
+            share_read_only,
             None,
             open_existing,
             flags,
@@ -270,22 +295,28 @@ def _cleanup_snapshot_directory(snapshot_directory: Path) -> None:
     raise SnapshotCleanupError(snapshot_directory) from failure
 
 
+def _source_metadata(source_fd: int) -> tuple[int, int | None]:
+    source_stat = os.fstat(source_fd)
+    return source_stat.st_size, getattr(source_stat, "st_mtime_ns", None)
+
+
 @contextmanager
 def snapshot_file(path: Path):
     """Copy a pinned, regular local source to a private immutable parser input."""
     candidate, source_fd, directory_handles, close_directory = _open_safe_source(path)
     try:
-        source_size = os.fstat(source_fd).st_size
+        initial_size, initial_mtime_ns = _source_metadata(source_fd)
     except Exception:
         _close_source(source_fd, directory_handles, close_directory)
         raise
-    if source_size > MAX_SOURCE_BYTES:
+    if initial_size > MAX_SOURCE_BYTES:
         _close_source(source_fd, directory_handles, close_directory)
         raise ExtractionError(
             f"supported source exceeds 100 MiB budget: {candidate}"
         )
     snapshot_directory: Path | None = None
     destination_fd: int | None = None
+    source_open = True
     try:
         snapshot_directory = Path(tempfile.mkdtemp(prefix="local-kb-extract-"))
         snapshot_path = snapshot_directory / candidate.name
@@ -294,20 +325,39 @@ def snapshot_file(path: Path):
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
             0o600,
         )
+        copied = 0
         while chunk := os.read(source_fd, 1024 * 1024):
+            next_copied = copied + len(chunk)
+            if next_copied > MAX_SOURCE_BYTES:
+                raise ExtractionError(
+                    f"source grew beyond source budget during snapshot copy: {candidate}"
+                )
             _write_all(destination_fd, chunk)
+            copied = next_copied
+        final_size, final_mtime_ns = _source_metadata(source_fd)
+        metadata_changed = final_size != initial_size
+        if initial_mtime_ns is not None and final_mtime_ns is not None:
+            metadata_changed = metadata_changed or final_mtime_ns != initial_mtime_ns
+        if copied != initial_size or metadata_changed:
+            raise ExtractionError(f"source changed during snapshot copy: {candidate}")
         os.fsync(destination_fd)
         os.close(destination_fd)
         destination_fd = None
+        os.close(source_fd)
+        source_open = False
         yield snapshot_path
     finally:
         if destination_fd is not None:
             os.close(destination_fd)
         try:
-            _close_source(source_fd, directory_handles, close_directory)
+            if source_open:
+                os.close(source_fd)
         finally:
-            if snapshot_directory is not None:
-                _cleanup_snapshot_directory(snapshot_directory)
+            try:
+                close_directory(directory_handles)
+            finally:
+                if snapshot_directory is not None:
+                    _cleanup_snapshot_directory(snapshot_directory)
 
 
 def _close_posix_fds(file_descriptors: list[int]) -> None:

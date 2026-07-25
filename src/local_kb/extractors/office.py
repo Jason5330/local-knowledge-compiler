@@ -15,7 +15,7 @@ from . import base as limits
 from .base import (
     Extraction,
     ExtractionError,
-    Fragment,
+    FragmentCollector,
     enforce_extraction_budget,
     registry,
     snapshot_file,
@@ -51,8 +51,9 @@ def _validate_office_zip(path: Path) -> None:
                 raise ExtractionError("Office ZIP compression ratio exceeds budget")
 
 
-def _table_fragments(table: Table, table_number: int) -> list[Fragment]:
-    fragments: list[Fragment] = []
+def _append_table_fragments(
+    table: Table, table_number: int, collector: FragmentCollector
+) -> None:
     seen_cells: set[int] = set()
     for row_number, row in enumerate(table.rows, 1):
         values: list[str] = []
@@ -71,8 +72,7 @@ def _table_fragments(table: Table, table_number: int) -> list[Fragment]:
                 f"table:{table_number};row:{row_number};"
                 f"cells:{positions[0]}-{positions[-1]}"
             )
-            fragments.append(Fragment(locator, "\t".join(values)))
-    return fragments
+            collector.append(locator, "\t".join(values))
 
 
 def _extract_docx_snapshot(path: Path) -> Extraction:
@@ -83,18 +83,18 @@ def _extract_docx_snapshot(path: Path) -> Extraction:
     except Exception as exc:
         raise ExtractionError(f"failed to read DOCX file: {path}") from exc
 
-    fragments: list[Fragment] = []
+    collector = FragmentCollector()
     paragraph_number = 0
     table_number = 0
     for item in document.iter_inner_content():
         if isinstance(item, Paragraph):
             paragraph_number += 1
             if item.text.strip():
-                fragments.append(Fragment(f"paragraph:{paragraph_number}", item.text))
+                collector.append(f"paragraph:{paragraph_number}", item.text)
         elif isinstance(item, Table):
             table_number += 1
-            fragments.extend(_table_fragments(item, table_number))
-    return Extraction("extracted", fragments)
+            _append_table_fragments(item, table_number, collector)
+    return collector.extraction("extracted")
 
 
 def extract_docx(path: Path) -> Extraction:
@@ -117,7 +117,7 @@ def _extract_xlsx_snapshot(path: Path) -> Extraction:
         raise ExtractionError(f"failed to read spreadsheet file: {path}") from exc
 
     try:
-        fragments: list[Fragment] = []
+        collector = FragmentCollector()
         for sheet in book.worksheets:
             max_row = sheet.max_row or 0
             max_column = sheet.max_column or 0
@@ -138,8 +138,8 @@ def _extract_xlsx_snapshot(path: Path) -> Extraction:
                         f"sheet:{sheet.title};cells:A{row_number}-"
                         f"{get_column_letter(len(row))}{row_number}"
                     )
-                    fragments.append(Fragment(locator, "\t".join(values)))
-        return Extraction("extracted", fragments)
+                    collector.append(locator, "\t".join(values))
+        return collector.extraction("extracted")
     except ExtractionError:
         raise
     except Exception as exc:

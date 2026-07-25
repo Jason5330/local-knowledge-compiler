@@ -7,7 +7,7 @@ from pathlib import Path
 from .base import (
     Extraction,
     ExtractionError,
-    Fragment,
+    FragmentCollector,
     enforce_extraction_budget,
     registry,
     snapshot_file,
@@ -15,18 +15,16 @@ from .base import (
 
 
 def _extract_text_snapshot(path: Path) -> Extraction:
+    collector = FragmentCollector()
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            for number, line in enumerate(stream, 1):
+                line = line.rstrip("\r\n")
+                if line.strip():
+                    collector.append(f"lines:{number}-{number}", line)
     except OSError as exc:
         raise ExtractionError(f"failed to read text file: {path}") from exc
-    return Extraction(
-        "extracted",
-        [
-            Fragment(f"lines:{number}-{number}", line)
-            for number, line in enumerate(text.splitlines(), 1)
-            if line.strip()
-        ],
-    )
+    return collector.extraction("extracted")
 
 
 class TextExtractor:

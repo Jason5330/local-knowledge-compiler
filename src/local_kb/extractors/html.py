@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from .base import (
     Extraction,
     ExtractionError,
-    Fragment,
+    FragmentCollector,
     enforce_extraction_budget,
     registry,
     snapshot_file,
@@ -26,7 +26,9 @@ def _extract_html_snapshot(path: Path) -> Extraction:
         node.decompose()
     title = soup.title.get_text(" ", strip=True) if soup.title else path.stem
     body = soup.get_text("\n", strip=True)
-    return Extraction("extracted", [Fragment(f"title:{title}", body)])
+    collector = FragmentCollector()
+    collector.append(f"title:{title}", body)
+    return collector.extraction("extracted")
 
 
 def extract_html(path: Path) -> Extraction:

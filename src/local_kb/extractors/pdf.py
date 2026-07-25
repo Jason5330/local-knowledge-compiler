@@ -9,7 +9,7 @@ from pypdf import PdfReader
 from .base import (
     Extraction,
     ExtractionError,
-    Fragment,
+    FragmentCollector,
     enforce_extraction_budget,
     registry,
     snapshot_file,
@@ -17,19 +17,24 @@ from .base import (
 
 
 def _extract_pdf_snapshot(path: Path) -> Extraction:
+    collector = FragmentCollector()
     try:
         with path.open("rb") as stream:
             reader = PdfReader(stream)
-            fragments = [
-                Fragment(f"page:{index}", page.extract_text() or "")
-                for index, page in enumerate(reader.pages, 1)
-            ]
+            for index, page in enumerate(reader.pages, 1):
+                text = page.extract_text() or ""
+                if text.strip():
+                    collector.append(f"page:{index}", text)
+    except ExtractionError:
+        raise
     except Exception as exc:
         raise ExtractionError(f"failed to read PDF file: {path}") from exc
-    fragments = [fragment for fragment in fragments if fragment.text.strip()]
-    if fragments:
-        return Extraction("extracted", fragments)
-    return Extraction("pending_extractor", [], "PDF has no extractable text; OCR required")
+    extraction = collector.extraction("extracted")
+    if extraction.fragments:
+        return extraction
+    return collector.extraction(
+        "pending_extractor", "PDF has no extractable text; OCR required"
+    )
 
 
 def extract_pdf(path: Path) -> Extraction:

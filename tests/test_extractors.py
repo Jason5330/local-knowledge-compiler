@@ -599,3 +599,139 @@ def test_direct_text_extractor_enforces_output_budget_and_cleans_snapshot(
 
     assert not snapshots[0].exists()
     assert not snapshots[0].parent.exists()
+
+
+def test_snapshot_copy_stops_when_a_small_source_grows_over_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "growing.txt"
+    source.write_bytes(b"x")
+    monkeypatch.setattr(base, "MAX_SOURCE_BYTES", 1)
+    chunks = iter([b"x", b"y"])
+    monkeypatch.setattr(base.os, "read", lambda fd, size: next(chunks, b""))
+    created: list[Path] = []
+    real_mkdtemp = base.tempfile.mkdtemp
+
+    def tracked_mkdtemp(*args, **kwargs):
+        directory = Path(real_mkdtemp(*args, **kwargs))
+        created.append(directory)
+        return str(directory)
+
+    monkeypatch.setattr(base.tempfile, "mkdtemp", tracked_mkdtemp)
+
+    with pytest.raises(base.ExtractionError, match="grew beyond source budget"):
+        registry.extract(source)
+
+    assert len(created) == 1
+    assert not created[0].exists()
+
+
+def test_snapshot_copy_rejects_source_metadata_change_and_cleans_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "changing.txt"
+    source.write_bytes(b"abcdef")
+    metadata = iter([(6, 100), (5, 101)])
+    monkeypatch.setattr(base, "_source_metadata", lambda fd: next(metadata))
+    created: list[Path] = []
+    real_mkdtemp = base.tempfile.mkdtemp
+
+    def tracked_mkdtemp(*args, **kwargs):
+        directory = Path(real_mkdtemp(*args, **kwargs))
+        created.append(directory)
+        return str(directory)
+
+    monkeypatch.setattr(base.tempfile, "mkdtemp", tracked_mkdtemp)
+
+    with pytest.raises(base.ExtractionError, match="source changed during snapshot copy"):
+        registry.extract(source)
+
+    assert len(created) == 1
+    assert not created[0].exists()
+
+
+def test_pdf_fragment_budget_stops_page_generator_at_second_fragment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb.extractors import pdf
+
+    source = tmp_path / "many.pdf"
+    source.write_bytes(b"placeholder")
+    monkeypatch.setattr(base, "MAX_FRAGMENT_COUNT", 1)
+    pages_visited = 0
+    snapshots: list[Path] = []
+
+    class Page:
+        def extract_text(self) -> str:
+            return "text"
+
+    class Pages:
+        def __iter__(self):
+            nonlocal pages_visited
+            for _ in range(10_000):
+                pages_visited += 1
+                yield Page()
+
+    class Reader:
+        pages = Pages()
+
+    monkeypatch.setattr(pdf, "PdfReader", lambda stream: Reader())
+    validate_pdf = pdf._extract_pdf_snapshot
+
+    def tracked_extract(path: Path) -> Extraction:
+        snapshots.append(path)
+        return validate_pdf(path)
+
+    monkeypatch.setattr(pdf.PdfExtractor, "extract_snapshot", staticmethod(tracked_extract))
+
+    with pytest.raises(base.ExtractionError, match="fragment count"):
+        registry.extract(source)
+
+    assert pages_visited == 2
+    assert not snapshots[0].exists()
+    assert not snapshots[0].parent.exists()
+
+
+def test_html_rejects_single_oversized_body_before_fragment_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb.extractors import html
+
+    source = tmp_path / "large.html"
+    source.write_text("<p>ab</p>", encoding="utf-8")
+    monkeypatch.setattr(base, "MAX_EXTRACTION_CHARACTERS", 1)
+    constructed = 0
+    real_fragment = base.Fragment
+
+    def fragment_spy(locator: str, text: str) -> Fragment:
+        nonlocal constructed
+        constructed += 1
+        return real_fragment(locator, text)
+
+    monkeypatch.setattr(base, "Fragment", fragment_spy)
+
+    with pytest.raises(base.ExtractionError, match="character count"):
+        html.HtmlExtractor().extract(source)
+
+    assert constructed == 0
+
+
+def test_text_extractor_streams_lines_without_read_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb.extractors import text
+
+    source = tmp_path / "stream.txt"
+    source.write_text("first\nsecond\n", encoding="utf-8")
+
+    def forbidden_read_text(*args, **kwargs):
+        raise AssertionError("text extractor must stream lines")
+
+    monkeypatch.setattr(Path, "read_text", forbidden_read_text)
+
+    result = text.TextExtractor().extract(source)
+
+    assert result.fragments == [
+        Fragment("lines:1-1", "first"),
+        Fragment("lines:2-2", "second"),
+    ]
