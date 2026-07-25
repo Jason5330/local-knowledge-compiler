@@ -4,30 +4,93 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import asdict, replace
+from datetime import datetime, timezone
 import errno
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import re
 import stat
 from typing import Any
 from uuid import uuid4
 
 from .catalog import Catalog
+from .compiler import MAX_CHANGES, MAX_EVIDENCE_CHARS, ManualCompiler
 from .extractors import registry as default_registry
 from .models import Job, SourceVersion
 from .paths import VaultPaths
 from .queue import DiskQueue
 from .source_store import SourceStore
+from .transaction import ChangeTransaction
+from .wiki import WikiPage, render_page
+
+
+_COMPILER_FIELDS = frozenset({
+    "path", "title", "type", "space", "confidence", "source_ids",
+    "current_state", "conflicts", "timeline_entry",
+})
+_WIKI_TYPES = frozenset({"concept", "entity", "topic", "decision", "timeline", "project"})
+_WIKI_SPACES = frozenset({"personal", "work", "shared", "unclassified"})
+_WIKI_CONFIDENCES = frozenset({"high", "medium", "low"})
+_PROJECT_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_WINDOWS_RESERVED = frozenset({
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5",
+    "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+    "LPT6", "LPT7", "LPT8", "LPT9",
+})
+
+
+def _safe_wiki_path(value: object) -> str:
+    """Accept only one canonical Markdown path below the managed wiki root."""
+    if not isinstance(value, str) or not value or len(value) > 240:
+        raise ValueError("compiler path must be a bounded non-empty string")
+    if ("\\" in value or value.startswith("/") or re.match(r"^[A-Za-z]:", value)
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)):
+        raise ValueError("compiler path is not a safe POSIX relative path")
+    path = PurePosixPath(value)
+    if (path.as_posix() != value or path.is_absolute() or len(path.parts) < 2
+            or path.parts[0] != "20_wiki" or any(part in {"", ".", ".."} for part in path.parts)
+            or path.suffix != ".md"):
+        raise ValueError(f"compiler path outside wiki: {value}")
+    for part in path.parts:
+        stem = part.rstrip(". ").split(".", 1)[0].upper()
+        if part != part.rstrip(". ") or ":" in part or stem in _WINDOWS_RESERVED:
+            raise ValueError("compiler path uses an unsafe Windows name")
+    return path.as_posix()
+
+
+def _safe_compiler_text(value: object, field: str, *, empty: bool = False, limit: int = 50_000) -> str:
+    if not isinstance(value, str) or len(value) > limit or (not empty and not value.strip()):
+        raise ValueError(f"compiler {field} must be bounded non-empty text")
+    if any(ord(character) == 127 or (ord(character) < 32 and character not in {"\n", "\t"}) for character in value):
+        raise ValueError(f"compiler {field} contains a control character")
+    return value
+
+
+def _safe_compiler_line(value: object, field: str, *, limit: int = 300) -> str:
+    text = _safe_compiler_text(value, field, limit=limit)
+    if "\n" in text or "\t" in text:
+        raise ValueError(f"compiler {field} must be a single line")
+    return text
 
 
 class IngestService:
-    def __init__(self, vault: VaultPaths | Path | str, queue: DiskQueue, catalog: Catalog, *, registry: Any = None) -> None:
+    def __init__(
+        self,
+        vault: VaultPaths | Path | str,
+        queue: DiskQueue,
+        catalog: Catalog,
+        compiler: Any = None,
+        *,
+        registry: Any = None,
+    ) -> None:
         self.vault = vault if isinstance(vault, VaultPaths) else VaultPaths(Path(vault).resolve())
         self.queue = queue
         self.catalog = catalog
         self.registry = registry or default_registry
         self.store = SourceStore(self.vault.raw)
+        self.compiler = compiler or ManualCompiler(self.vault.runtime / "manual")
 
     def process(self, job_id: str, *, space: str = "unclassified") -> SourceVersion:
         """Process one job; persist each recoverable boundary before advancing."""
@@ -41,6 +104,8 @@ class IngestService:
                 job = self.queue.get(job_id)
             extraction = self._extraction_for(job, source)
             final = replace(source, status=extraction["status"])
+            if final.status == "extracted":
+                self.compile_extraction(final, extraction)
             fragments = [(item["locator"], item["text"]) for item in extraction["fragments"]]
             self._write_cache(final, extraction)
             processed = self._move_processed(self.queue.get(job_id), final)
@@ -51,6 +116,111 @@ class IngestService:
         except BaseException as error:
             self.queue.fail(job_id, error)
             raise
+
+    def compile_extraction(self, source: SourceVersion, extraction: dict[str, Any]) -> list[str]:
+        """Validate every model change before opening one all-or-nothing transaction."""
+        if source.status != "extracted":
+            return []
+        evidence = self._compiler_evidence(source, extraction)
+        result = self.compiler.compile(evidence)
+        if isinstance(result, Path):
+            return []
+        changes = self._validated_compiler_changes(result, source)
+        if not changes:
+            return []
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        pages: list[tuple[str, WikiPage]] = []
+        for relative, change in changes:
+            pages.append((relative, WikiPage(
+                page_id="page_" + hashlib.sha256(relative.encode("utf-8")).hexdigest()[:16],
+                title=change["title"],
+                page_type=change["type"],
+                space=change["space"],
+                confidence=change["confidence"],
+                source_ids=tuple(change["source_ids"]),
+                current_state=change["current_state"],
+                conflicts=change["conflicts"],
+                timeline_entry=change["timeline_entry"],
+                updated_at=now,
+            )))
+        # Rendering invokes the shared Wiki validation before any live path is staged.
+        rendered = [(relative, render_page(page)) for relative, page in pages]
+        transaction = ChangeTransaction(self.vault.root)
+        for relative, content in rendered:
+            transaction.stage(relative, content)
+        transaction.publish(lambda _: None)
+        transaction.commit_git(f"kb: compile {source.version_id}")
+        return [relative for relative, _ in rendered]
+
+    def _compiler_evidence(self, source: SourceVersion, extraction: dict[str, Any]) -> str:
+        if extraction.get("status") != "extracted":
+            raise ValueError("only extracted evidence can reach a compiler")
+        fragments = extraction.get("fragments")
+        if not isinstance(fragments, list):
+            raise ValueError("compiler extraction fragments are invalid")
+        pieces: list[str] = []
+        total = 0
+        for fragment in fragments:
+            if not isinstance(fragment, dict):
+                raise ValueError("compiler extraction fragment is invalid")
+            locator = fragment.get("locator")
+            text = fragment.get("text")
+            if not isinstance(locator, str) or not isinstance(text, str):
+                raise ValueError("compiler extraction fragment is invalid")
+            piece = f"source_id={source.source_id} locator={locator}\n{text}"
+            total += len(piece) + (1 if pieces else 0)
+            if total > MAX_EVIDENCE_CHARS:
+                raise ValueError("compiler evidence exceeds budget")
+            pieces.append(piece)
+        return "\n".join(pieces)
+
+    def _validated_compiler_changes(
+        self, result: object, source: SourceVersion
+    ) -> list[tuple[str, dict[str, Any]]]:
+        if not isinstance(result, dict) or set(result) != {"changes"}:
+            raise ValueError("compiler result must contain only changes")
+        raw_changes = result["changes"]
+        if not isinstance(raw_changes, list) or len(raw_changes) > MAX_CHANGES:
+            raise ValueError("compiler changes exceed budget")
+        validated: list[tuple[str, dict[str, Any]]] = []
+        paths: set[str] = set()
+        for change in raw_changes:
+            if not isinstance(change, dict) or set(change) != _COMPILER_FIELDS:
+                raise ValueError("compiler change has missing or unexpected fields")
+            relative = _safe_wiki_path(change["path"])
+            if relative.casefold() in paths:
+                raise ValueError("compiler result has duplicate page paths")
+            paths.add(relative.casefold())
+            title = _safe_compiler_line(change["title"], "title")
+            page_type = _safe_compiler_line(change["type"], "type", limit=40)
+            if page_type not in _WIKI_TYPES:
+                raise ValueError("compiler type is invalid")
+            space = _safe_compiler_line(change["space"], "space", limit=80)
+            if space not in _WIKI_SPACES and not (
+                space.startswith("project:") and _PROJECT_SLUG.fullmatch(space[8:])
+            ):
+                raise ValueError("compiler space is invalid")
+            confidence = _safe_compiler_line(change["confidence"], "confidence", limit=20)
+            if confidence not in _WIKI_CONFIDENCES:
+                raise ValueError("compiler confidence is invalid")
+            source_ids = change["source_ids"]
+            if (not isinstance(source_ids, list) or len(source_ids) != 1
+                    or source_ids[0] != source.source_id):
+                raise ValueError("compiler change must cite only the current source")
+            current_state = _safe_compiler_text(change["current_state"], "current_state")
+            conflicts = _safe_compiler_text(change["conflicts"], "conflicts", empty=True, limit=20_000)
+            timeline_entry = _safe_compiler_text(change["timeline_entry"], "timeline_entry")
+            validated.append((relative, {
+                "title": title,
+                "type": page_type,
+                "space": space,
+                "confidence": confidence,
+                "source_ids": source_ids,
+                "current_state": current_state,
+                "conflicts": conflicts,
+                "timeline_entry": timeline_entry,
+            }))
+        return validated
 
     def _claim(self, job: Job) -> Job:
         claimed_value = job.metadata.get("claimed_path")
