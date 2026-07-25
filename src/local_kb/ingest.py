@@ -39,6 +39,8 @@ _WINDOWS_RESERVED = frozenset({
     "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
     "LPT6", "LPT7", "LPT8", "LPT9",
 })
+_RECEIPT_SCHEMA_VERSION = 1
+_MAX_RECEIPT_BYTES = 2_000_000
 
 
 def _safe_wiki_path(value: object) -> str:
@@ -79,6 +81,7 @@ def _safe_compiler_line(value: object, field: str, *, limit: int = 300) -> str:
 class _CompileOutcome:
     paths: tuple[str, ...] = ()
     handoff: dict[str, Any] | None = None
+    receipt: dict[str, Any] | None = None
 
 
 def _utc_now() -> str:
@@ -100,13 +103,20 @@ class IngestService:
         self.catalog = catalog
         self.registry = registry or default_registry
         self.store = SourceStore(self.vault.raw)
-        self.compiler = compiler or ManualCompiler(self.vault.runtime / "manual")
+        self.compiler = compiler or ManualCompiler(
+            self.vault.runtime / "manual", trusted_root=self.vault.root,
+        )
 
     def process(self, job_id: str, *, space: str = "unclassified") -> SourceVersion:
         """Process one job; persist each recoverable boundary before advancing."""
         job = self.queue.get(job_id)
         try:
             self.catalog.initialize()
+            if "compilation_receipt" in job.metadata:
+                final, receipt = self._receipt_resume_inputs(job)
+                self._apply_compilation_receipt(receipt, final)
+                self._complete_compilation(job_id, final)
+                return final
             if job.state == "pending_attention" and job.metadata.get("compiler_status") == "needs_agent":
                 # A manual handoff is deliberately terminal for normal ingest.
                 # Only resume_compilation() may request another model attempt.
@@ -131,7 +141,7 @@ class IngestService:
             self._cleanup_claim_staging(job_id)
             outcome = _CompileOutcome()
             if final.status == "extracted":
-                outcome = self._compile_extraction_outcome(final, extraction)
+                outcome = self._prepare_compilation(final, extraction)
                 if outcome.handoff is not None:
                     self._mark_compiler_pending(
                         job_id,
@@ -141,6 +151,11 @@ class IngestService:
                     )
             if outcome.handoff is not None:
                 return final
+            if outcome.receipt is not None:
+                self._persist_compilation_receipt(job_id, final, outcome.receipt)
+                self._apply_compilation_receipt(outcome.receipt, final)
+                self._complete_compilation(job_id, final)
+                return final
             self._mark(job_id, "published", source=asdict(final), processed_path=str(processed.relative_to(self.vault.root)))
             return final
         except BaseException as error:
@@ -149,12 +164,15 @@ class IngestService:
 
     def compile_extraction(self, source: SourceVersion, extraction: dict[str, Any]) -> list[str]:
         """Public compatibility wrapper: return pages, never a manual handoff path."""
-        return list(self._compile_extraction_outcome(source, extraction).paths)
+        outcome = self._prepare_compilation(source, extraction)
+        if outcome.receipt is not None:
+            self._apply_compilation_receipt(outcome.receipt, source)
+        return list(outcome.paths)
 
-    def _compile_extraction_outcome(
+    def _prepare_compilation(
         self, source: SourceVersion, extraction: dict[str, Any], *, compiler: Any = None
     ) -> _CompileOutcome:
-        """Validate every model change before opening one all-or-nothing transaction."""
+        """Compile and render an immutable receipt without touching live Wiki files."""
         if source.status != "extracted":
             return _CompileOutcome()
         evidence = self._compiler_evidence(source, extraction)
@@ -162,8 +180,6 @@ class IngestService:
         if isinstance(result, Path):
             return _CompileOutcome(handoff=self._handoff_metadata(result))
         changes = self._validated_compiler_changes(result, source)
-        if not changes:
-            return _CompileOutcome()
         now = _utc_now()
         pages: list[tuple[str, WikiPage]] = []
         for relative, change in changes:
@@ -179,18 +195,35 @@ class IngestService:
                 timeline_entry=change["timeline_entry"],
                 updated_at=now,
             )))
-        # Rendering invokes the shared Wiki validation before any live path is staged.
+        # Rendering invokes shared Wiki validation before the receipt is persisted.
         rendered = [(relative, render_page(page)) for relative, page in pages]
-        transaction = ChangeTransaction(self.vault.root)
-        for relative, content in rendered:
-            transaction.stage(relative, content)
-        transaction.publish(lambda _: None)
-        transaction.commit_git(f"kb: compile {source.version_id}")
-        return _CompileOutcome(paths=tuple(relative for relative, _ in rendered))
+        receipt = {
+            "schema_version": _RECEIPT_SCHEMA_VERSION,
+            "source_id": source.source_id,
+            "version_id": source.version_id,
+            "updated_at": now,
+            "pages": [
+                {
+                    "path": relative,
+                    "content": content,
+                    "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                }
+                for relative, content in rendered
+            ],
+        }
+        self._receipt_bytes(receipt)
+        return _CompileOutcome(
+            paths=tuple(relative for relative, _ in rendered), receipt=receipt
+        )
 
     def resume_compilation(self, job_id: str, *, compiler: Any = None) -> SourceVersion:
         """Recompile one durable manual handoff without re-ingesting its raw file."""
         job = self.queue.get(job_id)
+        if "compilation_receipt" in job.metadata:
+            final, receipt = self._receipt_resume_inputs(job)
+            self._apply_compilation_receipt(receipt, final)
+            self._complete_compilation(job_id, final)
+            return final
         self._validate_pending_compiler_metadata(job)
         source = self._source_for(job)
         if source is None:
@@ -201,23 +234,158 @@ class IngestService:
         final = replace(source, status=extraction["status"])
         if final.status != "extracted":
             raise ValueError("pending compiler job has no extracted evidence")
-        outcome = self._compile_extraction_outcome(final, extraction, compiler=compiler)
+        outcome = self._prepare_compilation(final, extraction, compiler=compiler)
         if outcome.handoff is not None:
             processed_path = self._safe_processed_metadata(job.metadata.get("processed_path"))
             self._mark_compiler_pending(job_id, final, processed_path, outcome.handoff)
             return final
+        assert outcome.receipt is not None
+        self._persist_compilation_receipt(job_id, final, outcome.receipt)
+        self._apply_compilation_receipt(outcome.receipt, final)
+        self._complete_compilation(job_id, final)
+        return final
 
+    def _receipt_bytes(self, receipt: object) -> bytes:
+        try:
+            encoded = json.dumps(
+                receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeEncodeError) as error:
+            raise ValueError("compilation receipt is not canonical JSON") from error
+        if len(encoded) > _MAX_RECEIPT_BYTES:
+            raise ValueError("compilation receipt exceeds size budget")
+        return encoded
+
+    def _validate_compilation_receipt(
+        self, receipt: object, expected_hash: object, source: SourceVersion
+    ) -> dict[str, Any]:
+        if not isinstance(receipt, dict) or set(receipt) != {
+            "schema_version", "source_id", "version_id", "updated_at", "pages",
+        }:
+            raise ValueError("compilation receipt schema is invalid")
+        encoded = self._receipt_bytes(receipt)
+        actual_hash = hashlib.sha256(encoded).hexdigest()
+        if (not isinstance(expected_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+                or actual_hash != expected_hash):
+            raise ValueError("compilation receipt hash is invalid")
+        if (receipt["schema_version"] != _RECEIPT_SCHEMA_VERSION
+                or isinstance(receipt["schema_version"], bool)
+                or receipt["source_id"] != source.source_id
+                or receipt["version_id"] != source.version_id):
+            raise ValueError("compilation receipt source or version is invalid")
+        updated_at = receipt["updated_at"]
+        try:
+            if not isinstance(updated_at, str):
+                raise ValueError
+            datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("compilation receipt timestamp is invalid") from error
+        pages = receipt["pages"]
+        if not isinstance(pages, list) or len(pages) > MAX_CHANGES:
+            raise ValueError("compilation receipt pages are invalid")
+        seen: set[str] = set()
+        for page in pages:
+            if not isinstance(page, dict) or set(page) != {"path", "content", "sha256"}:
+                raise ValueError("compilation receipt page schema is invalid")
+            relative = _safe_wiki_path(page["path"])
+            if relative.casefold() in seen:
+                raise ValueError("compilation receipt has duplicate paths")
+            seen.add(relative.casefold())
+            content = page["content"]
+            digest = page["sha256"]
+            if (not isinstance(content, str) or not isinstance(digest, str)
+                    or hashlib.sha256(content.encode("utf-8")).hexdigest() != digest):
+                raise ValueError("compilation receipt page hash is invalid")
+        return receipt
+
+    def _persist_compilation_receipt(
+        self, job_id: str, source: SourceVersion, receipt: dict[str, Any]
+    ) -> None:
+        digest = hashlib.sha256(self._receipt_bytes(receipt)).hexdigest()
+        self._validate_compilation_receipt(receipt, digest, source)
+
+        def persist(current: Job) -> None:
+            existing = current.metadata.get("compilation_receipt")
+            if existing is not None:
+                prior = self._validate_compilation_receipt(
+                    existing, current.metadata.get("compilation_receipt_sha256"), source
+                )
+                if self._receipt_bytes(prior) != self._receipt_bytes(receipt):
+                    raise ValueError("a different compilation receipt is already durable")
+            current.state = "compiled"
+            current.error = None
+            current.metadata["source"] = asdict(source)
+            current.metadata["compiler_status"] = "ready"
+            current.metadata["compilation_receipt"] = receipt
+            current.metadata["compilation_receipt_sha256"] = digest
+            current.metadata["compiler_prepared_at"] = receipt["updated_at"]
+
+        self.queue.update(job_id, persist)
+
+    def _receipt_resume_inputs(
+        self, job: Job
+    ) -> tuple[SourceVersion, dict[str, Any]]:
+        source = self._source_for(job)
+        extraction = job.metadata.get("extraction")
+        if source is None or not isinstance(extraction, dict) or not self._valid_extraction(extraction):
+            raise ValueError("compilation receipt job is incomplete")
+        final = replace(source, status=extraction["status"])
+        if final.status != "extracted":
+            raise ValueError("compilation receipt has no extracted source")
+        if job.metadata.get("compiler_status") not in {"ready", "completed"}:
+            raise ValueError("compilation receipt status is invalid")
+        self._safe_processed_metadata(job.metadata.get("processed_path"))
+        receipt = self._validate_compilation_receipt(
+            job.metadata.get("compilation_receipt"),
+            job.metadata.get("compilation_receipt_sha256"),
+            final,
+        )
+        return final, receipt
+
+    def _apply_compilation_receipt(
+        self, receipt: dict[str, Any], source: SourceVersion
+    ) -> list[str]:
+        digest = hashlib.sha256(self._receipt_bytes(receipt)).hexdigest()
+        validated = self._validate_compilation_receipt(receipt, digest, source)
+        paths: list[str] = []
+        changed: list[dict[str, str]] = []
+        for page in validated["pages"]:
+            relative = page["path"]
+            paths.append(relative)
+            target = self.vault.root / Path(*PurePosixPath(relative).parts)
+            if os.path.lexists(target):
+                try:
+                    self._safe_regular_under(self.vault.wiki, target)
+                    if self._hash_pinned_regular(target) == page["sha256"]:
+                        continue
+                except (OSError, ValueError) as error:
+                    raise ValueError("compilation receipt live target is unsafe") from error
+            changed.append(page)
+        if changed:
+            transaction = ChangeTransaction(self.vault.root)
+            for page in changed:
+                transaction.stage(page["path"], page["content"])
+            transaction.publish(lambda _: None)
+            transaction.commit_git(f"kb: compile {source.version_id}")
+        return paths
+
+    def _complete_compilation(self, job_id: str, source: SourceVersion) -> None:
         def complete(current: Job) -> None:
-            self._validate_pending_compiler_metadata(current)
+            self._validate_compilation_receipt(
+                current.metadata.get("compilation_receipt"),
+                current.metadata.get("compilation_receipt_sha256"),
+                source,
+            )
             current.state = "published"
             current.error = None
-            current.metadata["source"] = asdict(final)
+            current.metadata["source"] = asdict(source)
             current.metadata["compiler_status"] = "completed"
             current.metadata["compiler_completed_at"] = _utc_now()
             current.metadata.pop("compiler_handoff", None)
 
         self.queue.update(job_id, complete)
-        return final
 
     def _handoff_metadata(self, handoff: Path) -> dict[str, Any]:
         """Read only a canonical packet created beneath this vault's manual outbox."""

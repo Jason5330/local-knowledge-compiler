@@ -1,9 +1,43 @@
 import json
+import io
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
+
+
+class _RecordingInput(io.BytesIO):
+    def close(self):
+        self.flush()
+
+
+class _FakePopen:
+    def __init__(self, stdout=b"", stderr=b"", returncode=0, running=False):
+        self.stdin = _RecordingInput()
+        self.stdout = io.BytesIO(stdout)
+        self.stderr = io.BytesIO(stderr)
+        self.returncode = None if running else returncode
+        self.final_returncode = returncode
+        self.pid = 4242
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired(["claude"], timeout)
+        return self.returncode
+
+    def terminate(self):
+        self.killed = True
+        self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
 
 
 def _valid_change(**overrides):
@@ -27,42 +61,36 @@ def test_claude_compiler_disables_tools_uses_stdin_and_requires_json(monkeypatch
 
     captured = {}
 
-    def fake_run(command, **kwargs):
+    process = _FakePopen(stdout=b'{"result":{"changes":[]}}')
+
+    def fake_popen(command, **kwargs):
         captured["command"] = command
         captured["kwargs"] = kwargs
+        return process
 
-        class Result:
-            stdout = '{"result":{"changes":[]}}'
-            returncode = 0
-
-        return Result()
-
-    monkeypatch.setattr("local_kb.compiler.subprocess.run", fake_run)
-    compiler = ClaudeCompiler(fallback=ManualCompiler(tmp_path / "manual"), cwd=tmp_path)
+    monkeypatch.setattr("local_kb.compiler.subprocess.Popen", fake_popen)
+    compiler = ClaudeCompiler(
+        fallback=ManualCompiler(tmp_path / "manual", trusted_root=tmp_path), cwd=tmp_path,
+    )
 
     assert compiler.compile("evidence") == {"changes": []}
     assert "--tools" in captured["command"]
     assert captured["command"][captured["command"].index("--tools") + 1] == ""
-    assert captured["kwargs"]["input"].endswith("\n\nevidence")
+    assert process.stdin.getvalue().decode("utf-8").endswith("\n\nevidence")
     assert captured["kwargs"]["shell"] is False
     assert captured["kwargs"]["cwd"] == str(tmp_path)
 
 
-@pytest.mark.parametrize(
-    "failure",
-    [
-        FileNotFoundError("claude"),
-        subprocess.TimeoutExpired(["claude"], 1),
-    ],
-)
-def test_claude_compiler_writes_manual_handoff_when_cli_is_unavailable(monkeypatch, tmp_path, failure):
+def test_claude_compiler_writes_manual_handoff_when_cli_is_unavailable(monkeypatch, tmp_path):
     from local_kb.compiler import ClaudeCompiler, ManualCompiler
 
     def fail(*_args, **_kwargs):
-        raise failure
+        raise FileNotFoundError("claude")
 
-    monkeypatch.setattr("local_kb.compiler.subprocess.run", fail)
-    path = ClaudeCompiler(fallback=ManualCompiler(tmp_path / "manual")).compile("evidence")
+    monkeypatch.setattr("local_kb.compiler.subprocess.Popen", fail)
+    path = ClaudeCompiler(
+        fallback=ManualCompiler(tmp_path / "manual", trusted_root=tmp_path)
+    ).compile("evidence")
 
     packet = json.loads(path.read_text(encoding="utf-8"))
     assert path.suffix == ".json"
@@ -74,21 +102,98 @@ def test_claude_compiler_writes_manual_handoff_when_cli_is_unavailable(monkeypat
 def test_claude_compiler_falls_back_for_nonzero_or_malformed_output(monkeypatch, tmp_path):
     from local_kb.compiler import ClaudeCompiler, ManualCompiler
 
-    class Result:
-        returncode = 3
-        stdout = "not json"
-        stderr = "bad"
-
-    monkeypatch.setattr("local_kb.compiler.subprocess.run", lambda *_args, **_kwargs: Result())
-    path = ClaudeCompiler(fallback=ManualCompiler(tmp_path / "manual")).compile("evidence")
+    process = _FakePopen(stdout=b"not json", stderr=b"bad", returncode=3)
+    monkeypatch.setattr("local_kb.compiler.subprocess.Popen", lambda *_args, **_kwargs: process)
+    path = ClaudeCompiler(
+        fallback=ManualCompiler(tmp_path / "manual", trusted_root=tmp_path)
+    ).compile("evidence")
 
     assert json.loads(path.read_text(encoding="utf-8"))["status"] == "needs_agent"
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_claude_compiler_kills_process_when_stream_output_exceeds_hard_limit(monkeypatch, tmp_path, stream):
+    from local_kb.compiler import ClaudeCompiler, MAX_OUTPUT_BYTES, ManualCompiler
+
+    payload = b"x" * (MAX_OUTPUT_BYTES + 100_000)
+    process = _FakePopen(
+        stdout=payload if stream == "stdout" else b"",
+        stderr=payload if stream == "stderr" else b"",
+        running=True,
+    )
+    monkeypatch.setattr("local_kb.compiler.subprocess.Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(
+        "local_kb.compiler._terminate_process_tree",
+        lambda child: child.kill(),
+    )
+
+    path = ClaudeCompiler(
+        fallback=ManualCompiler(tmp_path / "manual", trusted_root=tmp_path), timeout=1,
+    ).compile("evidence")
+
+    assert process.killed is True
+    assert json.loads(path.read_text(encoding="utf-8"))["status"] == "needs_agent"
+
+
+def test_claude_compiler_timeout_kills_process_tree_and_falls_back(monkeypatch, tmp_path):
+    from local_kb.compiler import ClaudeCompiler, ManualCompiler
+
+    process = _FakePopen(running=True)
+    monkeypatch.setattr("local_kb.compiler.subprocess.Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(
+        "local_kb.compiler._terminate_process_tree",
+        lambda child: child.kill(),
+    )
+
+    path = ClaudeCompiler(
+        fallback=ManualCompiler(tmp_path / "manual", trusted_root=tmp_path), timeout=0.02,
+    ).compile("evidence")
+
+    assert process.killed is True
+    assert json.loads(path.read_text(encoding="utf-8"))["status"] == "needs_agent"
+
+
+def test_bounded_process_drains_quick_exit_stdout_to_eof(tmp_path):
+    from local_kb.compiler import _run_bounded_process
+
+    expected = b'{"result":{"changes":[]}}TAIL'
+    command = [sys.executable, "-c", f"import sys;sys.stdout.buffer.write({expected!r})"]
+
+    returncode, stdout, overflowed, timed_out = _run_bounded_process(
+        command, "prompt", cwd=tmp_path, timeout=5,
+    )
+
+    assert returncode == 0
+    assert stdout == expected
+    assert overflowed is False
+    assert timed_out is False
+
+
+def test_bounded_process_preserves_tail_of_near_limit_fast_output(tmp_path):
+    from local_kb.compiler import MAX_OUTPUT_BYTES, _run_bounded_process
+
+    count = MAX_OUTPUT_BYTES - 100
+    command = [
+        sys.executable,
+        "-c",
+        f"import sys;sys.stdout.buffer.write(b'x'*{count}+b'TAIL')",
+    ]
+
+    returncode, stdout, overflowed, timed_out = _run_bounded_process(
+        command, "prompt", cwd=tmp_path, timeout=5,
+    )
+
+    assert returncode == 0
+    assert len(stdout) == count + 4
+    assert stdout.endswith(b"TAIL")
+    assert overflowed is False
+    assert timed_out is False
 
 
 def test_manual_compiler_writes_complete_unique_no_clobber_handoffs(tmp_path):
     from local_kb.compiler import ManualCompiler
 
-    compiler = ManualCompiler(tmp_path / "manual")
+    compiler = ManualCompiler(tmp_path / "manual", trusted_root=tmp_path)
     first = compiler.compile("evidence")
     second = compiler.compile("evidence")
 
@@ -98,6 +203,80 @@ def test_manual_compiler_writes_complete_unique_no_clobber_handoffs(tmp_path):
     assert packet["status"] == "needs_agent"
     assert packet["schema_version"] == 1
     assert packet["output_schema"]["required"] == ["changes"]
+
+
+def test_manual_compiler_rejects_posix_symlinked_outbox_ancestor_without_writing_outside(tmp_path):
+    if os.name == "nt":
+        pytest.skip("POSIX symlink test")
+    from local_kb.compiler import ManualCompiler
+
+    trusted = tmp_path / "trusted"
+    outside = tmp_path / "outside"
+    trusted.mkdir()
+    outside.mkdir()
+    (trusted / "redirect").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises((OSError, ValueError), match="safe|link|trusted"):
+        ManualCompiler(
+            trusted / "redirect" / "manual", trusted_root=trusted,
+        ).compile("secret evidence")
+    assert list(outside.iterdir()) == []
+
+
+def test_manual_compiler_rejects_windows_junction_without_writing_outside(tmp_path):
+    if os.name != "nt":
+        pytest.skip("Windows junction test")
+    from local_kb.compiler import ManualCompiler
+
+    trusted = tmp_path / "trusted"
+    outside = tmp_path / "outside"
+    trusted.mkdir()
+    outside.mkdir()
+    junction = trusted / "redirect"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        pytest.skip("junctions unavailable")
+    with pytest.raises((OSError, ValueError), match="safe|reparse|trusted"):
+        ManualCompiler(
+            junction / "manual", trusted_root=trusted,
+        ).compile("secret evidence")
+    assert list(outside.iterdir()) == []
+
+
+def test_manual_compiler_pinned_outbox_does_not_follow_replacement_race(tmp_path, monkeypatch):
+    if os.name == "nt":
+        pytest.skip("POSIX dir_fd race test")
+    from local_kb.compiler import ManualCompiler
+
+    trusted = tmp_path / "trusted"
+    outside = tmp_path / "outside"
+    outbox = trusted / "runtime" / "manual"
+    moved = trusted / "pinned-original"
+    trusted.mkdir()
+    outside.mkdir()
+    original_link = os.link
+    raced = False
+
+    def replace_then_link(source, target, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            outbox.rename(moved)
+            outbox.symlink_to(outside, target_is_directory=True)
+        return original_link(source, target, **kwargs)
+
+    monkeypatch.setattr("local_kb.compiler.os.link", replace_then_link)
+    ManualCompiler(outbox, trusted_root=trusted).compile("secret evidence")
+
+    assert raced is True
+    assert list(outside.iterdir()) == []
+    packets = list(moved.glob("manual_*.json"))
+    assert len(packets) == 1
+    assert "secret evidence" in packets[0].read_text(encoding="utf-8")
 
 
 def test_compile_extraction_publishes_only_valid_current_source_changes(tmp_path):
@@ -296,7 +475,7 @@ def test_handoff_marker_write_failure_leaves_no_half_metadata_or_orphan_on_retry
 
     vault = build_vault(tmp_path / "vault")
     queue = DiskQueue(vault.queue)
-    manual = ManualCompiler(vault.runtime / "manual")
+    manual = ManualCompiler(vault.runtime / "manual", trusted_root=vault.root)
 
     class FailBeforeMarker:
         first = True
@@ -341,7 +520,7 @@ def test_handoff_marker_sync_failure_recognizes_already_persisted_pending_state(
 
     vault = build_vault(tmp_path / "vault")
     queue = DiskQueue(vault.queue)
-    manual = ManualCompiler(vault.runtime / "manual")
+    manual = ManualCompiler(vault.runtime / "manual", trusted_root=vault.root)
 
     class FailAfterMarker:
         def compile(self, evidence):
@@ -380,7 +559,7 @@ def test_unpersisted_handoff_cleanup_preserves_packet_changed_after_hash_binding
 
     vault = build_vault(tmp_path / "vault")
     queue = DiskQueue(vault.queue)
-    manual = ManualCompiler(vault.runtime / "manual")
+    manual = ManualCompiler(vault.runtime / "manual", trusted_root=vault.root)
 
     class FailAndTamperMarker:
         def compile(self, evidence):
@@ -418,7 +597,7 @@ def test_unpersisted_handoff_cleanup_preserves_replaced_packet_identity(tmp_path
 
     vault = build_vault(tmp_path / "vault")
     queue = DiskQueue(vault.queue)
-    manual = ManualCompiler(vault.runtime / "manual")
+    manual = ManualCompiler(vault.runtime / "manual", trusted_root=vault.root)
 
     class FailAndReplaceMarker:
         def compile(self, evidence):
@@ -474,3 +653,163 @@ def test_claude_prompt_instruction_constant_is_readable_and_local_only():
     assert "Use only the following local evidence" in CLAUDE_PROMPT_INSTRUCTIONS
     assert "Do not browse the web" in CLAUDE_PROMPT_INSTRUCTIONS
     assert "source_id" in CLAUDE_PROMPT_INSTRUCTIONS
+
+
+def test_process_replays_durable_receipt_without_calling_model_after_publish_marker_failure(
+    tmp_path, monkeypatch
+):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+    from local_kb.transaction import ChangeTransaction
+
+    class DriftingCompiler:
+        calls = 0
+
+        def compile(self, evidence):
+            self.calls += 1
+            source_id = evidence.split(" locator=", 1)[0].removeprefix("source_id=")
+            name = "first" if self.calls == 1 else "second"
+            return {"changes": [_valid_change(
+                path=f"20_wiki/work/{name}.md",
+                title=name.title(),
+                source_ids=[source_id],
+            )]}
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue, max_retries=5)
+    compiler = DriftingCompiler()
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"), compiler=compiler)
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("stable receipt", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="receipt-replay")
+    original_commit = ChangeTransaction.commit_git
+
+    def commit_then_fail_marker(transaction, message):
+        committed = original_commit(transaction, message)
+        original_write = queue._write
+
+        def fail_once(*_args, **_kwargs):
+            queue._write = original_write
+            raise OSError("complete marker")
+
+        queue._write = fail_once
+        return committed
+
+    monkeypatch.setattr(ChangeTransaction, "commit_git", commit_then_fail_marker)
+    with pytest.raises(OSError, match="complete marker"):
+        service.process(job.job_id, space="work")
+
+    retrying = queue.get(job.job_id)
+    assert retrying.metadata["compiler_status"] == "ready"
+    assert "compilation_receipt" in retrying.metadata
+    monkeypatch.setattr(ChangeTransaction, "commit_git", original_commit)
+    service.process(job.job_id, space="work")
+
+    completed = queue.get(job.job_id)
+    assert compiler.calls == 1
+    assert completed.state == "published"
+    assert completed.metadata["compiler_status"] == "completed"
+    assert (vault.wiki / "work" / "first.md").is_file()
+    assert not (vault.wiki / "work" / "second.md").exists()
+
+
+def test_process_fails_closed_when_durable_compilation_receipt_is_tampered(tmp_path, monkeypatch):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+    from local_kb.transaction import ChangeTransaction
+
+    class Compiler:
+        calls = 0
+
+        def compile(self, evidence):
+            self.calls += 1
+            source_id = evidence.split(" locator=", 1)[0].removeprefix("source_id=")
+            return {"changes": [_valid_change(source_ids=[source_id])]}
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue, max_retries=5)
+    compiler = Compiler()
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"), compiler=compiler)
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("tamper receipt", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="receipt-tamper")
+    original_commit = ChangeTransaction.commit_git
+
+    def commit_then_fail_marker(transaction, message):
+        result = original_commit(transaction, message)
+        original_write = queue._write
+
+        def fail_once(*_args, **_kwargs):
+            queue._write = original_write
+            raise OSError("complete marker")
+
+        queue._write = fail_once
+        return result
+
+    monkeypatch.setattr(ChangeTransaction, "commit_git", commit_then_fail_marker)
+    with pytest.raises(OSError):
+        service.process(job.job_id)
+    monkeypatch.setattr(ChangeTransaction, "commit_git", original_commit)
+
+    def tamper(current):
+        current.metadata["compilation_receipt"]["pages"][0]["content"] += "tampered"
+
+    queue.update(job.job_id, tamper)
+    with pytest.raises(ValueError, match="receipt"):
+        service.process(job.job_id)
+    assert compiler.calls == 1
+
+
+def test_resume_replays_durable_receipt_without_reinvoking_replacement_compiler(tmp_path, monkeypatch):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+    from local_kb.transaction import ChangeTransaction
+
+    class Compiler:
+        calls = 0
+
+        def compile(self, evidence):
+            self.calls += 1
+            source_id = evidence.split(" locator=", 1)[0].removeprefix("source_id=")
+            name = "first" if self.calls == 1 else "second"
+            return {"changes": [_valid_change(
+                path=f"20_wiki/work/{name}.md", title=name, source_ids=[source_id],
+            )]}
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue)
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"))
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("resume receipt", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="resume-receipt")
+    service.process(job.job_id)
+    compiler = Compiler()
+    original_commit = ChangeTransaction.commit_git
+
+    def commit_then_fail_marker(transaction, message):
+        result = original_commit(transaction, message)
+        original_write = queue._write
+
+        def fail_once(*_args, **_kwargs):
+            queue._write = original_write
+            raise OSError("resume complete marker")
+
+        queue._write = fail_once
+        return result
+
+    monkeypatch.setattr(ChangeTransaction, "commit_git", commit_then_fail_marker)
+    with pytest.raises(OSError, match="resume complete marker"):
+        service.resume_compilation(job.job_id, compiler=compiler)
+    monkeypatch.setattr(ChangeTransaction, "commit_git", original_commit)
+
+    service.resume_compilation(job.job_id, compiler=compiler)
+    assert compiler.calls == 1
+    assert queue.get(job.job_id).state == "published"
+    assert (vault.wiki / "work" / "first.md").is_file()
+    assert not (vault.wiki / "work" / "second.md").exists()

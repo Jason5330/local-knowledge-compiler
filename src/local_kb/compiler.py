@@ -7,12 +7,17 @@ instead of an unverified knowledge-base update.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
+import signal
+import stat
 import subprocess
-import tempfile
+import threading
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -103,16 +108,179 @@ def _valid_payload_shape(payload: object) -> bool:
     return True
 
 
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """Best-effort termination of the isolated Claude process group and children."""
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            killer = subprocess.Popen(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            killer.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        process.wait(timeout=0.5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_bounded_process(
+    command: list[str], prompt: str, *, cwd: Path, timeout: float
+) -> tuple[int, bytes, bool, bool]:
+    """Run with bounded combined output; return code, stdout, overflow, timeout."""
+    platform_options: dict[str, Any]
+    if os.name == "nt":
+        platform_options = {
+            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        }
+    else:
+        platform_options = {"start_new_session": True}
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(cwd),
+        env=_controlled_environment(),
+        shell=False,
+        **platform_options,
+    )
+    assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    lock = threading.Lock()
+    overflow = threading.Event()
+
+    def read_stream(name: str, stream) -> None:
+        try:
+            while chunk := stream.read(64 * 1024):
+                with lock:
+                    used = len(buffers["stdout"]) + len(buffers["stderr"])
+                    remaining = max(0, MAX_OUTPUT_BYTES - used)
+                    if remaining:
+                        buffers[name].extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        overflow.set()
+                        return
+        except (OSError, ValueError):
+            return
+
+    def write_prompt() -> None:
+        try:
+            process.stdin.write(prompt.encode("utf-8"))
+            process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+    readers = [
+        threading.Thread(target=read_stream, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=read_stream, args=("stderr", process.stderr), daemon=True),
+    ]
+    writer = threading.Thread(target=write_prompt, daemon=True)
+    for thread in readers:
+        thread.start()
+    writer.start()
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    returncode = -1
+    try:
+        while process.poll() is None:
+            if overflow.wait(timeout=min(0.02, max(0.0, deadline - time.monotonic()))):
+                _terminate_process_tree(process)
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                _terminate_process_tree(process)
+                break
+        try:
+            returncode = process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(process)
+            observed = process.poll()
+            returncode = -1 if observed is None else observed
+    finally:
+        writer.join(timeout=1)
+        if writer.is_alive():
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
+            writer.join(timeout=1)
+        # A normally-exited child closes both pipes.  Let readers drain those
+        # kernel buffers before closing handles or snapshotting the bytearrays.
+        for thread in readers:
+            thread.join(timeout=1)
+        for stream in (process.stdout, process.stderr):
+            if any(thread.is_alive() for thread in readers):
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+        for thread in readers:
+            thread.join(timeout=1)
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+    return int(returncode), bytes(buffers["stdout"]), overflow.is_set(), timed_out
+
+
 class ManualCompiler:
     """Create a durable handoff packet without claiming any wiki was updated."""
 
-    def __init__(self, outbox: Path | str) -> None:
-        self.outbox = Path(outbox)
+    def __init__(self, outbox: Path | str, *, trusted_root: Path | str) -> None:
+        supplied_root = Path(trusted_root)
+        supplied_outbox = Path(outbox)
+        if not supplied_root.is_absolute() or not supplied_outbox.is_absolute():
+            raise ValueError("manual compiler paths must be absolute")
+        self.trusted_root = Path(os.path.abspath(os.fspath(supplied_root)))
+        self.outbox = Path(os.path.abspath(os.fspath(supplied_outbox)))
+        try:
+            relative = self.outbox.relative_to(self.trusted_root)
+        except ValueError as error:
+            raise ValueError("manual outbox must be beneath trusted_root") from error
+        for component in relative.parts:
+            stem = component.rstrip(". ").split(".", 1)[0].upper()
+            if (not component or component in {".", ".."} or component != component.rstrip(". ")
+                    or ":" in component or any(ord(character) < 32 for character in component)
+                    or stem in {"CON", "PRN", "AUX", "NUL"}
+                    or re.fullmatch(r"(?:COM|LPT)[1-9]", stem)):
+                raise ValueError("manual outbox contains an unsafe path component")
 
     def compile(self, evidence: str, *, reason: str | None = None) -> Path:
         if not isinstance(evidence, str) or len(evidence) > MAX_EVIDENCE_CHARS:
             raise ValueError("evidence exceeds the manual handoff budget")
-        self.outbox.mkdir(parents=True, exist_ok=True)
         packet: dict[str, Any] = {
             "schema_version": 1,
             "status": "needs_agent",
@@ -127,32 +295,102 @@ class ManualCompiler:
         if reason:
             packet["reason"] = _safe_reason(reason)
         encoded = (json.dumps(packet, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
-        for _ in range(16):
-            target = self.outbox / f"manual_{uuid4().hex}.json"
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=".manual-", suffix=".tmp", dir=self.outbox,
-            )
-            temporary = Path(temporary_name)
-            try:
-                with os.fdopen(descriptor, "wb") as stream:
-                    stream.write(encoded)
-                    stream.flush()
-                    os.fsync(stream.fileno())
+        with self._pinned_outbox() as directory_fd:
+            for _ in range(16):
+                identifier = uuid4().hex
+                temporary_name = f".manual-{identifier}.tmp"
+                target_name = f"manual_{identifier}.json"
+                descriptor: int | None = None
                 try:
-                    # A hard link makes publication atomic and refuses an existing name.
-                    os.link(temporary, target)
-                except FileExistsError:
-                    continue
-                if os.name != "nt":
-                    directory_fd = os.open(self.outbox, os.O_RDONLY)
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+                    if directory_fd is not None:
+                        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+                    else:
+                        descriptor = os.open(self.outbox / temporary_name, flags, 0o600)
+                    offset = 0
+                    while offset < len(encoded):
+                        offset += os.write(descriptor, encoded[offset:])
+                    os.fsync(descriptor)
+                    os.close(descriptor)
+                    descriptor = None
                     try:
+                        if directory_fd is not None:
+                            os.link(
+                                temporary_name, target_name,
+                                src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+                                follow_symlinks=False,
+                            )
+                        else:
+                            os.link(self.outbox / temporary_name, self.outbox / target_name)
+                    except FileExistsError:
+                        continue
+                    if directory_fd is not None:
                         os.fsync(directory_fd)
-                    finally:
-                        os.close(directory_fd)
-                return target
-            finally:
-                temporary.unlink(missing_ok=True)
+                    return self.outbox / target_name
+                finally:
+                    if descriptor is not None:
+                        os.close(descriptor)
+                    try:
+                        if directory_fd is not None:
+                            os.unlink(temporary_name, dir_fd=directory_fd)
+                        else:
+                            (self.outbox / temporary_name).unlink(missing_ok=True)
+                    except FileNotFoundError:
+                        pass
         raise RuntimeError("unable to allocate a unique manual handoff path")
+
+    @contextmanager
+    def _pinned_outbox(self):
+        if os.name == "nt":
+            from .source_store import _windows_close_handle, _windows_open_directory
+
+            handles: list[int] = []
+            try:
+                handles.append(_windows_open_directory(self.trusted_root, self.trusted_root))
+                cursor = self.trusted_root
+                for component in self.outbox.relative_to(self.trusted_root).parts:
+                    cursor = cursor / component
+                    if os.path.lexists(cursor):
+                        info = os.lstat(cursor)
+                        junction = getattr(cursor, "is_junction", None)
+                        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                                or (callable(junction) and junction())):
+                            raise ValueError("manual outbox path is unsafe")
+                    else:
+                        os.mkdir(cursor)
+                    handles.append(_windows_open_directory(cursor, self.trusted_root))
+                yield None
+            finally:
+                for handle in reversed(handles):
+                    _windows_close_handle(handle)
+            return
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptors: list[int] = []
+        try:
+            anchor = Path(self.trusted_root.anchor)
+            descriptor = os.open(anchor, flags)
+            descriptors.append(descriptor)
+            for component in self.trusted_root.parts[1:]:
+                descriptor = os.open(component, flags, dir_fd=descriptor)
+                if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    raise ValueError("trusted_root path is unsafe")
+                descriptors.append(descriptor)
+            for component in self.outbox.relative_to(self.trusted_root).parts:
+                try:
+                    child = os.open(component, flags, dir_fd=descriptor)
+                except FileNotFoundError:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                    child = os.open(component, flags, dir_fd=descriptor)
+                if not stat.S_ISDIR(os.fstat(child).st_mode):
+                    raise ValueError("manual outbox path is unsafe")
+                descriptors.append(child)
+                descriptor = child
+            yield descriptor
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
 
 class ClaudeCompiler:
@@ -168,7 +406,9 @@ class ClaudeCompiler:
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
             raise ValueError("timeout must be positive")
         self.cwd = Path(cwd).resolve() if cwd is not None else Path.cwd().resolve()
-        self.fallback = fallback or ManualCompiler(self.cwd / ".kb" / "manual")
+        self.fallback = fallback or ManualCompiler(
+            self.cwd / ".kb" / "manual", trusted_root=self.cwd,
+        )
         self.timeout = float(timeout)
 
     def compile(self, evidence: str) -> dict[str, Any] | Path:
@@ -182,26 +422,18 @@ class ClaudeCompiler:
             "--tools", "", "--no-session-persistence", "--json-schema", OUTPUT_SCHEMA,
         ]
         try:
-            result = subprocess.run(
-                command,
-                input=prompt,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=str(self.cwd),
-                env=_controlled_environment(),
-                shell=False,
-                timeout=self.timeout,
+            returncode, stdout_bytes, overflowed, timed_out = _run_bounded_process(
+                command, prompt, cwd=self.cwd, timeout=self.timeout,
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
+        except OSError as error:
             return self.fallback.compile(evidence, reason=f"Claude CLI unavailable: {_safe_reason(error)}")
-        if getattr(result, "returncode", 0) != 0:
-            return self.fallback.compile(evidence, reason="Claude CLI returned a non-zero exit status")
-        stdout = getattr(result, "stdout", "")
-        if not isinstance(stdout, str) or len(stdout.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        if timed_out:
+            return self.fallback.compile(evidence, reason="Claude CLI timed out")
+        if overflowed:
             return self.fallback.compile(evidence, reason="Claude CLI output exceeds the safe size limit")
+        if returncode != 0:
+            return self.fallback.compile(evidence, reason="Claude CLI returned a non-zero exit status")
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
         try:
             envelope = json.loads(stdout)
             payload = envelope["result"]
