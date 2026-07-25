@@ -19,11 +19,12 @@ class Config:
         with path.open("rb") as config_file:
             values = tomllib.load(config_file)
 
+        compiler = values.get("compiler", {})
         watcher = values.get("watcher", {})
         queue = values.get("queue", {})
         return cls(
             vault=path.parent.parent.resolve(),
-            compiler=values.get("compiler", "claude"),
+            compiler=compiler.get("provider", "claude"),
             poll_seconds=watcher.get("poll_seconds", 2.0),
             stable_seconds=watcher.get("stable_seconds", 5.0),
             max_retries=queue.get("max_retries", 3),

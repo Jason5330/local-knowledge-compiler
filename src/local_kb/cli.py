@@ -16,10 +16,11 @@ ROOTS = (
     "system",
     "logs",
     "trash",
-    "kb",
+    "runtime",
 )
 CATEGORIES = ("personal", "work", "projects", "shared", "unclassified")
-DEFAULT_CONFIG = """compiler = \"claude\"
+DEFAULT_CONFIG = """[compiler]
+provider = \"claude\"
 
 [watcher]
 poll_seconds = 2.0

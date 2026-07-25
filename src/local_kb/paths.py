@@ -43,20 +43,16 @@ class VaultPaths:
         return self.root / "99_trash"
 
     @property
-    def kb(self) -> Path:
+    def runtime(self) -> Path:
         return self.root / ".kb"
 
     @property
-    def state(self) -> Path:
-        return self.kb
-
-    @property
     def queue(self) -> Path:
-        return self.kb / "queue"
+        return self.runtime / "queue"
 
     @property
     def staging(self) -> Path:
-        return self.kb / "staging"
+        return self.runtime / "staging"
 
     @property
     def config(self) -> Path:
