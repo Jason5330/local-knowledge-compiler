@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 from docx import Document
@@ -235,3 +237,112 @@ def test_registry_rejects_directories_and_symlinks(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="symbolic link"):
         registry.extract(link)
+
+
+def test_registry_rejects_a_file_below_a_parent_junction(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("junctions are a Windows-only filesystem feature")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("must not be read", encoding="utf-8")
+    junction = tmp_path / "linked-parent"
+    created = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink /J linked-parent outside"],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert created.returncode == 0, created.stderr
+
+    with pytest.raises(ValueError, match="reparse"):
+        registry.extract(junction / "secret.txt")
+
+
+def test_registry_extracts_a_stable_snapshot_not_a_path_reopened_after_dispatch(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "mutable.snap"
+    source.write_text("before", encoding="utf-8")
+
+    class ReplacingExtractor:
+        suffixes = {".snap"}
+
+        def extract(self, path: Path) -> Extraction:
+            source.write_text("after", encoding="utf-8")
+            return Extraction("extracted", [Fragment("snapshot", path.read_text(encoding="utf-8"))])
+
+    isolated = Registry()
+    isolated.register(ReplacingExtractor())
+
+    result = isolated.extract(source)
+
+    assert result.fragments == [Fragment("snapshot", "before")]
+    assert source.read_text(encoding="utf-8") == "after"
+
+
+def test_parent_replacement_after_snapshot_cannot_change_parser_input(tmp_path: Path) -> None:
+    parent = tmp_path / "source-parent"
+    parent.mkdir()
+    source = parent / "race.snap"
+    source.write_text("before", encoding="utf-8")
+    replacement = tmp_path / "replaced-parent"
+    rename_failed = False
+
+    class ParentReplacingExtractor:
+        suffixes = {".snap"}
+
+        def extract(self, path: Path) -> Extraction:
+            nonlocal rename_failed
+            try:
+                parent.rename(replacement)
+                parent.mkdir()
+                (parent / "race.snap").write_text("outside", encoding="utf-8")
+            except OSError:
+                rename_failed = True
+            return Extraction("extracted", [Fragment("snapshot", path.read_text(encoding="utf-8"))])
+
+    isolated = Registry()
+    isolated.register(ParentReplacingExtractor())
+
+    result = isolated.extract(source)
+
+    assert result.fragments == [Fragment("snapshot", "before")]
+    if os.name == "nt":
+        assert rename_failed is True
+
+
+def test_registry_removes_snapshot_after_success_and_parser_failure(tmp_path: Path) -> None:
+    source = tmp_path / "temporary.snap"
+    source.write_text("content", encoding="utf-8")
+    seen_paths: list[Path] = []
+
+    class CapturingExtractor:
+        suffixes = {".snap"}
+
+        def extract(self, path: Path) -> Extraction:
+            seen_paths.append(path)
+            assert path.exists()
+            return Extraction("extracted", [])
+
+    isolated = Registry()
+    isolated.register(CapturingExtractor())
+    isolated.extract(source)
+    assert not seen_paths[0].exists()
+    assert not seen_paths[0].parent.exists()
+
+    class FailingExtractor:
+        suffixes = {".fail"}
+
+        def extract(self, path: Path) -> Extraction:
+            seen_paths.append(path)
+            raise RuntimeError("parser failed")
+
+    failing_source = tmp_path / "temporary.fail"
+    failing_source.write_text("content", encoding="utf-8")
+    failing = Registry()
+    failing.register(FailingExtractor())
+    with pytest.raises(RuntimeError, match="parser failed"):
+        failing.extract(failing_source)
+    assert not seen_paths[1].exists()
+    assert not seen_paths[1].parent.exists()

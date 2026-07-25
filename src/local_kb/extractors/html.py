@@ -6,26 +6,31 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 
-from .base import Extraction, ExtractionError, Fragment, registry, require_regular_file
+from .base import Extraction, ExtractionError, Fragment, registry, snapshot_file
 
 
-def extract_html(path: Path) -> Extraction:
-    candidate = require_regular_file(path)
+def _extract_html_snapshot(path: Path) -> Extraction:
     try:
-        raw_html = candidate.read_text(encoding="utf-8", errors="replace")
+        raw_html = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        raise ExtractionError(f"failed to read HTML file: {candidate}") from exc
+        raise ExtractionError(f"failed to read HTML file: {path}") from exc
     soup = BeautifulSoup(raw_html, "html.parser")
     for node in soup(["script", "style", "nav"]):
         node.decompose()
-    title = soup.title.get_text(" ", strip=True) if soup.title else candidate.stem
+    title = soup.title.get_text(" ", strip=True) if soup.title else path.stem
     body = soup.get_text("\n", strip=True)
     return Extraction("extracted", [Fragment(f"title:{title}", body)])
+
+
+def extract_html(path: Path) -> Extraction:
+    with snapshot_file(path) as snapshot:
+        return _extract_html_snapshot(snapshot)
 
 
 class HtmlExtractor:
     suffixes = {".html", ".htm"}
     extract = staticmethod(extract_html)
+    extract_snapshot = staticmethod(_extract_html_snapshot)
 
 
 registry.register(HtmlExtractor())

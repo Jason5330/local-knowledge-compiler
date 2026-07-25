@@ -8,15 +8,14 @@ from docx import Document
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
-from .base import Extraction, ExtractionError, Fragment, registry, require_regular_file
+from .base import Extraction, ExtractionError, Fragment, registry, snapshot_file
 
 
-def extract_docx(path: Path) -> Extraction:
-    candidate = require_regular_file(path)
+def _extract_docx_snapshot(path: Path) -> Extraction:
     try:
-        document = Document(candidate)
+        document = Document(path)
     except Exception as exc:
-        raise ExtractionError(f"failed to read DOCX file: {candidate}") from exc
+        raise ExtractionError(f"failed to read DOCX file: {path}") from exc
     return Extraction(
         "extracted",
         [
@@ -27,17 +26,21 @@ def extract_docx(path: Path) -> Extraction:
     )
 
 
-def extract_xlsx(path: Path) -> Extraction:
-    candidate = require_regular_file(path)
+def extract_docx(path: Path) -> Extraction:
+    with snapshot_file(path) as snapshot:
+        return _extract_docx_snapshot(snapshot)
+
+
+def _extract_xlsx_snapshot(path: Path) -> Extraction:
     try:
         book = load_workbook(
-            candidate,
+            path,
             read_only=True,
             data_only=True,
             keep_links=False,
         )
     except Exception as exc:
-        raise ExtractionError(f"failed to read spreadsheet file: {candidate}") from exc
+        raise ExtractionError(f"failed to read spreadsheet file: {path}") from exc
 
     try:
         fragments: list[Fragment] = []
@@ -52,19 +55,26 @@ def extract_xlsx(path: Path) -> Extraction:
                     fragments.append(Fragment(locator, "\t".join(values)))
         return Extraction("extracted", fragments)
     except Exception as exc:
-        raise ExtractionError(f"failed to extract spreadsheet file: {candidate}") from exc
+        raise ExtractionError(f"failed to extract spreadsheet file: {path}") from exc
     finally:
         book.close()
+
+
+def extract_xlsx(path: Path) -> Extraction:
+    with snapshot_file(path) as snapshot:
+        return _extract_xlsx_snapshot(snapshot)
 
 
 class DocxExtractor:
     suffixes = {".docx"}
     extract = staticmethod(extract_docx)
+    extract_snapshot = staticmethod(_extract_docx_snapshot)
 
 
 class XlsxExtractor:
     suffixes = {".xlsx", ".xlsm"}
     extract = staticmethod(extract_xlsx)
+    extract_snapshot = staticmethod(_extract_xlsx_snapshot)
 
 
 registry.register(DocxExtractor())
