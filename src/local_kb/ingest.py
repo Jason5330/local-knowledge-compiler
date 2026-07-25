@@ -78,7 +78,7 @@ def _safe_compiler_line(value: object, field: str, *, limit: int = 300) -> str:
 @dataclass(frozen=True)
 class _CompileOutcome:
     paths: tuple[str, ...] = ()
-    handoff: dict[str, str] | None = None
+    handoff: dict[str, Any] | None = None
 
 
 def _utc_now() -> str:
@@ -219,7 +219,7 @@ class IngestService:
         self.queue.update(job_id, complete)
         return final
 
-    def _handoff_metadata(self, handoff: Path) -> dict[str, str]:
+    def _handoff_metadata(self, handoff: Path) -> dict[str, Any]:
         """Read only a canonical packet created beneath this vault's manual outbox."""
         candidate = Path(handoff)
         if not candidate.is_absolute():
@@ -233,8 +233,8 @@ class IngestService:
         if not re.fullmatch(r"\.kb/manual/manual_[0-9a-f]{32}\.json", relative):
             raise ValueError("compiler handoff has an unsafe filename")
         try:
-            packet = json.loads(candidate.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+            packet, packet_hash, packet_identity = self._read_pinned_handoff_packet(candidate)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise ValueError("compiler handoff packet is unreadable") from error
         if not isinstance(packet, dict) or packet.get("status") != "needs_agent":
             raise ValueError("compiler handoff packet is invalid")
@@ -245,16 +245,34 @@ class IngestService:
             "status": "needs_agent",
             "created_at": created_at,
             "reason": reason,
+            "sha256": packet_hash,
+            "identity": list(packet_identity),
         })
         return {
             "path": relative,
             "status": "needs_agent",
             "created_at": created_at,
             "reason": reason,
+            "sha256": packet_hash,
+            "identity": list(packet_identity),
         }
 
+    def _read_pinned_handoff_packet(
+        self, candidate: Path
+    ) -> tuple[object, str, tuple[int, int, int, int]]:
+        """Parse the exact regular-file bytes whose digest will bind the handoff."""
+        with self._open_pinned_regular(candidate) as (descriptor, identity):
+            digest = hashlib.sha256()
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            self._assert_unchanged(candidate, identity)
+        return json.loads(data.decode("utf-8")), digest.hexdigest(), identity
+
     def _mark_compiler_pending(
-        self, job_id: str, source: SourceVersion, processed_path: str, handoff: dict[str, str]
+        self, job_id: str, source: SourceVersion, processed_path: str, handoff: dict[str, Any]
     ) -> None:
         self._validate_handoff_record(handoff)
 
@@ -281,7 +299,7 @@ class IngestService:
             self._remove_unpersisted_handoff(handoff)
             raise
 
-    def _handoff_is_durably_pending(self, job_id: str, handoff: dict[str, str]) -> bool:
+    def _handoff_is_durably_pending(self, job_id: str, handoff: dict[str, Any]) -> bool:
         try:
             job = self.queue.get(job_id)
             self._validate_pending_compiler_metadata(job)
@@ -290,18 +308,15 @@ class IngestService:
         history = job.metadata["compiler_handoffs"]
         return bool(history) and history[-1] == handoff
 
-    def _remove_unpersisted_handoff(self, handoff: dict[str, str]) -> None:
+    def _remove_unpersisted_handoff(self, handoff: dict[str, Any]) -> None:
         """Remove only the packet this failed atomic marker could not reference."""
         try:
             self._validate_handoff_record(handoff)
             candidate = self.vault.root / Path(*PurePosixPath(handoff["path"]).parts)
-            packet = json.loads(candidate.read_text(encoding="utf-8"))
-            reason = packet.get("reason", "manual compilation requested") if isinstance(packet, dict) else None
-            if (not isinstance(packet, dict) or packet.get("status") != "needs_agent"
-                    or packet.get("created_at") != handoff["created_at"]
-                    or reason != handoff["reason"]):
+            digest, identity = self._hash_pinned_regular(candidate, identity=True)
+            if digest != handoff["sha256"] or list(identity) != handoff["identity"]:
                 return
-            candidate.unlink()
+            self._remove_if_unchanged(candidate, identity)
         except (OSError, ValueError, json.JSONDecodeError):
             # A missing or modified packet must never trigger a broader cleanup.
             return
@@ -323,7 +338,9 @@ class IngestService:
             raise ValueError("compiler handoff metadata has an inconsistent latest path")
 
     def _validate_handoff_record(self, item: object) -> None:
-        if not isinstance(item, dict) or set(item) != {"path", "status", "created_at", "reason"}:
+        if not isinstance(item, dict) or set(item) != {
+            "path", "status", "created_at", "reason", "sha256", "identity",
+        }:
             raise ValueError("compiler handoff metadata is invalid")
         path = item["path"]
         if not isinstance(path, str) or re.fullmatch(r"\.kb/manual/manual_[0-9a-f]{32}\.json", path) is None:
@@ -343,6 +360,15 @@ class IngestService:
         except ValueError as error:
             raise ValueError("compiler handoff timestamp is invalid") from error
         _safe_compiler_line(item["reason"], "handoff reason", limit=500)
+        expected_hash = item["sha256"]
+        expected_identity = item["identity"]
+        if (not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+                or not isinstance(expected_identity, list) or len(expected_identity) != 4
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in expected_identity)):
+            raise ValueError("compiler handoff binding is invalid")
+        actual_hash, actual_identity = self._hash_pinned_regular(candidate, identity=True)
+        if actual_hash != expected_hash or list(actual_identity) != expected_identity:
+            raise ValueError("compiler handoff packet no longer matches its binding")
 
     def _safe_processed_metadata(self, value: object) -> str:
         if not isinstance(value, str) or not value or Path(value).is_absolute():

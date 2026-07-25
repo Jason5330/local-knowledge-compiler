@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -199,6 +200,9 @@ def test_default_manual_handoff_finishes_local_ingest_but_leaves_job_pending(tmp
     assert pending.metadata["compiler_status"] == "needs_agent"
     assert pending.metadata["compiler_handoff"].startswith(".kb/manual/manual_")
     assert len(pending.metadata["compiler_handoffs"]) == 1
+    record = pending.metadata["compiler_handoffs"][0]
+    assert len(record["sha256"]) == 64
+    assert len(record["identity"]) == 4
     assert (vault.root / pending.metadata["compiler_handoff"]).is_file()
     assert (vault.index / "cache" / f"{source.version_id}.json").is_file()
     assert service.catalog.search("durable", {"work"})
@@ -361,6 +365,88 @@ def test_handoff_marker_sync_failure_recognizes_already_persisted_pending_state(
     assert pending.state == "pending_attention"
     assert len(pending.metadata["compiler_handoffs"]) == 1
     assert len(list((vault.runtime / "manual").glob("manual_*.json"))) == 1
+
+
+@pytest.mark.parametrize("field, replacement", [
+    ("evidence", "tampered evidence"),
+    ("output_schema", {"type": "tampered"}),
+])
+def test_unpersisted_handoff_cleanup_preserves_packet_changed_after_hash_binding(tmp_path, field, replacement):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.compiler import ManualCompiler
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue)
+    manual = ManualCompiler(vault.runtime / "manual")
+
+    class FailAndTamperMarker:
+        def compile(self, evidence):
+            packet = manual.compile(evidence)
+            original_write = queue._write
+
+            def fail_once(*_args, **_kwargs):
+                payload = json.loads(packet.read_text(encoding="utf-8"))
+                payload[field] = replacement
+                packet.write_text(json.dumps(payload), encoding="utf-8")
+                queue._write = original_write
+                raise OSError("marker write failed")
+
+            queue._write = fail_once
+            return packet
+
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"), compiler=FailAndTamperMarker())
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("hash binding", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id=f"tamper-{field}")
+
+    with pytest.raises(OSError, match="marker write failed"):
+        service.process(job.job_id)
+    packets = list((vault.runtime / "manual").glob("manual_*.json"))
+    assert len(packets) == 1
+    assert json.loads(packets[0].read_text(encoding="utf-8"))[field] == replacement
+
+
+def test_unpersisted_handoff_cleanup_preserves_replaced_packet_identity(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.compiler import ManualCompiler
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue)
+    manual = ManualCompiler(vault.runtime / "manual")
+
+    class FailAndReplaceMarker:
+        def compile(self, evidence):
+            packet = manual.compile(evidence)
+            original_write = queue._write
+
+            def fail_once(*_args, **_kwargs):
+                payload = json.loads(packet.read_text(encoding="utf-8"))
+                payload["evidence"] = "replacement evidence"
+                replacement = packet.with_suffix(".replacement")
+                replacement.write_text(json.dumps(payload), encoding="utf-8")
+                os.replace(replacement, packet)
+                queue._write = original_write
+                raise OSError("marker replace failed")
+
+            queue._write = fail_once
+            return packet
+
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"), compiler=FailAndReplaceMarker())
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("identity binding", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="replace-packet")
+
+    with pytest.raises(OSError, match="marker replace failed"):
+        service.process(job.job_id)
+    packets = list((vault.runtime / "manual").glob("manual_*.json"))
+    assert len(packets) == 1
+    assert json.loads(packets[0].read_text(encoding="utf-8"))["evidence"] == "replacement evidence"
 
 
 def test_resume_compilation_fails_closed_for_forged_handoff_metadata(tmp_path):
