@@ -304,13 +304,39 @@ class ChangeTransaction:
         self._created_live_dirs.clear()
 
     def _restore(self, target: Path, data: bytes, metadata: os.stat_result | None) -> None:
-        temporary = self._write_live_temp_from_bytes(target, data)
-        os.replace(temporary, target)
-        if metadata is not None:
-            os.chmod(target, stat.S_IMODE(metadata.st_mode))
-            os.utime(target, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
-        _fsync_file(target)
-        _fsync_dir(target.parent)
+        temporary: Path | None = None
+        replaced = False
+        try:
+            temporary = self._write_live_temp_from_bytes(target, data)
+            for _ in range(2):
+                try:
+                    os.replace(temporary, target)
+                    replaced = True
+                    break
+                except OSError:
+                    continue
+            if not replaced:
+                # Last-resort recovery when atomic rename itself is unavailable.
+                # The target is already lock- and path-validated by publish.
+                with target.open("w+b") as output:
+                    output.write(data)
+                    output.truncate()
+                    output.flush()
+                    os.fsync(output.fileno())
+            if metadata is not None:
+                os.chmod(target, stat.S_IMODE(metadata.st_mode))
+                os.utime(target, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+            _fsync_file(target)
+            _fsync_dir(target.parent)
+            with target.open("rb") as restored:
+                if restored.read() != data:
+                    raise OSError("rollback verification failed")
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _write_live_temp_from_bytes(self, target: Path, data: bytes) -> Path:
         fd, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".new", dir=target.parent)
@@ -346,7 +372,7 @@ class ChangeTransaction:
                 return False
             if cached.returncode != 1:
                 raise RuntimeError(cached.stderr or "unable to inspect managed Git changes")
-            changed = subprocess.run(["git", "diff", "--cached", "--name-only", "-z", "--", *pathspecs], cwd=self.vault,
+            changed = subprocess.run(["git", "diff", "--cached", "--no-renames", "--name-only", "-z", "--", *pathspecs], cwd=self.vault,
                                      text=False, capture_output=True, check=True).stdout.split(b"\0")
             commit_paths = [path.decode("utf-8", "surrogateescape") for path in changed if path]
             # --only records the working-tree content, but Git requires untracked

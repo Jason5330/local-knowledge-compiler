@@ -148,6 +148,18 @@ def test_publish_rolls_back_a_replace_when_its_fsync_fails(vault: Path, monkeypa
     assert not list(vault.rglob("*.new"))
 
 
+def test_restore_falls_back_to_durable_in_place_write_when_replace_never_works(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = vault / "20_wiki" / "old.md"
+    target.write_text("changed", encoding="utf-8")
+    tx = ChangeTransaction(vault)
+    real_replace = os.replace
+    monkeypatch.setattr("local_kb.transaction.os.replace", lambda src, dst: (_ for _ in ()).throw(OSError("replace blocked")))
+    tx._restore(target, b"old", target.stat())
+    assert target.read_bytes() == b"old"
+    assert not list(vault.rglob("*.new"))
+    monkeypatch.setattr("local_kb.transaction.os.replace", real_replace)
+
+
 def test_publish_rollback_restores_metadata_captured_before_reading(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     original = vault / "20_wiki" / "old.md"
     original.write_text("old", encoding="utf-8")
