@@ -147,7 +147,7 @@ def _safe_read_wiki(catalog: Catalog, vault: VaultPaths, question: str, spaces: 
     terms = [term.casefold() for term in Catalog._plain_query_terms(question) if len(term) > 1]
     if not terms:
         return [], False, []
-    findings: list[dict[str, object]] = []
+    candidates: list[dict[str, object]] = []
     warnings: list[str] = []
     scan_state = {"truncated": False}
     # A deterministic cap prevents a huge wiki tree becoming an unbounded query operation.
@@ -176,23 +176,34 @@ def _safe_read_wiki(catalog: Catalog, vault: VaultPaths, question: str, spaces: 
         if space not in spaces:
             continue
         current = body.partition("## Current State\n")[2].partition("\n## ")[0].strip()
-        title_and_aliases = " ".join([values.get("title", ""), *_frontmatter_list(header, "aliases")]).casefold()
-        if not current or not (all(term in current.casefold() for term in terms) or all(term in title_and_aliases for term in terms)):
+        aliases = _frontmatter_list(header, "aliases")
+        title_and_aliases = " ".join([values.get("title", ""), *aliases]).casefold()
+        direct_routes = tuple(route for route in _significant_routes(question) if route.casefold() in title_and_aliases or route.casefold() in current.casefold())[:16]
+        if not current or not direct_routes:
             continue
         source_ids = _frontmatter_list(header, "source_ids")
-        if not _valid_wiki_provenance(catalog, vault, source_ids):
-            warnings.append("wiki_page_skipped_invalid_provenance")
-            continue
-        findings.append({
+        candidates.append({
             "kind": "derived_wiki", "evidence_class": "derived", "space": space, "path": path.relative_to(vault.root).as_posix(),
             "locator": "Current State", "text": current[:MAX_EVIDENCE_TEXT],
-            "source_ids": source_ids, "score": 0.0,
+            "source_ids": source_ids, "score": float(len(direct_routes) + sum(route.casefold() in title_and_aliases for route in direct_routes)),
+            "route": "direct_wiki", "routes": list(direct_routes), "coverage": len(direct_routes), "match_kind": "direct",
             "truncated": len(current) > MAX_EVIDENCE_TEXT,
         })
-        if len(findings) >= MAX_RESULTS:
-            scan_state["truncated"] = True
-            break
-    return findings, scan_state["truncated"], sorted(set(warnings))
+    all_ids = list(dict.fromkeys(source_id for item in candidates for source_id in item["source_ids"]))[:128]
+    paths_by_source: dict[str, list[str]] = {}
+    if all_ids:
+        marks = ", ".join("?" for _ in all_ids)
+        with catalog.connection() as connection:
+            for row in connection.execute(f"SELECT source_id, relative_path FROM sources WHERE source_id IN ({marks})", all_ids):
+                paths_by_source.setdefault(row["source_id"], []).append(row["relative_path"])
+    findings: list[dict[str, object]] = []
+    for item in candidates:
+        if not _valid_wiki_provenance_paths(vault, item["source_ids"], paths_by_source):
+            warnings.append("wiki_page_skipped_invalid_provenance")
+            continue
+        findings.append(item)
+    findings.sort(key=lambda item: (-float(item["score"]), str(item["path"])))
+    return findings[:MAX_RESULTS], scan_state["truncated"], sorted(set(warnings))
 
 
 def _valid_wiki_provenance(catalog: Catalog, vault: VaultPaths, source_ids: list[str]) -> bool:
@@ -214,6 +225,22 @@ def _valid_wiki_provenance(catalog: Catalog, vault: VaultPaths, source_ids: list
                     return True
         except (OSError, ValueError):
             continue
+    return False
+
+
+def _valid_wiki_provenance_paths(vault: VaultPaths, source_ids: list[str], paths_by_source: dict[str, list[str]]) -> bool:
+    if not source_ids or any(source_id not in paths_by_source for source_id in source_ids):
+        return False
+    for source_id in source_ids:
+        for relative in paths_by_source[source_id]:
+            candidate = vault.root / relative
+            try:
+                _safe_existing_tree(vault.raw, candidate)
+                with _open_pinned_regular(candidate) as (descriptor, _):
+                    os.read(descriptor, 1)
+                    return True
+            except (OSError, ValueError):
+                continue
     return False
 
 
@@ -254,6 +281,7 @@ def _raw_evidence(hits: list[EvidenceHit]) -> list[dict[str, object]]:
             "space": hit.space, "path": hit.relative_path, "locator": hit.locator,
             "text": hit.text[:MAX_EVIDENCE_TEXT], "score": round(hit.score, 6),
             "route": hit.route,
+            "routes": list(hit.routes), "coverage": hit.coverage,
             "truncated": len(hit.text) > MAX_EVIDENCE_TEXT,
         })
     return evidence

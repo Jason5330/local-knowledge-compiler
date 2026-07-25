@@ -31,6 +31,8 @@ class EvidenceHit:
     text: str
     score: float
     route: str = "full_question"
+    routes: tuple[str, ...] = ()
+    coverage: int = 0
 
 
 def validate_question(question: str) -> str:
@@ -99,7 +101,18 @@ def ranked_search(
                 # length bonus makes longer, more specific fallbacks win stable ties.
                 score=float(hit.score) + len(route) / 1_000_000, route=f"fallback:{route}",
             ))
-    return _deduplicate(combined, limit)
+    selected = _deduplicate(combined, limit)
+    routes = _fallback_queries(checked_question)
+    enriched = []
+    for hit in selected:
+        covered = tuple(route for route in routes if route.casefold() in hit.text.casefold())[:16]
+        enriched.append(EvidenceHit(
+            source_id=hit.source_id, version_id=hit.version_id, space=hit.space,
+            relative_path=hit.relative_path, locator=hit.locator, text=hit.text,
+            score=hit.score + len(covered) / 10_000, route=hit.route,
+            routes=covered, coverage=len(covered),
+        ))
+    return sorted(enriched, key=lambda hit: (-hit.score, hit.space, hit.source_id, hit.version_id, hit.locator))[:limit]
 
 
 def exact_routes(

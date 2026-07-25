@@ -206,7 +206,8 @@ def test_prepare_wiki_title_route_is_secondary_and_bounded(tmp_path):
     assert derived == [{
         "kind": "derived_wiki", "evidence_class": "derived", "space": "work",
         "path": "20_wiki/work/aurora.md", "locator": "Current State",
-        "text": "Derived summary only.", "source_ids": ["src-raw"], "score": 0.0,
+        "text": "Derived summary only.", "source_ids": ["src-raw"], "score": 2.0,
+        "route": "direct_wiki", "routes": ["Aurora"], "coverage": 1, "match_kind": "direct",
         "truncated": False,
     }]
 
