@@ -38,6 +38,21 @@ class DiskQueue:
         identifier = job_id or uuid4().hex
         self._validate_job_id(identifier)
         job = Job(job_id=identifier, source_path=os.fspath(source_path))
+        try:
+            candidate = Path(source_path)
+            info = os.stat(candidate, follow_symlinks=False)
+            if candidate.is_file() and not candidate.is_symlink():
+                job.metadata["enqueued_identity"] = [
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_size,
+                    info.st_mtime_ns,
+                ]
+                job.metadata["enqueued_sha256"] = hashlib.sha256(
+                    candidate.read_bytes()
+                ).hexdigest()
+        except OSError:
+            pass
         with self._locked():
             path = self._job_path(identifier)
             if path.exists():
@@ -61,6 +76,20 @@ class DiskQueue:
                 continue
             if job.state not in {"pending_attention", "published"}:
                 return job
+            if job.state == "pending_attention":
+                expected = job.metadata.get("enqueued_identity")
+                if not isinstance(expected, list):
+                    return job
+                try:
+                    info = os.stat(wanted, follow_symlinks=False)
+                    current = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]
+                    if current == expected:
+                        digest = hashlib.sha256(Path(wanted).read_bytes()).hexdigest()
+                        if digest == job.metadata.get("enqueued_sha256"):
+                            return job
+                except OSError:
+                    pass
+                continue
             if job.state == "published" and job.metadata.get("original_preserved") is True:
                 try:
                     info = os.stat(wanted, follow_symlinks=False)

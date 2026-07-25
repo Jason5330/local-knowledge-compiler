@@ -309,6 +309,53 @@ def test_cross_volume_preserved_original_is_a_tombstone_until_changed(tmp_path, 
     assert len(queue.iter_jobs()) == 2
 
 
+def test_cross_volume_retry_never_unlinks_replacement_at_original_path(tmp_path, monkeypatch):
+    vault, queue, _catalog, service = make_service(tmp_path)
+    incoming = vault.inbox / "preserved.txt"
+    incoming.write_text("same bytes", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="preserved")
+    monkeypatch.setattr(
+        service,
+        "_atomic_claim_no_replace",
+        lambda *_: (_ for _ in ()).throw(OSError(errno.EXDEV, "cross volume")),
+    )
+    original_cache = service._write_cache
+    failed = [False]
+
+    def fail_cache_once(source, extraction):
+        if not failed[0]:
+            failed[0] = True
+            raise OSError("cache")
+        return original_cache(source, extraction)
+
+    monkeypatch.setattr(service, "_write_cache", fail_cache_once)
+    with pytest.raises(OSError, match="cache"):
+        service.process(job.job_id)
+    replacement = vault.inbox / "replacement.txt"
+    replacement.write_text("same bytes", encoding="utf-8")
+    os.replace(replacement, incoming)
+    replacement_identity = incoming.stat().st_ino
+    service.process(job.job_id)
+    assert incoming.is_file()
+    assert incoming.stat().st_ino == replacement_identity
+
+
+def test_pending_attention_blocks_same_identity_but_allows_replacement(tmp_path):
+    from local_kb.queue import DiskQueue
+
+    source = tmp_path / "pending.txt"
+    source.write_text("old", encoding="utf-8")
+    queue = DiskQueue(tmp_path / "queue", max_retries=3)
+    job = queue.enqueue(source, job_id="pending")
+    for _ in range(3):
+        queue.fail(job.job_id, RuntimeError("fail"))
+    assert queue.active_for_source(source).job_id == job.job_id
+    replacement = tmp_path / "new.txt"
+    replacement.write_text("new", encoding="utf-8")
+    os.replace(replacement, source)
+    assert queue.active_for_source(source) is None
+
+
 def test_windows_claim_handle_blocks_path_replacement_before_rename(tmp_path, monkeypatch):
     if os.name != "nt":
         pytest.skip("Windows handle semantics")

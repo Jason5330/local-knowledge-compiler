@@ -59,7 +59,11 @@ class IngestService:
             if claimed.exists():
                 claimed_hash = self._hash_pinned_regular(claimed)
                 original_value = job.metadata.get("original_source_path")
-                if isinstance(original_value, str) and Path(original_value).exists():
+                if (
+                    job.metadata.get("original_preserved") is not True
+                    and isinstance(original_value, str)
+                    and Path(original_value).exists()
+                ):
                     original_hash, identity = self._hash_pinned_regular(
                         Path(original_value), identity=True
                     )

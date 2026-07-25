@@ -138,7 +138,6 @@ def watch_once(
         if job.state == "pending_attention":
             original = Path(str(job.metadata.get("original_source_path", job.source_path)))
             submitted.discard(original)
-            tracker.forget(original)
             continue
         if job.state == "published":
             continue
