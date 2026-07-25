@@ -59,6 +59,7 @@ class WriterLock:
         self.handle: int | None = None
         self._root: DiskQueue | None = None
         self._token: str | None = None
+        self._registered = False
 
     def __enter__(self) -> "WriterLock":
         deadline = time.monotonic() + self.timeout
@@ -81,7 +82,17 @@ class WriterLock:
                         flags | getattr(os, "O_NOFOLLOW", 0),
                     )
                     created = False
+                try:
+                    self._validate_open_lock(root, descriptor)
+                except BaseException:
+                    os.close(descriptor)
+                    raise
                 if self._try_lock(descriptor):
+                    try:
+                        self._validate_open_lock(root, descriptor)
+                    except BaseException:
+                        os.close(descriptor)
+                        raise
                     self.handle = descriptor
                     break
                 os.close(descriptor)
@@ -106,12 +117,14 @@ class WriterLock:
             while offset < len(encoded):
                 offset += os.write(self.handle, encoded[offset:])
             os.fsync(self.handle)
+            self._validate_open_lock(root, self.handle)
             root._sync_directory()
-            held = getattr(_WRITER_LOCAL, "paths", None)
-            if held is None:
-                held = set()
-                _WRITER_LOCAL.paths = held
-            held.add(os.path.normcase(str(self.path)))
+            registry = _writer_registry()
+            normalized = os.path.normcase(str(self.path))
+            if normalized in registry:
+                raise RuntimeError("writer lock registry collision")
+            registry[normalized] = {"pid": os.getpid(), "count": 1, "owner": self}
+            self._registered = True
             return self
         except BaseException:
             self._release()
@@ -165,8 +178,17 @@ class WriterLock:
         return value
 
     def _release(self) -> None:
-        held = getattr(_WRITER_LOCAL, "paths", set())
-        held.discard(os.path.normcase(str(self.path)))
+        if self._registered:
+            registry = _writer_registry()
+            normalized = os.path.normcase(str(self.path))
+            entry = registry.get(normalized)
+            if entry is not None and entry.get("owner") is self:
+                count = int(entry["count"]) - 1
+                if count <= 0:
+                    registry.pop(normalized, None)
+                else:
+                    entry["count"] = count
+            self._registered = False
         descriptor, self.handle = self.handle, None
         if descriptor is not None:
             try:
@@ -185,16 +207,61 @@ class WriterLock:
         if root is not None:
             root.close()
 
+    def _validate_open_lock(self, root: "DiskQueue", descriptor: int) -> None:
+        opened = os.fstat(descriptor)
+        current = root._entry_stat(self.path.name)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError("write.lock must be a stable single-link regular file")
+
 
 @contextmanager
 def shared_writer_lock(path: Path | str, timeout: float = 30) -> Iterator[None]:
     """Acquire the vault writer lock, reusing an outer lock in this thread."""
     normalized = os.path.normcase(os.path.abspath(os.fspath(path)))
-    if normalized in getattr(_WRITER_LOCAL, "paths", set()):
-        yield
+    registry = _writer_registry()
+    entry = registry.get(normalized)
+    if entry is not None and entry.get("pid") == os.getpid():
+        entry["count"] = int(entry["count"]) + 1
+        try:
+            yield
+        finally:
+            entry["count"] = int(entry["count"]) - 1
         return
     with WriterLock(normalized, timeout=timeout):
         yield
+
+
+def _writer_registry() -> dict[str, dict[str, object]]:
+    registry = getattr(_WRITER_LOCAL, "registry", None)
+    current_pid = os.getpid()
+    if registry is not None and getattr(_WRITER_LOCAL, "pid", None) != current_pid:
+        # After fork, close only the child's inherited duplicates.  Never call
+        # LOCK_UN: the parent still owns the shared open-file-description lock.
+        for entry in registry.values():
+            owner = entry.get("owner")
+            if isinstance(owner, WriterLock):
+                descriptor, owner.handle = owner.handle, None
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                root, owner._root = owner._root, None
+                if root is not None:
+                    root.close()
+                owner._registered = False
+        registry = None
+    if registry is None:
+        registry = {}
+        _WRITER_LOCAL.registry = registry
+        _WRITER_LOCAL.pid = current_pid
+    return registry
 
 
 def _bounded_lock_json(value: object) -> bytes:

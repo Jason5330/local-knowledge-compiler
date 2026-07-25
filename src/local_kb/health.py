@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from .catalog import Catalog
 from .extractors import registry as extractor_registry
+from .extractors.base import ExtractionError, SnapshotCleanupError
 from .models import SourceVersion
 from .paths import VaultPaths
 from .queue import WriterLock
@@ -52,43 +53,151 @@ def rebuild_catalog(vault: VaultPaths | Path | str) -> int:
 
 
 def _rebuild_catalog_unlocked(paths: VaultPaths) -> int:
-    paths.index.mkdir(parents=True, exist_ok=True)
+    _safe_existing_tree(paths.root, paths.index)
+    if (
+        not paths.index.is_dir()
+        or paths.index.is_symlink()
+        or bool(getattr(paths.index.lstat(), "st_file_attributes", 0) & 0x400)
+    ):
+        raise ValueError("index directory is unsafe")
     records = _read_raw_records(paths)
     ordered = _order_lineage(records)
     target = paths.index / "catalog.sqlite3"
-    temporary = paths.index / f".catalog-rebuild-{uuid4().hex}.sqlite3"
-    catalog = Catalog(temporary)
-    try:
+    with tempfile.TemporaryDirectory(prefix="local-kb-rebuild-") as workspace:
+        built = Path(workspace) / "catalog.sqlite3"
+        catalog = Catalog(built)
         catalog.initialize()
         for source, fragments in ordered:
             catalog.upsert_source(source, fragments)
-        with closing(sqlite3.connect(temporary)) as connection:
+        with closing(sqlite3.connect(built)) as connection:
             with connection:
                 connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 connection.execute("PRAGMA journal_mode=DELETE")
                 if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise ValueError("rebuilt catalog failed integrity check")
-        with temporary.open("r+b") as stream:
+        with built.open("r+b") as stream:
             os.fsync(stream.fileno())
-        os.replace(temporary, target)
-        _sync_directory(paths.index)
+        with _pinned_directory(paths.root, paths.index) as parent_fd:
+            _quiesce_catalog_sidecars(target, parent_fd)
+            _publish_rebuilt_catalog(built, target, parent_fd)
         return len(ordered)
-    except BaseException:
-        raise
+
+
+def _quiesce_catalog_sidecars(target: Path, parent_fd: int | None) -> None:
+    sidecars = (Path(f"{target}-wal"), Path(f"{target}-shm"))
+    observed: list[tuple[Path, os.stat_result]] = []
+    for sidecar in sidecars:
+        try:
+            info = (
+                os.stat(sidecar.name, dir_fd=parent_fd, follow_symlinks=False)
+                if parent_fd is not None else sidecar.lstat()
+            )
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise CatalogBusy("catalog sidecar is unsafe")
+        observed.append((sidecar, info))
+    if any(info.st_size for _, info in observed):
+        bound_target = _bound_catalog_path(target, parent_fd)
+        try:
+            with closing(sqlite3.connect(bound_target, timeout=0)) as connection:
+                result = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if result is not None and int(result[0]) != 0:
+                    raise CatalogBusy("catalog WAL is busy")
+                mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+                if str(mode).casefold() != "delete":
+                    raise CatalogBusy("catalog journal mode is busy")
+        except sqlite3.OperationalError as error:
+            raise CatalogBusy("catalog sidecars are live") from error
+    for sidecar in sidecars:
+        try:
+            info = (
+                os.stat(sidecar.name, dir_fd=parent_fd, follow_symlinks=False)
+                if parent_fd is not None else sidecar.lstat()
+            )
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 0:
+            raise CatalogBusy("catalog sidecar is not safely stale")
+        if parent_fd is not None:
+            os.unlink(sidecar.name, dir_fd=parent_fd)
+        else:
+            sidecar.unlink()
+    for sidecar in sidecars:
+        try:
+            if parent_fd is not None:
+                os.stat(sidecar.name, dir_fd=parent_fd, follow_symlinks=False)
+            else:
+                sidecar.lstat()
+        except FileNotFoundError:
+            continue
+        raise CatalogBusy("catalog sidecar appeared during rebuild")
+
+
+def _bound_catalog_path(target: Path, parent_fd: int | None) -> Path:
+    if parent_fd is None:
+        return target
+    proc_path = Path(f"/proc/self/fd/{parent_fd}/{target.name}")
+    if proc_path.parent.parent.is_dir():
+        return proc_path
+    raise CatalogBusy("cannot safely bind catalog path on this platform")
+
+
+def _publish_rebuilt_catalog(
+    built: Path, target: Path, parent_fd: int | None
+) -> None:
+    temporary_name = f".catalog-rebuild-{uuid4().hex}.sqlite3"
+    temporary = target.parent / temporary_name
+    descriptor: int | None = None
+    try:
+        flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        )
+        descriptor = (
+            os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+            if parent_fd is not None else os.open(temporary, flags, 0o600)
+        )
+        with built.open("rb") as source:
+            while chunk := source.read(65_536):
+                offset = 0
+                while offset < len(chunk):
+                    offset += os.write(descriptor, chunk[offset:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        try:
+            info = (
+                os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+                if parent_fd is not None else target.lstat()
+            )
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("catalog target is unsafe")
+        except FileNotFoundError:
+            pass
+        if parent_fd is not None:
+            os.replace(
+                temporary_name, target.name,
+                src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+        else:
+            os.replace(temporary, target)
+            _sync_directory(target.parent)
     finally:
-        for candidate in (
-            temporary,
-            Path(f"{temporary}-wal"),
-            Path(f"{temporary}-shm"),
-        ):
-            try:
-                candidate.unlink(missing_ok=True)
-            except OSError:
-                pass
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            if parent_fd is not None:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            else:
+                temporary.unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
 
 
 def _read_raw_records(
-    paths: VaultPaths,
+    paths: VaultPaths, *, extraction_errors: list[dict[str, str]] | None = None,
 ) -> list[tuple[SourceVersion, list[tuple[str, str]]]]:
     """Re-extract the catalog exclusively from immutable, verified raw data."""
     if not paths.raw.is_dir():
@@ -118,7 +227,20 @@ def _read_raw_records(
                 manifest = version_dir / "manifest.json"
                 source = store._read_manifest(manifest)
                 content = version_dir / source.original_name
-                extraction = extractor_registry.extract(content)
+                try:
+                    extraction = extractor_registry.extract(content)
+                except (
+                    ExtractionError, SnapshotCleanupError,
+                    OSError, UnicodeError, ValueError,
+                ) as error:
+                    if extraction_errors is None:
+                        raise
+                    if len(extraction_errors) < 100:
+                        extraction_errors.append({
+                            "version_id": source.version_id,
+                            "error": error.__class__.__name__,
+                        })
+                    continue
                 indexed = replace(source, status=extraction.status)
                 records.append(
                     (
@@ -143,8 +265,9 @@ def _require_plain_directory(root: Path, candidate: Path) -> None:
 def lint(vault: VaultPaths | Path | str) -> dict[str, object]:
     """Return a bounded, read-only health report."""
     paths = _paths(vault)
+    extraction_errors: list[dict[str, str]] = []
     try:
-        raw_records = _read_raw_records(paths)
+        raw_records = _read_raw_records(paths, extraction_errors=extraction_errors)
         raw_error = False
     except (OSError, ValueError):
         raw_records = []
@@ -195,6 +318,7 @@ def lint(vault: VaultPaths | Path | str) -> dict[str, object]:
     pending, queue_truncated = _count_pending(paths)
     missing.sort()
     issues = _wiki_issues(pages)
+    issues["raw_extraction_errors"] = extraction_errors
     index_raw: list[str] = []
     for version_id in sorted(set(raw_rows) | set(catalog_rows)):
         raw = raw_rows.get(version_id)

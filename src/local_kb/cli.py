@@ -114,8 +114,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "lint":
             import json
 
-            print(json.dumps(lint(paths), ensure_ascii=False, sort_keys=True))
-            return 0
+            report = lint(paths)
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            return 0 if report.get("healthy") is True else 2
         if arguments.command == "rebuild":
             print(f"Indexed sources: {rebuild_catalog(paths)}")
             return 0

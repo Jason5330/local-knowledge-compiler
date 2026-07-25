@@ -85,6 +85,58 @@ def test_writer_lock_rejects_symlink_without_touching_target(tmp_path):
     assert outside.read_text(encoding="utf-8") == "keep"
 
 
+def test_writer_lock_rejects_hardlinked_record_without_modifying_alias(tmp_path):
+    from local_kb.queue import WriterLock
+
+    lock_path = tmp_path / "runtime" / "write.lock"
+    with WriterLock(lock_path):
+        pass
+    alias = tmp_path / "lock-alias"
+    os.link(lock_path, alias)
+    before = alias.read_bytes()
+    with pytest.raises(ValueError, match="single-link"):
+        with WriterLock(lock_path, timeout=0):
+            pass
+    assert alias.read_bytes() == before
+
+
+def test_failed_nested_direct_lock_does_not_clear_outer_shared_registration(tmp_path):
+    from local_kb.queue import WriterLock, shared_writer_lock
+
+    lock_path = tmp_path / "runtime" / "write.lock"
+    with WriterLock(lock_path):
+        with pytest.raises(TimeoutError):
+            with WriterLock(lock_path, timeout=0):
+                pass
+        with shared_writer_lock(lock_path, timeout=0):
+            pass
+
+
+@pytest.mark.skipif(os.name == "nt" or not hasattr(os, "fork"), reason="POSIX fork only")
+def test_forked_child_does_not_reuse_parent_writer_registration(tmp_path):
+    from local_kb.queue import WriterLock, shared_writer_lock
+
+    lock_path = tmp_path / "runtime" / "write.lock"
+    read_fd, write_fd = os.pipe()
+    with WriterLock(lock_path):
+        pid = os.fork()
+        if pid == 0:
+            os.close(read_fd)
+            try:
+                with shared_writer_lock(lock_path, timeout=0):
+                    result = b"entered"
+            except TimeoutError:
+                result = b"blocked"
+            os.write(write_fd, result)
+            os.close(write_fd)
+            os._exit(0)
+        os.close(write_fd)
+        result = os.read(read_fd, 32)
+        os.close(read_fd)
+        os.waitpid(pid, 0)
+    assert result == b"blocked"
+
+
 def test_rebuild_restores_search_from_cache_without_deleting_good_db_on_failure(tmp_path):
     from local_kb.catalog import Catalog
     from local_kb.health import rebuild_catalog
@@ -131,6 +183,41 @@ def test_rebuild_rejects_untrusted_cache_and_raw_metadata(tmp_path):
         pytest.skip("file symlinks unavailable")
     assert rebuild_catalog(vault) == 1
     assert outside.read_text(encoding="utf-8") == "{}"
+
+
+def test_rebuild_rejects_symlinked_index_without_touching_outside(tmp_path):
+    import shutil
+
+    from local_kb.health import rebuild_catalog
+
+    vault = _vault(tmp_path)
+    _seed_cache(vault)
+    outside = tmp_path / "outside-index"
+    outside.mkdir()
+    marker = outside / "keep"
+    marker.write_text("keep", encoding="utf-8")
+    shutil.rmtree(vault.index)
+    try:
+        vault.index.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+    with pytest.raises(ValueError):
+        rebuild_catalog(vault)
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_rebuild_cleans_safe_stale_sidecars_and_is_immediately_healthy(tmp_path):
+    from local_kb.health import lint, rebuild_catalog
+
+    vault = _vault(tmp_path)
+    _seed_cache(vault)
+    database = vault.index / "catalog.sqlite3"
+    Path(f"{database}-wal").touch()
+    Path(f"{database}-shm").touch()
+    assert rebuild_catalog(vault) == 1
+    assert not Path(f"{database}-wal").exists()
+    assert not Path(f"{database}-shm").exists()
+    assert lint(vault)["healthy"] is True
 
 
 def test_change_transaction_uses_outer_writer_lock_without_nested_deadlock(tmp_path):
@@ -452,6 +539,25 @@ def test_lint_fails_closed_without_touching_live_wal(tmp_path):
     assert after == before
 
 
+def test_lint_reports_extractor_failure_instead_of_crashing(tmp_path, monkeypatch):
+    from local_kb.extractors.base import ExtractionError
+    from local_kb.health import lint
+    import local_kb.health as health
+
+    vault = _vault(tmp_path)
+    source = _seed_cache(vault)
+
+    def fail(_path):
+        raise ExtractionError("parser failed")
+
+    monkeypatch.setattr(health.extractor_registry, "extract", fail)
+    report = lint(vault)
+    assert report["healthy"] is False
+    assert report["issues"]["raw_extraction_errors"] == [
+        {"version_id": source.version_id, "error": "ExtractionError"}
+    ]
+
+
 def test_rebuild_respects_the_single_writer_lock(tmp_path):
     from local_kb.health import rebuild_catalog
     from local_kb.queue import WriterLock
@@ -536,3 +642,37 @@ def test_lint_and_rebuild_cli_print_json_and_count(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["healthy"] is True
     assert main(["rebuild", "--vault", str(vault.root)]) == 0
     assert capsys.readouterr().out.strip() == "Indexed sources: 1"
+
+
+def test_lint_cli_returns_nonzero_with_complete_json_for_unhealthy_and_corrupt(
+    tmp_path, capsys
+):
+    from local_kb.cli import main
+
+    vault = _vault(tmp_path)
+    _seed_cache(vault)
+    (vault.wiki / "work" / "bad.md").write_text("not frontmatter", encoding="utf-8")
+    assert main(["lint", "--vault", str(vault.root)]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["healthy"] is False
+    assert report["missing_source_pages"] == ["20_wiki/work/bad.md"]
+
+    (vault.wiki / "work" / "bad.md").unlink()
+    (vault.index / "catalog.sqlite3").write_bytes(b"corrupt")
+    assert main(["lint", "--vault", str(vault.root)]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["healthy"] is False
+    assert "catalog_unavailable_or_invalid" in report["issues"]["index_raw_mismatches"]
+
+
+def test_lint_cli_returns_nonzero_for_truncated_report(tmp_path, capsys, monkeypatch):
+    from local_kb.cli import main
+    import local_kb.health as health
+
+    vault = _vault(tmp_path)
+    _seed_cache(vault)
+    monkeypatch.setattr(health, "MAX_QUEUE_ENTRIES", 0)
+    assert main(["lint", "--vault", str(vault.root)]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["truncated"] is True
+    assert report["healthy"] is False
