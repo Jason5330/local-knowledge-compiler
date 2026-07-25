@@ -102,7 +102,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             source = service.process(job.job_id, space=arguments.space)
             print(f"{source.version_id} {source.status}")
             return 0
-        tracker = StableTracker(config.stable_seconds)
+        tracker = StableTracker(config.stable_seconds, trusted_root=paths.inbox)
         submitted: set[Path] = set()
         while True:
             for source in watch_once(paths, tracker, submitted, space=arguments.space):
@@ -124,11 +124,15 @@ def watch_once(
 ) -> list:
     """Run one poll iteration; kept separate so CLI polling is testable."""
     paths = vault if isinstance(vault, VaultPaths) else VaultPaths(Path(vault).resolve())
+    if tracker.trusted_root is None:
+        tracker.bind_trusted_root(paths.inbox)
+    elif tracker.trusted_root != Path(os.path.abspath(os.fspath(paths.inbox))):
+        raise ValueError("watch tracker is bound to a different inbox")
     config = Config.load(paths.config)
     queue = DiskQueue(paths.queue, config.max_retries)
     service = IngestService(paths, queue, Catalog(paths.index / "catalog.sqlite3"))
     results = []
-    for candidate in sorted(paths.inbox.iterdir()):
+    for candidate in sorted(tracker.iter_trusted_children()):
         if candidate in submitted or not tracker.observe(candidate):
             continue
         job = queue.enqueue(candidate)

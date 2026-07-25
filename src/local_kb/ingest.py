@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import errno
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 from typing import Any
 from uuid import uuid4
 
@@ -28,9 +30,9 @@ class IngestService:
 
     def process(self, job_id: str, *, space: str = "unclassified") -> SourceVersion:
         """Process one job; persist each recoverable boundary before advancing."""
-        self.catalog.initialize()
         job = self.queue.get(job_id)
         try:
+            self.catalog.initialize()
             source = self._source_for(job)
             if source is None:
                 source = self._archive(job, space)
@@ -49,14 +51,32 @@ class IngestService:
             raise
 
     def _source_for(self, job: Job) -> SourceVersion | None:
-        data = job.metadata.get("source")
-        if not isinstance(data, dict):
+        if "source" not in job.metadata:
             return None
+        data = job.metadata["source"]
+        if not isinstance(data, dict):
+            raise ValueError("resume metadata source is invalid")
         try:
             source = SourceVersion(**data)
-        except TypeError:
-            return None
-        return source if (self.vault.root / source.relative_path).is_file() else None
+        except (TypeError, ValueError) as error:
+            raise ValueError("resume metadata source is invalid") from error
+        expected = (
+            f"10_raw/{source.space}/{source.source_id}/{source.version_id}/"
+            f"{source.original_name}"
+        )
+        if source.relative_path != expected:
+            raise ValueError("resume metadata has a non-canonical raw path")
+        payload = self.vault.root / source.relative_path
+        try:
+            self._safe_regular_under(self.vault.raw, payload)
+            manifest = payload.parent / "manifest.json"
+            self._safe_regular_under(self.vault.raw, manifest)
+            stored = self.store._read_manifest(manifest)
+        except (OSError, ValueError) as error:
+            raise ValueError("resume metadata cannot be verified") from error
+        if replace(source, status="archived") != stored:
+            raise ValueError("resume metadata disagrees with raw manifest")
+        return stored
 
     def _archive(self, job: Job, space: str) -> SourceVersion:
         incoming = Path(job.source_path)
@@ -78,7 +98,19 @@ class IngestService:
 
     @staticmethod
     def _valid_extraction(value: dict[str, Any]) -> bool:
-        return value.get("status") in {"extracted", "pending_extractor"} and isinstance(value.get("fragments"), list) and all(isinstance(item, dict) and isinstance(item.get("locator"), str) and isinstance(item.get("text"), str) for item in value["fragments"])
+        if value.get("status") not in {"extracted", "pending_extractor"}:
+            return False
+        fragments = value.get("fragments")
+        if not isinstance(fragments, list):
+            return False
+        if value["status"] == "pending_extractor" and fragments:
+            raise ValueError("pending_extractor must not contain fragments")
+        return all(
+            isinstance(item, dict)
+            and isinstance(item.get("locator"), str)
+            and isinstance(item.get("text"), str)
+            for item in fragments
+        )
 
     def _mark(self, job_id: str, state: str, **metadata: object) -> None:
         def apply(job: Job) -> None:
@@ -115,13 +147,55 @@ class IngestService:
         target.parent.mkdir(parents=True, exist_ok=True)
         incoming = Path(job.source_path)
         if target.exists():
-            if incoming.exists() and file_sha256(target) != file_sha256(incoming):
+            self._safe_regular_under(self.vault.trash, target)
+            if file_sha256(target) != source.sha256:
                 raise FileExistsError("processed target contains different file")
-            return target
+            if not incoming.exists():
+                return target
+            recovered = target.parent / f"recovered-{uuid4().hex}-{name}"
+            self._move_no_clobber(incoming, recovered)
+            return recovered
         if not incoming.exists():
             raise FileNotFoundError(f"incoming file is missing: {incoming}")
-        shutil.move(str(incoming), str(target))
+        self._move_no_clobber(incoming, target)
         return target
+
+    def _move_no_clobber(self, incoming: Path, target: Path) -> None:
+        """Publish a processed copy without replacing an existing target."""
+        try:
+            os.link(incoming, target)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            temporary = target.parent / f".{target.name}.{uuid4().hex}.tmp"
+            try:
+                shutil.copyfile(incoming, temporary)
+                with temporary.open("rb") as stream:
+                    os.fsync(stream.fileno())
+                os.link(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        incoming.unlink()
+        self._sync_directory(target.parent)
+
+    @staticmethod
+    def _safe_regular_under(root: Path, candidate: Path) -> None:
+        root = Path(os.path.abspath(os.fspath(root)))
+        candidate = Path(os.path.abspath(os.fspath(candidate)))
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            raise ValueError("path escapes trusted root") from None
+        current = Path(candidate.anchor)
+        for component in candidate.parts[1:]:
+            current = current / component
+            info = os.lstat(current)
+            junction = getattr(current, "is_junction", None)
+            if stat.S_ISLNK(info.st_mode) or (callable(junction) and junction()):
+                raise ValueError("path contains a link or junction")
+        info = os.lstat(candidate)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("path is not a regular file")
 
     @staticmethod
     def _sync_directory(directory: Path) -> None:

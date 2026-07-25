@@ -2,6 +2,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -52,6 +53,19 @@ def test_disk_queue_rejects_traversal_and_corrupt_json(tmp_path):
     (tmp_path / "queue" / "bad.json").write_text("{not json", encoding="utf-8")
     with pytest.raises(ValueError, match="corrupt"):
         queue.get("bad")
+
+
+def test_disk_queue_rejects_unknown_state_and_bad_field_types(tmp_path):
+    from local_kb.queue import DiskQueue
+
+    queue = DiskQueue(tmp_path / "queue")
+    queue.enqueue("a.txt", job_id="job")
+    path = tmp_path / "queue" / "job.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["state"] = "invented"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="corrupt"):
+        queue.get("job")
 
 
 def test_disk_queue_atomic_update_leaves_complete_json_after_replace_failure(tmp_path, monkeypatch):
@@ -123,6 +137,60 @@ def test_stable_tracker_zero_still_needs_two_observations_and_ignores_unsafe_pat
     assert tracker.observe(source) is False
 
 
+def test_stable_tracker_trusted_root_accepts_only_direct_safe_children(tmp_path):
+    from local_kb.watcher import StableTracker
+
+    inbox = tmp_path / "00_inbox"
+    inbox.mkdir()
+    direct = inbox / "direct.txt"
+    direct.write_text("safe", encoding="utf-8")
+    nested = inbox / "nested"
+    nested.mkdir()
+    child = nested / "not-direct.txt"
+    child.write_text("no", encoding="utf-8")
+    tracker = StableTracker(0, trusted_root=inbox)
+
+    assert tracker.observe(direct) is False
+    assert tracker.observe(direct) is True
+    assert tracker.observe(child) is False
+
+
+def test_stable_tracker_rejects_symlinked_trusted_root_and_parent(tmp_path):
+    from local_kb.watcher import StableTracker
+
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "note.txt").write_text("safe", encoding="utf-8")
+    (real / "inbox").mkdir()
+    linked = tmp_path / "linked"
+    try:
+        linked.symlink_to(real, target_is_directory=True)
+    except OSError:
+        pytest.skip("links unavailable")
+    tracker = StableTracker(0, trusted_root=linked)
+    assert tracker.observe(linked / "note.txt") is False
+
+
+def test_stable_tracker_rejects_windows_junction_root_and_parent(tmp_path):
+    from local_kb.watcher import StableTracker
+
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "note.txt").write_text("safe", encoding="utf-8")
+    junction = tmp_path / "junction"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(real)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        pytest.skip("junctions unavailable")
+    with pytest.raises(ValueError, match="safe"):
+        StableTracker(0, trusted_root=junction)
+    with pytest.raises(ValueError, match="safe"):
+        StableTracker(0, trusted_root=junction / "inbox")
+
+
 def test_ingest_text_archives_indexes_caches_and_moves_inbox_file(tmp_path):
     vault, queue, catalog, service = make_service(tmp_path)
     incoming = vault.inbox / "note.txt"
@@ -153,6 +221,23 @@ def test_ingest_pending_format_never_invents_fragments(tmp_path):
     assert source.status == "pending_extractor"
     assert json.loads((vault.index / "cache" / f"{source.version_id}.json").read_text())["fragments"] == []
     assert catalog.search("not", {"unclassified"}) == []
+
+
+def test_ingest_rejects_pending_extractor_with_invented_fragments(tmp_path):
+    from local_kb.extractors.base import Extraction, Fragment
+
+    class BadRegistry:
+        def extract(self, _path):
+            return Extraction("pending_extractor", [Fragment("invented", "no")])
+
+    vault, queue, _catalog, service = make_service(tmp_path, registry=BadRegistry())
+    incoming = vault.inbox / "bad.mp4"
+    incoming.write_bytes(b"x")
+    job = queue.enqueue(incoming, job_id="bad-pending")
+
+    with pytest.raises(ValueError, match="pending_extractor"):
+        service.process(job.job_id)
+    assert queue.get(job.job_id).state == "retrying"
 
 
 def test_changed_same_name_keeps_previous_raw_version_and_retry_is_idempotent(tmp_path):
@@ -187,6 +272,78 @@ def test_ingest_does_not_overwrite_a_different_processed_file(tmp_path):
     assert queue.get(job.job_id).state == "retrying"
 
 
+def test_processed_same_bytes_is_recovered_without_leaving_incoming_for_watch(tmp_path):
+    vault, queue, _catalog, service = make_service(tmp_path)
+    incoming = vault.inbox / "same.txt"
+    incoming.write_text("same", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="same")
+    target = vault.trash / "processed-inbox" / "same" / "same.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("same", encoding="utf-8")
+
+    service.process(job.job_id)
+    completed = queue.get(job.job_id)
+    actual = vault.root / completed.metadata["processed_path"]
+    assert not incoming.exists()
+    assert actual.is_file()
+    assert actual != target
+
+
+def test_ingest_rejects_untrusted_resume_metadata(tmp_path):
+    from dataclasses import asdict
+    from local_kb.models import SourceVersion
+
+    vault, queue, _catalog, service = make_service(tmp_path)
+    incoming = vault.inbox / "resume.txt"
+    incoming.write_text("safe", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="resume")
+    forged = SourceVersion(
+        source_id="src_aaaaaaaaaaaaaaaa",
+        version_id="ver_" + "a" * 64,
+        space="work",
+        original_name="resume.txt",
+        relative_path="10_raw/work/src_aaaaaaaaaaaaaaaa/ver_" + "a" * 64 + "/resume.txt",
+        sha256="a" * 64,
+        media_type="text/plain",
+        status="archived",
+    )
+    queue.update(job.job_id, lambda current: current.metadata.update(source=asdict(forged)))
+
+    with pytest.raises(ValueError, match="resume"):
+        service.process(job.job_id)
+    assert queue.get(job.job_id).state == "retrying"
+
+
+@pytest.mark.parametrize("damage", ["manifest", "payload"])
+def test_ingest_resume_revalidates_manifest_and_raw_hash(tmp_path, damage):
+    vault, queue, _catalog, service = make_service(tmp_path)
+    incoming = vault.inbox / "verify.txt"
+    incoming.write_text("original", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id=f"verify-{damage}")
+    source = service.process(job.job_id)
+    raw = vault.root / source.relative_path
+    if damage == "manifest":
+        (raw.parent / "manifest.json").write_text("{bad", encoding="utf-8")
+    else:
+        raw.write_text("modified", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="resume"):
+        service.process(job.job_id)
+    assert queue.get(job.job_id).state == "retrying"
+
+
+def test_catalog_initialization_failure_is_recorded_on_existing_job(tmp_path, monkeypatch):
+    vault, queue, catalog, service = make_service(tmp_path)
+    incoming = vault.inbox / "init.txt"
+    incoming.write_text("x", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="init")
+    monkeypatch.setattr(catalog, "initialize", lambda: (_ for _ in ()).throw(OSError("init")))
+
+    with pytest.raises(OSError, match="init"):
+        service.process(job.job_id)
+    assert queue.get(job.job_id).state == "retrying"
+
+
 @pytest.mark.parametrize("stage", ["extract", "catalog", "cache", "move"])
 def test_ingest_retry_recovers_after_each_recoverable_stage_failure(tmp_path, monkeypatch, stage):
     vault, queue, catalog, service = make_service(tmp_path)
@@ -198,7 +355,7 @@ def test_ingest_retry_recovers_after_each_recoverable_stage_failure(tmp_path, mo
     original_cache = service._write_cache
     import local_kb.ingest as ingest_module
 
-    original_move = ingest_module.shutil.move
+    original_move = ingest_module.os.link
     failed = [False]
 
     def once_then(call):
@@ -216,7 +373,7 @@ def test_ingest_retry_recovers_after_each_recoverable_stage_failure(tmp_path, mo
     elif stage == "cache":
         monkeypatch.setattr(service, "_write_cache", once_then(original_cache))
     else:
-        monkeypatch.setattr(ingest_module.shutil, "move", once_then(original_move))
+        monkeypatch.setattr(ingest_module.os, "link", once_then(original_move))
 
     with pytest.raises(OSError, match=stage):
         service.process(job.job_id)

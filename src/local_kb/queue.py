@@ -8,13 +8,14 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import Callable, Iterator
+from typing import Callable, Iterator, get_args
 from uuid import uuid4
 
-from .models import Job
+from .models import Job, JobState
 
 
 _JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+_JOB_STATES = frozenset(get_args(JobState))
 
 
 class DiskQueue:
@@ -98,22 +99,11 @@ class DiskQueue:
             job = Job(**data)
         except (TypeError, ValueError) as error:
             raise ValueError(f"corrupt job JSON: {path.name}") from error
-        if (
-            not isinstance(job.source_path, str)
-            or not isinstance(job.state, str)
-            or isinstance(job.attempts, bool)
-            or not isinstance(job.attempts, int)
-            or job.attempts < 0
-            or job.error is not None and not isinstance(job.error, str)
-            or not isinstance(job.metadata, dict)
-        ):
-            raise ValueError(f"corrupt job JSON: {path.name}")
-        self._validate_job_id(job.job_id)
-        if path.name != f"{job.job_id}.json":
-            raise ValueError(f"corrupt job JSON: {path.name}")
+        self._validate_job(job, path.name)
         return self._copy(job)
 
     def _write(self, path: Path, job: Job) -> None:
+        self._validate_job(job, path.name)
         payload = json.dumps(job.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         temporary = self.root / f".{path.name}.{uuid4().hex}.tmp"
         try:
@@ -176,3 +166,24 @@ class DiskQueue:
     @staticmethod
     def _copy(job: Job) -> Job:
         return Job(**json.loads(json.dumps(job.to_dict())))
+
+    def _validate_job(self, job: Job, filename: str) -> None:
+        if (
+            not isinstance(job, Job)
+            or not isinstance(job.source_path, str)
+            or not isinstance(job.state, str)
+            or job.state not in _JOB_STATES
+            or isinstance(job.attempts, bool)
+            or not isinstance(job.attempts, int)
+            or job.attempts < 0
+            or job.error is not None and not isinstance(job.error, str)
+            or not isinstance(job.metadata, dict)
+        ):
+            raise ValueError(f"corrupt job JSON: {filename}")
+        self._validate_job_id(job.job_id)
+        if filename != f"{job.job_id}.json":
+            raise ValueError(f"corrupt job JSON: {filename}")
+        try:
+            json.dumps(job.to_dict(), allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"corrupt job JSON: {filename}") from error
