@@ -17,11 +17,19 @@ from .models import SourceVersion
 
 
 _CHUNK_SIZE = 1024 * 1024
-_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
-_SOURCE_ID_RE = re.compile(r"src_[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+_COMPONENT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,127}\Z")
+_SOURCE_ID_RE = re.compile(r"src_[a-z0-9][a-z0-9_-]{0,127}\Z")
 _VERSION_ID_RE = re.compile(r"ver_[0-9a-f]{64}\Z")
 _MANIFEST_NAME = "manifest.json"
 _LOCK_NAME = ".archive.lock"
+_RESERVED_WINDOWS_NAMES = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
 
 
 def file_sha256(path: Path) -> str:
@@ -33,12 +41,23 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _is_junction(path: Path) -> bool:
+    """Return whether *path* is a Windows junction on supported Python versions."""
+    checker = getattr(path, "is_junction", None)
+    try:
+        return bool(checker()) if callable(checker) else False
+    except OSError:
+        return True
+
+
 class SourceStore:
     """Archive source files into a content-addressed, immutable raw-file tree."""
 
     def __init__(self, raw_root: Path | str) -> None:
         candidate = Path(raw_root)
-        if candidate.exists() and (candidate.is_symlink() or not candidate.is_dir()):
+        if candidate.exists() and (
+            candidate.is_symlink() or _is_junction(candidate) or not candidate.is_dir()
+        ):
             raise ValueError("raw_root must be a directory and not a symlink")
         candidate.mkdir(parents=True, exist_ok=True)
         self.raw_root = candidate.resolve()
@@ -71,7 +90,7 @@ class SourceStore:
             if duplicate is not None:
                 return duplicate
 
-            actual_source_id = source_id or f"src_{uuid4().hex}"
+            actual_source_id = source_id or f"src_{source_digest[:16]}"
             if previous_version_id is not None:
                 self._validate_predecessor(space, actual_source_id, previous_version_id)
 
@@ -96,10 +115,12 @@ class SourceStore:
         parent = self._safe_directory(self.raw_root / source.space)
         parent = self._safe_directory(parent / source.source_id)
         target = parent / source.version_id
+        self._ensure_contained(target)
         if os.path.lexists(target):
             raise FileExistsError("immutable target already exists")
 
         stage = parent / f".{source.version_id}.tmp-{uuid4().hex}"
+        self._ensure_contained(stage)
         stage.mkdir()
         try:
             copied = stage / source.original_name
@@ -124,6 +145,7 @@ class SourceStore:
     def _archive_lock(self) -> Iterator[None]:
         """Serialize scanners and publishers without a mutable dedupe index."""
         lock = self.raw_root / _LOCK_NAME
+        self._ensure_contained(lock)
         deadline = time.monotonic() + 30
         while True:
             try:
@@ -135,7 +157,7 @@ class SourceStore:
                         raise
                     time.sleep(0.01)
                     continue
-                if lock.is_symlink():
+                if lock.is_symlink() or _is_junction(lock):
                     raise ValueError("archive lock is unsafe")
                 if not lock.is_dir():
                     if not os.path.lexists(lock):
@@ -153,23 +175,36 @@ class SourceStore:
         for space_dir in self.raw_root.iterdir():
             if space_dir.name == _LOCK_NAME:
                 continue
-            if space_dir.is_symlink() or not space_dir.is_dir():
+            if (
+                space_dir.is_symlink()
+                or _is_junction(space_dir)
+                or not space_dir.is_dir()
+            ):
                 raise ValueError("raw store contains an unsafe entry")
+            self._ensure_contained(space_dir)
             self._validate_component(space_dir.name, "space")
             for source_dir in space_dir.iterdir():
-                if source_dir.is_symlink() or not source_dir.is_dir():
+                if (
+                    source_dir.is_symlink()
+                    or _is_junction(source_dir)
+                    or not source_dir.is_dir()
+                ):
                     raise ValueError("raw store contains an unsafe source entry")
+                self._ensure_contained(source_dir)
                 self._validate_source_id(source_dir.name)
                 for version_dir in source_dir.iterdir():
                     if version_dir.name.startswith("."):
                         continue
-                    if version_dir.is_symlink() or not version_dir.is_dir():
+                    if (
+                        version_dir.is_symlink()
+                        or _is_junction(version_dir)
+                        or not version_dir.is_dir()
+                    ):
                         raise ValueError("raw store contains an unsafe version entry")
+                    self._ensure_contained(version_dir)
                     self._validate_version_id(version_dir.name)
                     manifest = version_dir / _MANIFEST_NAME
                     if not manifest.exists() or manifest.is_symlink():
-                        if version_dir.name == f"ver_{digest}":
-                            continue
                         raise ValueError("source manifest is missing")
                     stored = self._read_manifest(manifest)
                     if stored.sha256 == digest:
@@ -180,6 +215,7 @@ class SourceStore:
         self, space: str, source_id: str, version_id: str
     ) -> None:
         manifest = self.raw_root / space / source_id / version_id / _MANIFEST_NAME
+        self._ensure_contained(manifest)
         if not manifest.exists() or manifest.is_symlink():
             raise ValueError("previous_version_id does not exist")
         predecessor = self._read_manifest(manifest)
@@ -192,8 +228,13 @@ class SourceStore:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("source manifest is corrupt") from error
         expected_keys = set(SourceVersion.__dataclass_fields__)
-        if not isinstance(data, dict) or set(data) != expected_keys:
+        legacy_optional = {"created_sequence"}
+        if not isinstance(data, dict) or not set(data) <= expected_keys:
             raise ValueError("source manifest is corrupt")
+        missing = expected_keys - set(data)
+        if missing - legacy_optional:
+            raise ValueError("source manifest is corrupt")
+        data.setdefault("created_sequence", None)
         try:
             source = SourceVersion(**data)
             self._validate_manifest(source, path.parent)
@@ -233,7 +274,13 @@ class SourceStore:
         ):
             raise ValueError("source manifest location is invalid")
         content = version_dir / source.original_name
-        if not content.exists() or content.is_symlink() or not content.is_file():
+        self._ensure_contained(content)
+        if (
+            not content.exists()
+            or content.is_symlink()
+            or _is_junction(content)
+            or not content.is_file()
+        ):
             raise ValueError("source manifest content is missing")
         if file_sha256(content) != source.sha256:
             raise ValueError("source manifest content checksum does not match")
@@ -277,7 +324,11 @@ class SourceStore:
 
     @staticmethod
     def _validate_component(value: str, label: str) -> None:
-        if not isinstance(value, str) or not _COMPONENT_RE.fullmatch(value):
+        if (
+            not isinstance(value, str)
+            or not _COMPONENT_RE.fullmatch(value)
+            or SourceStore._is_windows_reserved(value)
+        ):
             raise ValueError(f"invalid {label}")
 
     @staticmethod
@@ -300,14 +351,29 @@ class SourceStore:
             or "/" in value
             or "\\" in value
             or any(ord(character) < 32 for character in value)
+            or SourceStore._is_windows_reserved(value)
         ):
             raise ValueError("invalid original filename")
 
-    @staticmethod
-    def _safe_directory(path: Path) -> Path:
+    def _safe_directory(self, path: Path) -> Path:
+        self._ensure_contained(path)
         if os.path.lexists(path):
-            if path.is_symlink() or not path.is_dir():
+            if path.is_symlink() or _is_junction(path) or not path.is_dir():
                 raise ValueError("raw store path is unsafe")
         else:
             path.mkdir()
+        self._ensure_contained(path)
         return path
+
+    def _ensure_contained(self, path: Path) -> None:
+        if path.is_symlink() or _is_junction(path):
+            raise ValueError("raw store path is unsafe")
+        try:
+            path.resolve(strict=False).relative_to(self.raw_root)
+        except (OSError, ValueError) as error:
+            raise ValueError("raw store path escapes raw_root") from error
+
+    @staticmethod
+    def _is_windows_reserved(value: str) -> bool:
+        stem = value.rstrip(". ").split(".", 1)[0].lower()
+        return stem in _RESERVED_WINDOWS_NAMES

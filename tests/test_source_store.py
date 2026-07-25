@@ -1,5 +1,7 @@
 import hashlib
 import json
+import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -27,7 +29,7 @@ def test_archive_stores_an_immutable_source_version(tmp_path: Path) -> None:
 
     archived = SourceStore(raw_root).archive(incoming, "work")
 
-    assert archived.source_id.startswith("src_")
+    assert archived.source_id == f"src_{archived.sha256[:16]}"
     assert archived.version_id.startswith("ver_")
     assert archived.relative_path == (
         f"10_raw/work/{archived.source_id}/{archived.version_id}/report.md"
@@ -92,7 +94,19 @@ def test_archive_rejects_non_regular_input(tmp_path: Path, name: str) -> None:
 
 @pytest.mark.parametrize(
     ("space", "source_id"),
-    [("../outside", None), ("work/child", None), ("work", "src_../outside"), ("work", "source-id")],
+    [
+        ("../outside", None),
+        ("work/child", None),
+        ("Work", None),
+        ("work.", None),
+        ("work ", None),
+        ("con", None),
+        ("con.txt", None),
+        ("work", "src_../outside"),
+        ("work", "source-id"),
+        ("work", "src_Upper"),
+        ("work", "src_work."),
+    ],
 )
 def test_archive_rejects_path_traversal_and_invalid_identifiers(
     tmp_path: Path, space: str, source_id: str | None
@@ -115,8 +129,10 @@ def test_archive_rejects_a_preexisting_immutable_target(tmp_path: Path) -> None:
     target.mkdir(parents=True)
     (target / "note.txt").write_bytes(b"untrusted")
 
-    with pytest.raises(FileExistsError, match="immutable target"):
+    with pytest.raises(ValueError, match="manifest"):
         SourceStore(raw_root).archive(incoming, "work", source_id="src_collision")
+
+    assert (target / "note.txt").read_bytes() == b"untrusted"
 
 
 def test_archive_rejects_corrupt_manifest_instead_of_silently_deduplicating(
@@ -153,7 +169,7 @@ def test_archive_fails_when_the_copied_checksum_does_not_match(
     with pytest.raises(ValueError, match="checksum"):
         source_store.SourceStore(tmp_path / "10_raw").archive(incoming, "work")
 
-    assert not list((tmp_path / "10_raw").rglob("*.tmp"))
+    assert not list((tmp_path / "10_raw").rglob(".ver_*.tmp-*"))
 
 
 def test_archive_is_safe_when_equal_content_arrives_concurrently(tmp_path: Path) -> None:
@@ -200,3 +216,86 @@ def test_manifest_round_trips_all_source_version_fields(tmp_path: Path) -> None:
         "previous_version_id": first.version_id,
         "created_sequence": None,
     }
+
+
+def test_legacy_manifest_without_created_sequence_round_trips_as_none(
+    tmp_path: Path,
+) -> None:
+    from local_kb.source_store import SourceStore
+
+    raw_root = tmp_path / "10_raw"
+    store = SourceStore(raw_root)
+    archived = store.archive(write_file(tmp_path / "legacy.txt", b"legacy"), "work")
+    manifest_path = raw_root / "work" / archived.source_id / archived.version_id / "manifest.json"
+    legacy = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del legacy["created_sequence"]
+    manifest_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    restored = store._read_manifest(manifest_path)
+
+    assert restored == archived
+    assert restored.created_sequence is None
+
+
+@pytest.mark.parametrize("change", ["unknown", "missing_required"])
+def test_manifest_rejects_unknown_or_missing_required_fields(
+    tmp_path: Path, change: str
+) -> None:
+    from local_kb.source_store import SourceStore
+
+    raw_root = tmp_path / "10_raw"
+    store = SourceStore(raw_root)
+    archived = store.archive(write_file(tmp_path / "manifest.txt", b"manifest"), "work")
+    manifest_path = raw_root / "work" / archived.source_id / archived.version_id / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if change == "unknown":
+        data["surprise"] = True
+    else:
+        del data["status"]
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manifest"):
+        store._read_manifest(manifest_path)
+
+
+def make_junction(link: Path, target: Path) -> None:
+    if os.name != "nt" or not hasattr(Path, "is_junction"):
+        pytest.skip("junctions are only available on supported Windows Python")
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"cannot create test junction: {result.stderr}")
+    assert link.is_junction()
+
+
+def test_archive_rejects_a_junction_below_raw_root_without_writing_outside(
+    tmp_path: Path,
+) -> None:
+    from local_kb.source_store import SourceStore
+
+    raw_root = tmp_path / "10_raw"
+    raw_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    make_junction(raw_root / "work", outside)
+
+    with pytest.raises(ValueError, match="unsafe|outside raw_root"):
+        SourceStore(raw_root).archive(write_file(tmp_path / "note.txt", b"safe"), "work")
+
+    assert list(outside.iterdir()) == []
+
+
+def test_source_store_rejects_a_raw_root_junction(tmp_path: Path) -> None:
+    from local_kb.source_store import SourceStore
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    raw_root = tmp_path / "10_raw"
+    make_junction(raw_root, outside)
+
+    with pytest.raises(ValueError, match="raw_root"):
+        SourceStore(raw_root)
