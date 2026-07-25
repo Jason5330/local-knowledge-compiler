@@ -201,7 +201,8 @@ class DiskQueue:
                     raise ValueError(f"corrupt job JSON: {path.name}")
                 if opened.st_size > budget:
                     raise _BatchBudgetExceeded
-                chunks=[]; remaining=MAX_JOB_BYTES+1
+                read_limit=min(MAX_JOB_BYTES,budget)+1
+                chunks=[]; remaining=read_limit
                 while remaining and (chunk:=os.read(fd,min(65536,remaining))):
                     chunks.append(chunk); remaining-=len(chunk)
                 encoded=b"".join(chunks)
@@ -209,6 +210,8 @@ class DiskQueue:
                 os.close(fd)
             if len(encoded) > MAX_JOB_BYTES:
                 raise ValueError(f"corrupt job JSON: {path.name}")
+            if len(encoded) > budget:
+                raise _BatchBudgetExceeded
             data = json.loads(encoded.decode("utf-8"))
         except FileNotFoundError:
             raise

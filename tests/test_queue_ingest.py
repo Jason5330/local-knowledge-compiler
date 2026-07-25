@@ -149,6 +149,28 @@ def test_disk_queue_batch_budget_uses_pinned_size_after_atomic_replacement(tmp_p
     assert truncated is True
 
 
+def test_disk_queue_batch_budget_stops_in_place_growth_during_read(tmp_path, monkeypatch):
+    import os
+    import local_kb.queue as queue_module
+    from local_kb.queue import DiskQueue
+
+    queue=DiskQueue(tmp_path/"queue"); queue.enqueue("a.txt",job_id="job")
+    target=queue.root/"job.json"; budget=target.stat().st_size+10
+    real_read=os.read; grown=False
+    def grow_then_read(fd,size):
+        nonlocal grown
+        if not grown:
+            grown=True
+            with target.open("ab") as stream: stream.write(b" "*100)
+        return real_read(fd,size)
+    monkeypatch.setattr(queue_module.os,"read",grow_then_read)
+
+    jobs,truncated=queue.iter_jobs_bounded(10,max_bytes=budget)
+
+    assert jobs == []
+    assert truncated is True
+
+
 def test_stable_tracker_requires_two_matching_observations_and_elapsed_time(tmp_path):
     from local_kb.watcher import StableTracker
 
