@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import threading
 import time
 from typing import Callable, Iterator, get_args
 from uuid import uuid4
@@ -28,6 +29,7 @@ MAX_QUEUE_BATCH_BYTES = 64 * 1024 * 1024
 DEFAULT_QUEUE_BATCH_BYTES = 16 * 1024 * 1024
 _WRITER_LOCK_FORMAT = "local-kb-writer-lock-v1"
 _MAX_WRITER_LOCK_BYTES = 4096
+_WRITER_LOCAL = threading.local()
 
 
 class _BatchBudgetExceeded(Exception):
@@ -105,6 +107,11 @@ class WriterLock:
                 offset += os.write(self.handle, encoded[offset:])
             os.fsync(self.handle)
             root._sync_directory()
+            held = getattr(_WRITER_LOCAL, "paths", None)
+            if held is None:
+                held = set()
+                _WRITER_LOCAL.paths = held
+            held.add(os.path.normcase(str(self.path)))
             return self
         except BaseException:
             self._release()
@@ -158,6 +165,8 @@ class WriterLock:
         return value
 
     def _release(self) -> None:
+        held = getattr(_WRITER_LOCAL, "paths", set())
+        held.discard(os.path.normcase(str(self.path)))
         descriptor, self.handle = self.handle, None
         if descriptor is not None:
             try:
@@ -175,6 +184,17 @@ class WriterLock:
         root, self._root = self._root, None
         if root is not None:
             root.close()
+
+
+@contextmanager
+def shared_writer_lock(path: Path | str, timeout: float = 30) -> Iterator[None]:
+    """Acquire the vault writer lock, reusing an outer lock in this thread."""
+    normalized = os.path.normcase(os.path.abspath(os.fspath(path)))
+    if normalized in getattr(_WRITER_LOCAL, "paths", set()):
+        yield
+        return
+    with WriterLock(normalized, timeout=timeout):
+        yield
 
 
 def _bounded_lock_json(value: object) -> bytes:

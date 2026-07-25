@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import closing
-from dataclasses import fields
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -13,6 +13,7 @@ import stat
 from uuid import uuid4
 
 from .catalog import Catalog
+from .extractors import registry as extractor_registry
 from .models import SourceVersion
 from .paths import VaultPaths
 from .queue import WriterLock
@@ -27,11 +28,8 @@ from .source_store import SourceStore
 
 
 MAX_CACHE_FILES = 100_000
-MAX_CACHE_BYTES = 16 * 1024 * 1024
-MAX_TOTAL_CACHE_BYTES = 256 * 1024 * 1024
 MAX_WIKI_BYTES = 4 * 1024 * 1024
 MAX_QUEUE_ENTRIES = 10_000
-_CACHE_NAME = re.compile(r"ver_[0-9a-f]{64}\.json\Z")
 
 
 def rebuild_catalog(vault: VaultPaths | Path | str) -> int:
@@ -43,8 +41,7 @@ def rebuild_catalog(vault: VaultPaths | Path | str) -> int:
 
 def _rebuild_catalog_unlocked(paths: VaultPaths) -> int:
     paths.index.mkdir(parents=True, exist_ok=True)
-    cache = paths.index / "cache"
-    records = _read_cache_records(paths, cache)
+    records = _read_raw_records(paths)
     ordered = _order_lineage(records)
     target = paths.index / "catalog.sqlite3"
     temporary = paths.index / f".catalog-rebuild-{uuid4().hex}.sqlite3"
@@ -78,34 +75,262 @@ def _rebuild_catalog_unlocked(paths: VaultPaths) -> int:
                 pass
 
 
+def _read_raw_records(
+    paths: VaultPaths,
+) -> list[tuple[SourceVersion, list[tuple[str, str]]]]:
+    """Re-extract the catalog exclusively from immutable, verified raw data."""
+    if not paths.raw.is_dir():
+        return []
+    store = SourceStore(paths.raw)
+    records: list[tuple[SourceVersion, list[tuple[str, str]]]] = []
+    entry_count = 0
+    for space_dir in sorted(paths.raw.iterdir(), key=lambda path: path.name.casefold()):
+        entry_count += 1
+        if entry_count > MAX_CACHE_FILES:
+            raise ValueError("raw store contains too many entries")
+        if space_dir.name.startswith("."):
+            continue
+        _require_plain_directory(paths.raw, space_dir)
+        for source_dir in sorted(space_dir.iterdir(), key=lambda path: path.name.casefold()):
+            entry_count += 1
+            if entry_count > MAX_CACHE_FILES:
+                raise ValueError("raw store contains too many entries")
+            _require_plain_directory(paths.raw, source_dir)
+            for version_dir in sorted(source_dir.iterdir(), key=lambda path: path.name.casefold()):
+                entry_count += 1
+                if entry_count > MAX_CACHE_FILES:
+                    raise ValueError("raw store contains too many entries")
+                if version_dir.name.startswith("."):
+                    continue
+                _require_plain_directory(paths.raw, version_dir)
+                manifest = version_dir / "manifest.json"
+                source = store._read_manifest(manifest)
+                content = version_dir / source.original_name
+                extraction = extractor_registry.extract(content)
+                indexed = replace(source, status=extraction.status)
+                records.append(
+                    (
+                        indexed,
+                        [(fragment.locator, fragment.text) for fragment in extraction.fragments],
+                    )
+                )
+    return records
+
+
+def _require_plain_directory(root: Path, candidate: Path) -> None:
+    _safe_existing_tree(root, candidate)
+    info = candidate.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or candidate.is_symlink()
+        or bool(getattr(info, "st_file_attributes", 0) & 0x400)
+    ):
+        raise ValueError("raw store contains an unsafe directory")
+
+
 def lint(vault: VaultPaths | Path | str) -> dict[str, object]:
     """Return a bounded, read-only health report."""
     paths = _paths(vault)
-    catalog_ids = _catalog_source_ids(paths.index / "catalog.sqlite3")
+    catalog_rows, catalog_error = _catalog_inventory(paths.index / "catalog.sqlite3")
+    catalog_ids = {row["source_id"] for row in catalog_rows.values()}
+    raw_rows, raw_error = _raw_inventory(paths)
     missing: list[str] = []
+    pages: list[dict[str, object]] = []
     wiki_pages = 0
     scan_state = {"truncated": False}
     if paths.wiki.exists():
         for page, parent_fd, name in _safe_walk_wiki(paths.wiki, scan_state):
             wiki_pages += 1
+            page_path = page.relative_to(paths.root).as_posix()
             try:
                 text = _read_text(page, parent_fd, name, MAX_WIKI_BYTES)
                 header = _frontmatter(text)
                 source_ids = _frontmatter_list(header, "source_ids")
+                page = {
+                    "path": page_path,
+                    "id": _frontmatter_value(header, "id"),
+                    "title": _frontmatter_value(header, "title"),
+                    "aliases": _frontmatter_list(header, "aliases"),
+                    "related": _markdown_list_section(text, "Related"),
+                    "status": _frontmatter_value(header, "status"),
+                    "source_ids": source_ids,
+                }
+                pages.append(page)
                 if not source_ids or any(source_id not in catalog_ids for source_id in source_ids):
-                    missing.append(page.relative_to(paths.root).as_posix())
+                    missing.append(str(page["path"]))
             except (OSError, UnicodeError, ValueError):
-                missing.append(page.relative_to(paths.root).as_posix())
+                missing.append(page_path)
     pending, queue_truncated = _count_pending(paths)
     missing.sort()
+    issues = _wiki_issues(pages)
+    index_raw: list[str] = []
+    for version_id in sorted(set(raw_rows) | set(catalog_rows)):
+        raw = raw_rows.get(version_id)
+        indexed = catalog_rows.get(version_id)
+        if raw is None:
+            index_raw.append(f"catalog_only:{version_id}")
+        elif indexed is None:
+            index_raw.append(f"raw_only:{version_id}")
+        elif any(str(raw[key]) != str(indexed[key]) for key in ("source_id", "space", "relative_path", "sha256")):
+            index_raw.append(f"metadata:{version_id}")
+    if catalog_error:
+        index_raw.append("catalog_unavailable_or_invalid")
+    if raw_error:
+        index_raw.append("raw_inventory_invalid")
+    issues["index_raw_mismatches"] = index_raw
+    issues["index_wiki_mismatches"] = sorted(set(missing))
+    all_issues = any(bool(value) for value in issues.values())
+    truncated = bool(scan_state["truncated"] or queue_truncated)
     return {
         "wiki_pages": wiki_pages,
         "missing_source_pages": missing,
         "pending_jobs": pending,
         "catalog_source_ids": sorted(catalog_ids),
-        "truncated": bool(scan_state["truncated"] or queue_truncated),
-        "healthy": not missing and not scan_state["truncated"] and not queue_truncated,
+        "issues": issues,
+        "truncated": truncated,
+        "healthy": not all_issues and not truncated,
     }
+
+
+def _frontmatter_value(header: str, key: str) -> str:
+    match = re.search(rf"(?m)^{re.escape(key)}:\s*(.+?)\s*$", header)
+    if match is None:
+        return ""
+    value = match.group(1)
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = value.strip()
+    return parsed if isinstance(parsed, str) else ""
+
+
+def _markdown_list_section(text: str, heading: str) -> list[str]:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    marker = f"## {heading}\n"
+    body = text.partition(marker)[2]
+    if not body:
+        return []
+    section = body.partition("\n## ")[0]
+    return [
+        line[2:].strip()
+        for line in section.splitlines()
+        if line.startswith("- ") and line[2:].strip() not in {"無", "none"}
+    ][:32]
+
+
+def _wiki_issues(pages: list[dict[str, object]]) -> dict[str, list[object]]:
+    ids: dict[str, list[str]] = {}
+    aliases: dict[str, list[str]] = {}
+    known: set[str] = set()
+    for page in pages:
+        path = str(page["path"])
+        page_id = str(page["id"])
+        title = str(page["title"])
+        if page_id:
+            ids.setdefault(page_id.casefold(), []).append(path)
+        for value in (page_id, title, path, Path(path).stem):
+            if value:
+                known.add(value.casefold())
+        for alias in page["aliases"]:
+            aliases.setdefault(str(alias).casefold(), []).append(path)
+            known.add(str(alias).casefold())
+    duplicate_ids = [
+        {"value": key, "pages": sorted(paths)}
+        for key, paths in sorted(ids.items()) if len(paths) > 1
+    ]
+    duplicate_aliases = [
+        {"value": key, "pages": sorted(paths)}
+        for key, paths in sorted(aliases.items()) if len(paths) > 1
+    ]
+    broken: list[dict[str, str]] = []
+    inbound: set[str] = set()
+    for page in pages:
+        for related in page["related"]:
+            key = str(related).casefold()
+            if key in known:
+                inbound.add(key)
+            else:
+                broken.append({"page": str(page["path"]), "target": str(related)})
+    orphan = []
+    for page in pages:
+        keys = {
+            str(page["id"]).casefold(), str(page["title"]).casefold(),
+            str(page["path"]).casefold(), Path(str(page["path"])).stem.casefold(),
+        }
+        valid_outgoing = any(str(item).casefold() in known for item in page["related"])
+        if not valid_outgoing and not keys.intersection(inbound):
+            orphan.append(str(page["path"]))
+    return {
+        "duplicate_page_ids": duplicate_ids,
+        "duplicate_aliases": duplicate_aliases,
+        "broken_related": sorted(broken, key=lambda item: (item["page"], item["target"])),
+        "orphan_pages": sorted(orphan),
+        "stale_pages": sorted(
+            str(page["path"]) for page in pages if page["status"] == "stale"
+        ),
+        "outdated_versions": sorted(
+            str(page["path"]) for page in pages if page["status"] == "stale"
+        ),
+    }
+
+
+def _catalog_inventory(path: Path) -> tuple[dict[str, dict[str, object]], bool]:
+    if not path.is_file():
+        return {}, True
+    try:
+        with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro&immutable=1", uri=True)) as connection:
+            rows = connection.execute(
+                "SELECT version_id, source_id, space, relative_path, sha256 FROM sources"
+            ).fetchall()
+        return {
+            row[0]: {
+                "source_id": row[1], "space": row[2],
+                "relative_path": row[3], "sha256": row[4],
+            }
+            for row in rows
+        }, False
+    except sqlite3.Error:
+        return {}, True
+
+
+def _raw_inventory(paths: VaultPaths) -> tuple[dict[str, dict[str, object]], bool]:
+    if not paths.raw.is_dir():
+        return {}, False
+    store = SourceStore(paths.raw)
+    result: dict[str, dict[str, object]] = {}
+    count = 0
+    scanned = 0
+    try:
+        for space_dir in sorted(paths.raw.iterdir()):
+            scanned += 1
+            if scanned > MAX_CACHE_FILES:
+                return result, True
+            if space_dir.name.startswith("."):
+                continue
+            _require_plain_directory(paths.raw, space_dir)
+            for source_dir in sorted(space_dir.iterdir()):
+                scanned += 1
+                if scanned > MAX_CACHE_FILES:
+                    return result, True
+                _require_plain_directory(paths.raw, source_dir)
+                for version_dir in sorted(source_dir.iterdir()):
+                    scanned += 1
+                    if scanned > MAX_CACHE_FILES:
+                        return result, True
+                    if version_dir.name.startswith("."):
+                        continue
+                    count += 1
+                    if count > MAX_CACHE_FILES:
+                        return result, True
+                    _require_plain_directory(paths.raw, version_dir)
+                    source = store._read_manifest(version_dir / "manifest.json")
+                    result[source.version_id] = {
+                        "source_id": source.source_id, "space": source.space,
+                        "relative_path": source.relative_path, "sha256": source.sha256,
+                    }
+    except (OSError, ValueError):
+        return result, True
+    return result, False
 
 
 def _paths(vault: VaultPaths | Path | str) -> VaultPaths:
@@ -115,98 +340,6 @@ def _paths(vault: VaultPaths | Path | str) -> VaultPaths:
     if not root.is_dir():
         raise ValueError("vault root is unavailable")
     return VaultPaths(root)
-
-
-def _read_cache_records(
-    paths: VaultPaths, cache: Path
-) -> list[tuple[SourceVersion, list[tuple[str, str]]]]:
-    if not cache.exists():
-        return []
-    _safe_existing_tree(paths.root, cache)
-    records: list[tuple[SourceVersion, list[tuple[str, str]]]] = []
-    total = 0
-    seen_versions: set[str] = set()
-    with _pinned_directory(paths.root, cache) as parent_fd:
-        target = parent_fd if parent_fd is not None else cache
-        with os.scandir(target) as entries:
-            names = sorted(entry.name for entry in entries)
-        if len(names) > MAX_CACHE_FILES:
-            raise ValueError("cache contains too many entries")
-        for name in names:
-            if not _CACHE_NAME.fullmatch(name):
-                if name.startswith(".") and name.endswith(".tmp"):
-                    continue
-                raise ValueError("cache contains an unexpected entry")
-            path = cache / name
-            try:
-                encoded = _read_bytes(path, parent_fd, name, MAX_CACHE_BYTES)
-                total += len(encoded)
-                if total > MAX_TOTAL_CACHE_BYTES:
-                    raise ValueError("cache exceeds total size limit")
-                payload = json.loads(encoded.decode("utf-8"))
-                source, fragments = _validate_cache_payload(paths, name, payload)
-            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
-                if isinstance(error, ValueError) and str(error).startswith("cache "):
-                    raise
-                raise ValueError(f"cache file is invalid: {name}") from error
-            if source.version_id in seen_versions:
-                raise ValueError("cache contains duplicate versions")
-            seen_versions.add(source.version_id)
-            records.append((source, fragments))
-    return records
-
-
-def _validate_cache_payload(
-    paths: VaultPaths, name: str, payload: object
-) -> tuple[SourceVersion, list[tuple[str, str]]]:
-    if not isinstance(payload, dict) or set(payload) != {"source", "fragments", "warning"}:
-        raise ValueError("cache payload has invalid fields")
-    source_data = payload["source"]
-    if not isinstance(source_data, dict) or set(source_data) != {
-        field.name for field in fields(SourceVersion)
-    }:
-        raise ValueError("cache source has invalid fields")
-    try:
-        source = SourceVersion(**source_data)
-    except TypeError as error:
-        raise ValueError("cache source is invalid") from error
-    if name != f"{source.version_id}.json":
-        raise ValueError("cache filename does not match version")
-    raw = paths.root / source.relative_path
-    try:
-        raw.relative_to(paths.raw)
-    except ValueError as error:
-        raise ValueError("cache source path leaves raw storage") from error
-    archived = SourceVersion(
-        source_id=source.source_id,
-        version_id=source.version_id,
-        space=source.space,
-        original_name=source.original_name,
-        relative_path=source.relative_path,
-        sha256=source.sha256,
-        media_type=source.media_type,
-        status="archived",
-        previous_version_id=source.previous_version_id,
-        created_sequence=source.created_sequence,
-    )
-    SourceStore(paths.raw)._validate_manifest(archived, raw.parent)
-    fragments_data = payload["fragments"]
-    if not isinstance(fragments_data, list) or len(fragments_data) > 100_000:
-        raise ValueError("cache fragments are invalid")
-    fragments: list[tuple[str, str]] = []
-    for item in fragments_data:
-        if (
-            not isinstance(item, dict)
-            or set(item) != {"locator", "text"}
-            or not isinstance(item["locator"], str)
-            or not isinstance(item["text"], str)
-            or not item["locator"]
-            or len(item["locator"]) > 1024
-            or len(item["text"]) > 1_000_000
-        ):
-            raise ValueError("cache fragment is invalid")
-        fragments.append((item["locator"], item["text"]))
-    return source, fragments
 
 
 def _order_lineage(
@@ -263,31 +396,19 @@ def _frontmatter(text: str) -> str:
     return normalized[4:end]
 
 
-def _catalog_source_ids(path: Path) -> set[str]:
-    if not path.is_file():
-        return set()
-    try:
-        with closing(
-            sqlite3.connect(
-                f"{path.resolve().as_uri()}?mode=ro&immutable=1", uri=True
-            )
-        ) as connection:
-            return {row[0] for row in connection.execute("SELECT DISTINCT source_id FROM sources")}
-    except sqlite3.Error:
-        return set()
-
-
 def _count_pending(paths: VaultPaths) -> tuple[int, bool]:
     if not paths.queue.exists():
         return 0, False
     _safe_existing_tree(paths.root, paths.queue)
     count = 0
+    scanned = 0
     truncated = False
     with _pinned_directory(paths.root, paths.queue) as parent_fd:
         target = parent_fd if parent_fd is not None else paths.queue
         with os.scandir(target) as entries:
             for entry in entries:
-                if count >= MAX_QUEUE_ENTRIES:
+                scanned += 1
+                if scanned > MAX_QUEUE_ENTRIES:
                     truncated = True
                     break
                 if entry.name.endswith(".json"):

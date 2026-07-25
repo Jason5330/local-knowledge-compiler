@@ -97,13 +97,18 @@ def test_rebuild_restores_search_from_cache_without_deleting_good_db_on_failure(
     assert count == 1
     assert Catalog(db).search("searchable", {"work"})[0].version_id == source.version_id
 
-    before = db.read_bytes()
-    (vault.index / "cache" / f"{source.version_id}.json").write_text(
-        "{broken", encoding="utf-8"
-    )
-    with pytest.raises(ValueError, match="cache"):
-        rebuild_catalog(vault)
-    assert db.read_bytes() == before
+    cache = vault.index / "cache" / f"{source.version_id}.json"
+    payload = json.loads(cache.read_text(encoding="utf-8"))
+    payload["fragments"] = [{"locator": "paragraph:1", "text": "forged cache text"}]
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+    rebuild_catalog(vault)
+    assert not Catalog(db).search("forged", {"work"})
+    assert Catalog(db).search("searchable", {"work"})
+
+    cache.unlink()
+    db.unlink()
+    assert rebuild_catalog(vault) == 1
+    assert Catalog(db).search("searchable", {"work"})
 
 
 def test_rebuild_rejects_untrusted_cache_and_raw_metadata(tmp_path):
@@ -115,8 +120,7 @@ def test_rebuild_rejects_untrusted_cache_and_raw_metadata(tmp_path):
     payload = json.loads(cache.read_text(encoding="utf-8"))
     payload["source"]["relative_path"] = "../outside"
     cache.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="cache"):
-        rebuild_catalog(vault)
+    assert rebuild_catalog(vault) == 1
 
     cache.unlink()
     outside = tmp_path / "outside.json"
@@ -125,9 +129,132 @@ def test_rebuild_rejects_untrusted_cache_and_raw_metadata(tmp_path):
         cache.symlink_to(outside)
     except OSError:
         pytest.skip("file symlinks unavailable")
-    with pytest.raises(ValueError, match="cache"):
-        rebuild_catalog(vault)
+    assert rebuild_catalog(vault) == 1
     assert outside.read_text(encoding="utf-8") == "{}"
+
+
+def test_change_transaction_uses_outer_writer_lock_without_nested_deadlock(tmp_path):
+    from local_kb.queue import WriterLock
+    from local_kb.transaction import ChangeTransaction
+
+    vault = _vault(tmp_path)
+    transaction = ChangeTransaction(vault.root, lock_timeout=0)
+    transaction.stage("20_wiki/work/locked.md", "safe\n")
+    with WriterLock(vault.runtime / "write.lock", timeout=0):
+        transaction.publish(lambda _paths: None)
+    assert (vault.wiki / "work" / "locked.md").read_text(encoding="utf-8") == "safe\n"
+
+
+def test_change_transaction_and_writer_lock_contend_on_the_same_kernel_lock(tmp_path):
+    import queue
+    import threading
+
+    from local_kb.queue import WriterLock
+    from local_kb.transaction import ChangeTransaction
+
+    vault = _vault(tmp_path)
+    result = queue.Queue()
+
+    def compete():
+        try:
+            with WriterLock(vault.runtime / "write.lock", timeout=0):
+                result.put("entered")
+        except Exception as error:
+            result.put(error)
+
+    with ChangeTransaction(vault.root, lock_timeout=0)._writer_lock():
+        thread = threading.Thread(target=compete)
+        thread.start()
+        thread.join(timeout=5)
+    outcome = result.get_nowait()
+    assert isinstance(outcome, TimeoutError)
+
+
+def test_watch_iteration_respects_writer_lock_before_mutating(tmp_path):
+    from local_kb.cli import watch_once
+    from local_kb.queue import WriterLock
+    from local_kb.watcher import StableTracker
+
+    vault = _vault(tmp_path)
+    incoming = vault.inbox / "blocked.txt"
+    incoming.write_text("blocked", encoding="utf-8")
+    tracker = StableTracker(0, trusted_root=vault.inbox)
+    with WriterLock(vault.runtime / "write.lock"):
+        with pytest.raises(TimeoutError):
+            watch_once(vault, tracker, set())
+    assert incoming.exists()
+    assert not list(vault.queue.glob("*.json"))
+
+
+def test_prepare_with_missing_catalog_does_not_create_database(tmp_path, capsys):
+    from local_kb.cli import main
+
+    vault = _vault(tmp_path)
+    database = vault.index / "catalog.sqlite3"
+    database.unlink(missing_ok=True)
+    output = vault.runtime / "packet.json"
+    assert main([
+        "prepare", "missing evidence", "--vault", str(vault.root),
+        "--space", "work", "--output", str(output),
+    ]) == 0
+    packet = json.loads(output.read_text(encoding="utf-8"))
+    assert packet["status"] == "insufficient_evidence"
+    assert packet["reason"] == "catalog_unavailable"
+    assert not database.exists()
+
+
+def test_prepare_opens_existing_catalog_read_only(tmp_path):
+    from local_kb.cli import main
+
+    vault = _vault(tmp_path)
+    _seed_cache(vault)
+    database = vault.index / "catalog.sqlite3"
+    before = (database.stat().st_mtime_ns, database.read_bytes())
+    assert main([
+        "prepare", "searchable", "--vault", str(vault.root),
+        "--space", "work", "--output", str(vault.runtime / "readonly.json"),
+    ]) == 0
+    assert (database.stat().st_mtime_ns, database.read_bytes()) == before
+    assert not Path(f"{database}-wal").exists()
+    assert not Path(f"{database}-shm").exists()
+
+
+def test_lint_reports_complete_wiki_relationship_and_index_issues(tmp_path):
+    from local_kb.health import lint
+
+    vault = _vault(tmp_path)
+    source = _seed_cache(vault)
+    template = (
+        "---\nid: \"{id}\"\ntitle: \"{title}\"\naliases:\n  - \"same\"\n"
+        "type: \"topic\"\nspace: \"work\"\nstatus: \"{status}\"\n"
+        "confidence: \"low\"\nupdated_at: \"2026-01-01T00:00:00Z\"\n"
+        "source_ids:\n  - \"{source_id}\"\n---\n\n## Current State\nClaim\n\n"
+        "## Evidence\n- {source_id}\n\n## Conflicts and Gaps\nnone\n\n"
+        "## Related\n- {related}\n\n## Timeline\nCreated\n"
+    )
+    (vault.wiki / "work" / "one.md").write_text(
+        template.format(id="duplicate", title="One", status="active",
+                        source_id=source.source_id, related="missing-page"),
+        encoding="utf-8",
+    )
+    (vault.wiki / "work" / "two.md").write_text(
+        template.format(id="duplicate", title="Two", status="stale",
+                        source_id=source.source_id, related="missing-page"),
+        encoding="utf-8",
+    )
+    report = lint(vault)
+    assert report["healthy"] is False
+    issues = report["issues"]
+    assert issues["duplicate_page_ids"]
+    assert issues["duplicate_aliases"]
+    assert issues["broken_related"]
+    assert issues["orphan_pages"]
+    assert issues["stale_pages"]
+
+    database = vault.index / "catalog.sqlite3"
+    database.unlink()
+    report = lint(vault)
+    assert report["issues"]["index_raw_mismatches"]
 
 
 def test_rebuild_respects_the_single_writer_lock(tmp_path):

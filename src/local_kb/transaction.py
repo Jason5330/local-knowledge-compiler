@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import errno
 import hashlib
 import json
 import os
@@ -13,21 +12,16 @@ import shutil
 import stat
 import subprocess
 import tempfile
-import threading
-import time
 import uuid
 from typing import Callable, Iterator
 
+from .queue import shared_writer_lock
 
 _MANAGED_ROOTS = ("20_wiki", "30_answers", "40_index/index.md", "90_logs")
 _RESERVED = frozenset({
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
     "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 })
-_LOCK_GUARD = threading.Lock()
-_THREAD_LOCKS: dict[str, threading.Lock] = {}
-
-
 class RollbackError(RuntimeError):
     """Rollback could not completely restore an externally visible transaction."""
     def __init__(self, original: BaseException, errors: list[BaseException]) -> None:
@@ -356,52 +350,8 @@ class ChangeTransaction:
         if runtime.exists() and (_is_reparse(runtime) or not runtime.is_dir()):
             raise ValueError(".kb must not be a symlink or reparse point")
         runtime.mkdir(exist_ok=True)
-        lock_path = runtime / "write.lock"
-        lock_key = str(lock_path.resolve(strict=False)).casefold()
-        with _LOCK_GUARD:
-            thread_lock = _THREAD_LOCKS.setdefault(lock_key, threading.Lock())
-        if not thread_lock.acquire(timeout=self.lock_timeout):
-            raise TimeoutError("writer lock timed out")
-        try:
-            created = False
-            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            try:
-                fd = os.open(lock_path, flags, 0o600)
-                created = True
-            except FileExistsError:
-                info = lock_path.lstat()
-                if _is_reparse(lock_path) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                    raise ValueError("write.lock must be a single-link regular file")
-                fd = os.open(lock_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
-            with os.fdopen(fd, "r+b", closefd=True) as handle:
-                if created:
-                    handle.write(b"0")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                deadline = time.monotonic() + self.lock_timeout
-                while True:
-                    try:
-                        if os.name == "nt":
-                            import msvcrt
-                            handle.seek(0)
-                            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                            unlock = lambda: msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                        else:
-                            import fcntl
-                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                            unlock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                        break
-                    except (OSError, BlockingIOError):
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError("writer lock timed out")
-                        time.sleep(0.05)
-                try:
-                    yield
-                finally:
-                    unlock()
-        finally:
-            thread_lock.release()
+        with shared_writer_lock(runtime / "write.lock", timeout=self.lock_timeout):
+            yield
 
     def _staged_paths(self) -> tuple[tuple[str, Path], ...]:
         return tuple(sorted(((path.relative_to(self.stage_root).as_posix(), path)

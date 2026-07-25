@@ -122,9 +122,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = Config.load(paths.config)
         if arguments.command == "prepare":
             catalog = Catalog(paths.index / "catalog.sqlite3")
-            catalog.initialize()
             spaces, selection = _select_prepare_spaces(catalog, arguments.question, arguments.space)
-            packet = QueryService(catalog, vault=paths, queue=DiskQueue(paths.queue, config.max_retries)).prepare(
+            queue = (
+                DiskQueue(paths.queue, config.max_retries)
+                if _queue_has_job(paths.queue)
+                else None
+            )
+            packet = QueryService(catalog, vault=paths, queue=queue).prepare(
                 arguments.question, spaces, space_selection=selection
             )
             print(write_packet(paths, packet, arguments.output))
@@ -164,6 +168,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 1
 
 
+def _queue_has_job(path: Path, *, max_entries: int = 10_000) -> bool:
+    if not path.is_dir():
+        return False
+    with os.scandir(path) as entries:
+        for index, entry in enumerate(entries):
+            if index >= max_entries:
+                return False
+            if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False):
+                return True
+    return False
+
+
 def _select_prepare_spaces(catalog: Catalog, question: str, explicit: list[str]) -> tuple[list[str], str]:
     if explicit:
         return explicit, "explicit"
@@ -197,6 +213,13 @@ def watch_once(
         tracker.bind_trusted_root(paths.inbox)
     elif tracker.trusted_root != Path(os.path.abspath(os.fspath(paths.inbox))):
         raise ValueError("watch tracker is bound to a different inbox")
+    with WriterLock(paths.runtime / "write.lock", timeout=0):
+        return _watch_once_locked(paths, tracker, submitted, space=space)
+
+
+def _watch_once_locked(
+    paths: VaultPaths, tracker: StableTracker, submitted: set[Path], *, space: str
+) -> list:
     config = Config.load(paths.config)
     queue = DiskQueue(paths.queue, config.max_retries)
     service = IngestService(paths, queue, Catalog(paths.index / "catalog.sqlite3"))

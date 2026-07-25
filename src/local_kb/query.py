@@ -395,9 +395,13 @@ class QueryService:
     def prepare(self, question: str, spaces: Collection[str], *, limit: int = MAX_RESULTS, space_selection: str = "explicit") -> dict[str, object]:
         checked_question = validate_question(question)
         checked_spaces = validate_spaces(spaces)
+        catalog_available = self.catalog.path.is_file()
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_RESULTS:
             raise ValueError(f"limit must be between 1 and {MAX_RESULTS}")
-        if not has_searchable_terms(checked_question):
+        if not catalog_available:
+            raw = []
+            reason = "catalog_unavailable"
+        elif not has_searchable_terms(checked_question):
             raw: list[EvidenceHit] = []
             reason = "question_has_no_searchable_terms"
         else:
@@ -410,7 +414,7 @@ class QueryService:
         wiki_scan_truncated = False
         # Generated wiki pages are useful secondary context only.  Raw extraction is
         # always listed first and is never relabelled as original evidence.
-        if self.vault is not None and has_searchable_terms(checked_question):
+        if self.vault is not None and catalog_available and has_searchable_terms(checked_question):
             derived, wiki_scan_truncated, warnings = _safe_read_wiki(self.catalog, self.vault, checked_question, checked_spaces)
             wiki_quota = min(5, limit - 1)
             selected_derived = derived[:wiki_quota] if limit >= 2 else []
@@ -420,8 +424,14 @@ class QueryService:
         else:
             warnings = []
             evidence = evidence[:limit]
-        reason = ("question_has_no_searchable_terms" if not has_searchable_terms(checked_question)
-                  else "no_matching_evidence") if not evidence else None
+        if evidence:
+            reason = None
+        elif not catalog_available:
+            reason = "catalog_unavailable"
+        elif not has_searchable_terms(checked_question):
+            reason = "question_has_no_searchable_terms"
+        else:
+            reason = "no_matching_evidence"
         pending_jobs = _pending_jobs(self.queue, checked_spaces, checked_question)
         packet: dict[str, object] = {
             "schema_version": SCHEMA_VERSION, "question": checked_question,
