@@ -290,6 +290,17 @@ def test_pending_jobs_report_total_shown_relation_and_truncation(seeded_catalog,
     pending = QueryService(seeded_catalog, queue=queue).prepare("Aurora", {"work"})["pending_jobs"]
     assert (pending["total"], pending["shown"], pending["truncated"]) == (41, 40, True)
     assert pending["jobs"][0]["relation"] == "matched_metadata"
+    assert (pending["related_total"], pending["unknown_total"]) == (41, 0)
+
+
+def test_pending_counts_separate_matched_and_unknown(seeded_catalog, tmp_path):
+    from local_kb.query import QueryService
+    from local_kb.queue import DiskQueue
+    queue=DiskQueue(tmp_path/"queue")
+    queue.enqueue(tmp_path/"aurora.txt",job_id="related").metadata
+    queue.enqueue(tmp_path/"plain.txt",job_id="unknown")
+    pending=QueryService(seeded_catalog,queue=queue).prepare("Aurora",{"work"})["pending_jobs"]
+    assert (pending["total"],pending["shown"],pending["related_total"],pending["related_shown"],pending["unknown_total"],pending["unknown_shown"]) == (2,2,1,1,1,1)
 
 
 def test_prepare_keeps_derived_wiki_when_raw_hits_fill_limit(tmp_path):

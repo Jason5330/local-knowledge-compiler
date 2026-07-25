@@ -371,7 +371,11 @@ def _pending_jobs(queue: DiskQueue | None, spaces: tuple[str, ...], question: st
         })
     jobs.sort(key=lambda item: str(item["job_id"]))
     shown = jobs[:MAX_PENDING_JOBS]
-    return {"scope": "selected_spaces_plus_unknown" if unknown_space else "selected_spaces", "jobs": shown, "total": len(jobs), "shown": len(shown), "truncated": len(jobs) > MAX_PENDING_JOBS}
+    related = [item for item in jobs if item["relation"] == "matched_metadata"]
+    unknown = [item for item in jobs if item["relation"] != "matched_metadata"]
+    return {"scope": "selected_spaces_plus_unknown" if unknown_space else "selected_spaces", "jobs": shown, "total": len(jobs), "shown": len(shown), "truncated": len(jobs) > MAX_PENDING_JOBS,
+            "related_total": len(related), "related_shown": sum(item["relation"] == "matched_metadata" for item in shown),
+            "unknown_total": len(unknown), "unknown_shown": sum(item["relation"] != "matched_metadata" for item in shown)}
 
 
 class QueryService:
