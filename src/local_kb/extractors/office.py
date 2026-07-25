@@ -131,7 +131,22 @@ def _extract_xlsx_snapshot(path: Path) -> Extraction:
                     f"({max_row} rows x {max_column} columns)"
                 )
         for sheet in book.worksheets:
+            sheet.reset_dimensions()
+        for sheet in book.worksheets:
+            observed_max_column = 0
             for row_number, row in enumerate(sheet.iter_rows(), 1):
+                row_width = len(row)
+                observed_max_column = max(observed_max_column, row_width)
+                if (
+                    row_number > limits.MAX_WORKSHEET_ROWS
+                    or row_width > limits.MAX_WORKSHEET_COLUMNS
+                    or row_number * observed_max_column > limits.MAX_WORKSHEET_CELLS
+                ):
+                    raise ExtractionError(
+                        f"worksheet dimensions exceed budget: {sheet.title} "
+                        f"({row_number} observed rows x "
+                        f"{observed_max_column} observed columns)"
+                    )
                 values = ["" if cell.value is None else str(cell.value) for cell in row]
                 if any(values):
                     locator = (

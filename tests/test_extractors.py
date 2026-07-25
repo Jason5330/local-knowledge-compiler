@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import zipfile
@@ -217,6 +218,9 @@ def test_xlsx_workbook_is_closed_after_extraction(tmp_path: Path, monkeypatch: p
         max_row = 1
         max_column = 1
 
+        def reset_dimensions(self) -> None:
+            pass
+
         def iter_rows(self):
             yield (Cell("A1", "value"),)
 
@@ -256,6 +260,9 @@ def test_xlsx_rejects_sparse_dimensions_before_iterating_and_closes_book(
             self.max_row = sheet.max_row
             self.max_column = sheet.max_column
 
+        def reset_dimensions(self) -> None:
+            raise AssertionError("declared dimension precheck must run before reset")
+
         def iter_rows(self):
             raise AssertionError("dimension budget must be checked before iter_rows")
 
@@ -281,6 +288,106 @@ def test_xlsx_rejects_sparse_dimensions_before_iterating_and_closes_book(
 
     assert len(loaded) == 1
     assert loaded[0].closed is True
+
+
+def test_xlsx_reset_dimensions_recovers_a_real_cell_hidden_by_low_dimension(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.xlsx"
+    path = tmp_path / "low-dimension.xlsx"
+    book = Workbook()
+    book.active["B2"] = "hidden-by-dimension"
+    book.save(source)
+    book.close()
+
+    with zipfile.ZipFile(source) as original, zipfile.ZipFile(
+        path, "w", compression=zipfile.ZIP_DEFLATED
+    ) as rewritten:
+        for member in original.infolist():
+            data = original.read(member)
+            if member.filename == "xl/worksheets/sheet1.xml":
+                data = re.sub(
+                    br'<dimension ref="[^"]+"',
+                    b'<dimension ref="A1:A1"',
+                    data,
+                    count=1,
+                )
+            rewritten.writestr(member, data)
+
+    result = registry.extract(path)
+
+    assert result.fragments == [
+        Fragment("sheet:Sheet;cells:A2-B2", "\thidden-by-dimension")
+    ]
+
+
+@pytest.mark.parametrize("actual_shape", ["far_row", "far_column", "cell_product"])
+def test_xlsx_low_dimension_rejects_actual_bounds_before_cell_stringification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, actual_shape: str
+) -> None:
+    from local_kb.extractors import office
+
+    path = tmp_path / "low-dimension.xlsx"
+    source_book = Workbook()
+    source_book.save(path)
+    source_book.close()
+    value_reads = 0
+    rows_yielded = 0
+
+    class ForbiddenCell:
+        @property
+        def value(self):
+            nonlocal value_reads
+            value_reads += 1
+            raise AssertionError("budget must be checked before reading cell values")
+
+    class Sheet:
+        title = "Low"
+        max_row = 1
+        max_column = 1
+        reset_called = False
+
+        def reset_dimensions(self) -> None:
+            self.reset_called = True
+
+        def iter_rows(self):
+            nonlocal rows_yielded
+            if actual_shape == "far_column":
+                rows_yielded += 1
+                yield tuple(ForbiddenCell() for _ in range(257))
+                return
+            if actual_shape == "cell_product":
+                for _ in range(3_999):
+                    rows_yielded += 1
+                    yield ()
+                rows_yielded += 1
+                yield tuple(ForbiddenCell() for _ in range(251))
+                return
+            for _ in range(100_000):
+                rows_yielded += 1
+                yield ()
+            rows_yielded += 1
+            yield (ForbiddenCell(),)
+
+    class Book:
+        def __init__(self) -> None:
+            self.worksheets = [Sheet()]
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    loaded = Book()
+    monkeypatch.setattr(office, "load_workbook", lambda *args, **kwargs: loaded)
+
+    with pytest.raises(base.ExtractionError, match="worksheet dimensions exceed budget"):
+        registry.extract(path)
+
+    assert loaded.worksheets[0].reset_called is True
+    assert value_reads == 0
+    expected_rows = {"far_column": 1, "cell_product": 4_000, "far_row": 100_001}
+    assert rows_yielded == expected_rows[actual_shape]
+    assert loaded.closed is True
 
 
 @pytest.mark.parametrize("suffix", [".pdf", ".docx", ".xlsx"])
