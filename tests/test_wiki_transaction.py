@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from local_kb.transaction import ChangeTransaction, RollbackError
+from local_kb.transaction import ChangeTransaction, RollbackError, recover_pending_transactions
 from local_kb.wiki import WikiPage, render_page, validate_page
 
 
@@ -121,6 +121,24 @@ def test_publish_calls_validator_before_any_live_change(vault: Path) -> None:
     with pytest.raises(ValueError, match="invalid"):
         tx.publish(lambda staged: (_ for _ in ()).throw(ValueError("invalid")))
     assert target.read_text(encoding="utf-8") == "old"
+
+
+def test_committed_cleanup_failure_is_success_and_next_recovery_cleans(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tx = ChangeTransaction(vault)
+    tx.stage("20_wiki/page.md", "new")
+    real_rmtree = __import__("local_kb.transaction", fromlist=["shutil"]).shutil.rmtree
+    calls = 0
+    def fail_twice(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise OSError("cleanup blocked")
+        real_rmtree(path, *args, **kwargs)
+    monkeypatch.setattr("local_kb.transaction.shutil.rmtree", fail_twice)
+    tx.publish(lambda _: None)
+    assert tx.cleanup_warning and (vault / "20_wiki/page.md").read_text(encoding="utf-8") == "new"
+    recover_pending_transactions(vault)
+    assert not list((vault / ".kb/staging").iterdir())
 
 
 def test_publish_rolls_back_existing_and_new_files_on_replace_failure(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:

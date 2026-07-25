@@ -96,7 +96,9 @@ def _recover_journal(vault: Path, journal: Path) -> None:
             raise ValueError("invalid journal entries")
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"corrupt transaction journal: {journal.name}") from exc
-    # Validate the complete manifest before touching any live namespace.
+    checker = ChangeTransaction(vault)
+    validated: list[tuple[dict[str, object], Path, Path, Path]] = []
+    # Validate the complete manifest and every filesystem object before touching live.
     for item in entries:
         if not isinstance(item, dict):
             raise RuntimeError("corrupt transaction journal entry")
@@ -105,24 +107,67 @@ def _recover_journal(vault: Path, journal: Path) -> None:
         backup_rel = str(item.get("backup", ""))
         new_rel = str(item.get("new", ""))
         if (str(pure) != relative or pure.is_absolute() or ".." in pure.parts
-                or not ChangeTransaction._managed(relative)
                 or not re.fullmatch(r"backups/[0-9]+\.bak", backup_rel)
                 or not re.fullmatch(r"new/[0-9]+\.new", new_rel)
                 or not isinstance(item.get("existed"), bool)
                 or not isinstance(item.get("published"), bool)):
             raise RuntimeError("corrupt transaction journal entry")
+        checker._relative(relative)
+        target = vault / Path(*pure.parts)
+        checker._safe_parents(target, create=False)
+        checker._case_safe(target)
+        if target.exists() or target.is_symlink():
+            target_info = target.lstat()
+            if _is_reparse(target) or not stat.S_ISREG(target_info.st_mode):
+                raise ConflictError(f"unsafe recovery target: {relative}")
+        new_path = journal / Path(*PurePosixPath(new_rel).parts)
+        backup = journal / Path(*PurePosixPath(backup_rel).parts)
+        if not new_path.exists():
+            raise RuntimeError("corrupt transaction journal new file")
+        for candidate, expected, links in ((new_path, item.get("new_fingerprint"), {1, 2}),
+                                           (backup, item.get("base"), {1})):
+            if candidate.exists():
+                info = candidate.lstat()
+                if (_is_reparse(candidate) or not stat.S_ISREG(info.st_mode) or info.st_nlink not in links
+                        or not isinstance(expected, dict) or _fingerprint(candidate) != expected):
+                    raise RuntimeError("corrupt transaction journal file")
+        validated.append((item, target, new_path, backup))
+    created = manifest.get("created_live_dirs", [])
+    if not isinstance(created, list) or any(not isinstance(value, dict) for value in created):
+        raise RuntimeError("corrupt transaction created dirs")
+    for created_item in created:
+        relative = str(created_item.get("relative", ""))
+        pure_dir = PurePosixPath(relative)
+        if (str(pure_dir) != relative or pure_dir.is_absolute() or ".." in pure_dir.parts
+                or pure_dir.parts[0] not in {"20_wiki", "30_answers", "40_index", "90_logs"}):
+            raise RuntimeError("corrupt transaction created dirs")
     if manifest["state"] == "prepared":
-        for item in reversed(entries):
-            relative = str(item["relative"])
-            pure = PurePosixPath(relative)
-            target = vault / Path(*pure.parts)
-            backup = journal / str(item["backup"])
+        for item, target, new_path, backup in reversed(validated):
             if backup.exists():
                 target.unlink(missing_ok=True)
                 os.replace(backup, target)
                 _fsync_file(target); _fsync_dir(target.parent)
-            elif bool(item.get("published")) and not bool(item["existed"]):
-                target.unlink(missing_ok=True); _fsync_dir(target.parent)
+            elif not bool(item["existed"]) and target.exists():
+                same_binding = new_path.exists() and os.path.samefile(target, new_path)
+                target_fp = _fingerprint(target)
+                expected_fp = item.get("new_fingerprint")
+                same_bytes = (isinstance(expected_fp, dict)
+                              and target_fp["sha256"] == expected_fp.get("sha256")
+                              and target_fp["size"] == expected_fp.get("size"))
+                if not (same_binding or same_bytes):
+                    raise ConflictError(f"recovery target conflict: {item['relative']}")
+                target.unlink(); _fsync_dir(target.parent)
+        for created_item in reversed(created):
+            relative = str(created_item["relative"])
+            directory = vault / Path(*PurePosixPath(relative).parts)
+            try:
+                info = directory.stat()
+                identity_ok = (created_item.get("dev") is None
+                               or (info.st_dev == created_item.get("dev") and info.st_ino == created_item.get("ino")))
+                if identity_ok and directory.is_dir() and not _is_reparse(directory):
+                    directory.rmdir()
+            except OSError:
+                pass
     shutil.rmtree(journal)
 
 
@@ -336,6 +381,7 @@ class ChangeTransaction:
             validator(tuple(staged for _, staged in entries))
             manifest_entries: list[dict[str, object]] = []
             preparation_metadata: list[tuple[Path, dict[str, object]]] = []
+            created_live_dirs: list[dict[str, object]] = []
             try:
                 new_root = self.stage_root / "new"
                 backup_root = self.stage_root / "backups"
@@ -352,16 +398,29 @@ class ChangeTransaction:
                     new_path = new_root / f"{index}.new"
                     shutil.copyfile(staged, new_path)
                     _fsync_file(new_path)
+                    cursor = self.vault
+                    for part in target.relative_to(self.vault).parts[:-1]:
+                        cursor = cursor / part
+                        relative_dir = cursor.relative_to(self.vault).as_posix()
+                        if not cursor.exists() and all(item["relative"] != relative_dir for item in created_live_dirs):
+                            created_live_dirs.append({"relative": relative_dir, "dev": None, "ino": None})
                     manifest_entries.append({"relative": relative, "existed": existed,
                         "base": fingerprint, "new": f"new/{index}.new", "backup": f"backups/{index}.bak",
-                        "published": False})
-                manifest = {"version": 1, "state": "prepared", "entries": manifest_entries}
+                        "new_fingerprint": _fingerprint(new_path), "published": False})
+                manifest = {"version": 1, "state": "prepared", "entries": manifest_entries,
+                            "created_live_dirs": created_live_dirs}
                 _write_manifest(self.stage_root, manifest)
                 for index, item in enumerate(manifest_entries):
                     target = self.vault / Path(*PurePosixPath(str(item["relative"])).parts)
                     backup = self.stage_root / str(item["backup"])
                     new_path = self.stage_root / str(item["new"])
                     self._safe_parents(target, create=True)
+                    for created_item in created_live_dirs:
+                        directory = self.vault / Path(*PurePosixPath(str(created_item["relative"])).parts)
+                        if directory.exists() and created_item["ino"] is None:
+                            info = directory.stat()
+                            created_item["dev"], created_item["ino"] = info.st_dev, info.st_ino
+                    _write_manifest(self.stage_root, manifest)
                     if item["existed"]:
                         if not target.exists():
                             raise ConflictError(f"live target disappeared: {item['relative']}")
@@ -377,6 +436,7 @@ class ChangeTransaction:
                     except FileExistsError as exc:
                         raise ConflictError(f"target concurrently appeared: {item['relative']}") from exc
                     _fsync_file(target); _fsync_dir(target.parent)
+                    self._crash_hook("linked", index)
                     item["published"] = True
                     _write_manifest(self.stage_root, manifest)
                     self._crash_hook("published", index)
@@ -397,7 +457,16 @@ class ChangeTransaction:
                 except BaseException as recovery_error:
                     raise RollbackError(original, [recovery_error]) from original
                 raise
-            shutil.rmtree(self.stage_root)
+            cleanup_error: OSError | None = None
+            for _ in range(2):
+                try:
+                    shutil.rmtree(self.stage_root)
+                    cleanup_error = None
+                    break
+                except OSError as exc:
+                    cleanup_error = exc
+            if cleanup_error is not None:
+                self.cleanup_warning = f"committed; journal cleanup pending: {cleanup_error}"
             self._staged.clear()
 
     def _crash_hook(self, point: str, index: int) -> None:
