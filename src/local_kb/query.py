@@ -201,7 +201,7 @@ def _safe_read_wiki(catalog: Catalog, vault: VaultPaths, question: str, spaces: 
                 paths_by_source.setdefault(row["source_id"], []).append(row["relative_path"])
     findings: list[dict[str, object]] = []
     for item in candidates:
-        if not _valid_wiki_provenance_paths(vault, item["source_ids"], paths_by_source):
+        if not _valid_wiki_provenance_paths(vault, item["source_ids"], paths_by_source, str(item["space"])):
             warnings.append("wiki_page_skipped_invalid_provenance")
             continue
         findings.append(item)
@@ -255,20 +255,27 @@ def _valid_wiki_provenance(catalog: Catalog, vault: VaultPaths, source_ids: list
     return False
 
 
-def _valid_wiki_provenance_paths(vault: VaultPaths, source_ids: list[str], paths_by_source: dict[str, list[str]]) -> bool:
+def _valid_wiki_provenance_paths(vault: VaultPaths, source_ids: list[str], paths_by_source: dict[str, list[str]], space: str) -> bool:
     if not source_ids or any(source_id not in paths_by_source for source_id in source_ids):
         return False
     for source_id in source_ids:
+        readable = False
         for relative in paths_by_source[source_id]:
+            expected = f"10_raw/{space}/{source_id}/"
+            if not str(relative).replace("\\", "/").startswith(expected):
+                continue
             candidate = vault.root / relative
             try:
                 _safe_existing_tree(vault.raw, candidate)
                 with _open_pinned_regular(candidate) as (descriptor, _):
                     os.read(descriptor, 1)
-                    return True
+                    readable = True
+                    break
             except (OSError, ValueError):
                 continue
-    return False
+        if not readable:
+            return False
+    return True
 
 
 def _frontmatter_list(header: str, name: str) -> list[str]:
@@ -398,7 +405,10 @@ class QueryService:
         if self.vault is not None and has_searchable_terms(checked_question):
             derived, wiki_scan_truncated, warnings = _safe_read_wiki(self.catalog, self.vault, checked_question, checked_spaces)
             wiki_quota = min(5, limit - 1)
-            evidence = (evidence[:limit - wiki_quota] + derived[:wiki_quota]) if limit >= 2 and derived else evidence[:limit]
+            selected_derived = derived[:wiki_quota] if limit >= 2 else []
+            raw_recalled = evidence
+            raw_slots = limit - len(selected_derived)
+            evidence = raw_recalled[:raw_slots] + selected_derived
         else:
             warnings = []
             evidence = evidence[:limit]
@@ -422,6 +432,7 @@ class QueryService:
                 "evidence": any(item.get("truncated") is True for item in evidence),
                 "pending_jobs": pending_jobs["truncated"],
                 "result_limit_reached": len(evidence) >= limit,
+                "raw_results": 'raw_recalled' in locals() and len(raw_recalled) > sum(item.get("kind") == "raw_fragment" for item in evidence),
                 "wiki_scan": wiki_scan_truncated,
             },
         }

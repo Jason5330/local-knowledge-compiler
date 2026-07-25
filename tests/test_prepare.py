@@ -51,7 +51,7 @@ def test_prepare_isolates_space_and_keeps_raw_provenance(seeded_catalog):
     assert packet["evidence"]
     assert packet["truncated"] == {
         "evidence": False, "pending_jobs": False,
-        "result_limit_reached": False, "wiki_scan": False,
+        "result_limit_reached": False, "wiki_scan": False, "raw_results": False,
     }
     assert all(hit["space"] == "work" for hit in packet["evidence"])
     assert packet["evidence"][0]["kind"] == "raw_fragment"
