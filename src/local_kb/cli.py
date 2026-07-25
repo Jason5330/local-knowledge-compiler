@@ -1,7 +1,9 @@
 """Command-line interface for local knowledge vaults."""
 
 import argparse
+import os
 from pathlib import Path
+import tempfile
 from typing import Sequence
 
 from .paths import VaultPaths
@@ -41,11 +43,27 @@ def build_vault(root: Path) -> VaultPaths:
             (source_root / category).mkdir(exist_ok=True)
     paths.queue.mkdir(parents=True, exist_ok=True)
     paths.staging.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
     try:
-        with paths.config.open("x", encoding="utf-8") as config_file:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=paths.system,
+            prefix=f".{paths.config.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as config_file:
+            temporary_path = Path(config_file.name)
             config_file.write(DEFAULT_CONFIG)
-    except FileExistsError:
-        pass
+            config_file.flush()
+            os.fsync(config_file.fileno())
+        try:
+            os.link(temporary_path, paths.config)
+        except FileExistsError:
+            pass
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
     return paths
 
 

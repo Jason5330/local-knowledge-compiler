@@ -1,6 +1,7 @@
 """Configuration loading for a knowledge vault."""
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 import tomllib
 
@@ -18,7 +19,10 @@ def _number(values: dict, section: str, key: str) -> float:
     value = _required(values, section, key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{field} must be a number")
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be finite")
+    return number
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,7 @@
+import os
 import re
 import tomllib
+from pathlib import Path
 
 import pytest
 
@@ -79,6 +81,26 @@ max_retries = 7
         stable_seconds=0.0,
         max_retries=7,
     )
+    assert not list(config_path.parent.glob("*.tmp"))
+
+
+def test_build_vault_preserves_concurrent_config_and_cleans_temp(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "80_system" / "config.toml"
+    concurrent_config = VALID_CONFIG.replace('"claude"', '"codex"').encode()
+
+    def publish_concurrent_config(source, destination):
+        assert Path(source).parent == config_path.parent
+        Path(destination).write_bytes(concurrent_config)
+        raise FileExistsError
+
+    monkeypatch.setattr(os, "link", publish_concurrent_config)
+
+    build_vault(tmp_path)
+
+    assert config_path.read_bytes() == concurrent_config
+    assert not list(config_path.parent.glob("*.tmp"))
 
 
 @pytest.mark.parametrize(
@@ -95,10 +117,14 @@ max_retries = 7
         ("poll_seconds = 2.0", "poll_seconds = true", "watcher.poll_seconds"),
         ("poll_seconds = 2.0", "poll_seconds = 0", "watcher.poll_seconds"),
         ("poll_seconds = 2.0", "poll_seconds = nan", "watcher.poll_seconds"),
+        ("poll_seconds = 2.0", "poll_seconds = inf", "watcher.poll_seconds"),
+        ("poll_seconds = 2.0", "poll_seconds = -inf", "watcher.poll_seconds"),
         ("stable_seconds = 5.0\n", "", "watcher.stable_seconds"),
         ("stable_seconds = 5.0", "stable_seconds = true", "watcher.stable_seconds"),
         ("stable_seconds = 5.0", "stable_seconds = -1", "watcher.stable_seconds"),
         ("stable_seconds = 5.0", "stable_seconds = nan", "watcher.stable_seconds"),
+        ("stable_seconds = 5.0", "stable_seconds = inf", "watcher.stable_seconds"),
+        ("stable_seconds = 5.0", "stable_seconds = -inf", "watcher.stable_seconds"),
         ("[queue]\nmax_retries = 3\n", "", "queue.max_retries"),
         ("max_retries = 3", "max_retries = 0", "queue.max_retries"),
         ("max_retries = 3", "max_retries = true", "queue.max_retries"),
