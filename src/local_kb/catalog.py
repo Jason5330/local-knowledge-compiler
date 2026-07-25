@@ -229,7 +229,7 @@ class Catalog:
                       FROM sources AS successor
                       WHERE successor.previous_version_id = candidate.version_id
                   )
-                ORDER BY candidate.version_id DESC
+                ORDER BY candidate.rowid DESC
                 LIMIT 1
                 """,
                 (space, original_name),

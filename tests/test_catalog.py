@@ -398,9 +398,7 @@ def test_latest_source_returns_newest_matching_original_name(tmp_path):
         make_source(version_id="old", sha256="d" * 64), [("line:1", "old")]
     )
     catalog.upsert_source(
-        make_source(
-            version_id="new", sha256="e" * 64, previous_version_id="old"
-        ),
+        make_source(version_id="new", sha256="e" * 64),
         [("line:1", "new")],
     )
     catalog.upsert_source(
