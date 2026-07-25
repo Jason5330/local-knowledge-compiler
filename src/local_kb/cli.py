@@ -9,6 +9,7 @@ from typing import Sequence
 
 from .catalog import Catalog
 from .config import Config
+from .finalize import finalize_and_enqueue, read_json_document
 from .ingest import IngestService
 from .paths import VaultPaths
 from .queue import DiskQueue
@@ -92,6 +93,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare_parser.add_argument("--vault", type=Path, default=Path.cwd())
     prepare_parser.add_argument("--space", action="append", default=[])
     prepare_parser.add_argument("--output", type=Path, default=Path(".kb/last-packet.json"))
+    finalize_parser = subcommands.add_parser("finalize", help="save a cited derived answer")
+    finalize_parser.add_argument("--vault", type=Path, default=Path.cwd())
+    finalize_parser.add_argument("--packet", type=Path, required=True)
+    finalize_parser.add_argument("--answer", type=Path, required=True)
     arguments = parser.parse_args(argv)
 
     if arguments.command == "init":
@@ -110,6 +115,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.question, spaces, space_selection=selection
             )
             print(write_packet(paths, packet, arguments.output))
+            return 0
+        if arguments.command == "finalize":
+            queue = DiskQueue(paths.queue, config.max_retries)
+            result = finalize_and_enqueue(
+                paths,
+                queue,
+                read_json_document(arguments.packet),
+                read_json_document(arguments.answer),
+            )
+            print(f"Saved answer: {result.path}")
+            print(f"Queued derived update: {result.job_id}")
             return 0
         if arguments.command == "ingest-once":
             queue = DiskQueue(paths.queue, config.max_retries)
@@ -171,6 +187,8 @@ def watch_once(
     service = IngestService(paths, queue, Catalog(paths.index / "catalog.sqlite3"))
     results = []
     for job in queue.iter_jobs():
+        if job.metadata.get("job_type") == "derived_update":
+            continue
         if job.state == "pending_attention":
             original = Path(str(job.metadata.get("original_source_path", job.source_path)))
             submitted.discard(original)
