@@ -298,6 +298,7 @@ def test_processed_job_junction_is_rejected_without_writing_outside_vault(tmp_pa
     outside = tmp_path / "outside"
     outside.mkdir()
     junction = vault.trash / "processed-inbox" / job.job_id
+    junction.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
         ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
         capture_output=True,
