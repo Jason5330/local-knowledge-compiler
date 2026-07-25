@@ -3,47 +3,133 @@
 from __future__ import annotations
 
 from pathlib import Path
+import zipfile
 
 from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
-from .base import Extraction, ExtractionError, Fragment, registry, snapshot_file
+from . import base as limits
+from .base import (
+    Extraction,
+    ExtractionError,
+    Fragment,
+    enforce_extraction_budget,
+    registry,
+    snapshot_file,
+)
+
+
+def _validate_office_zip(path: Path) -> None:
+    """Validate Office ZIP metadata without reading or expanding any member."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
+    except Exception as exc:
+        raise ExtractionError(f"failed to inspect Office ZIP file: {path}") from exc
+
+    if len(members) > limits.MAX_ZIP_MEMBERS:
+        raise ExtractionError(
+            f"Office ZIP member count exceeds budget of {limits.MAX_ZIP_MEMBERS}"
+        )
+    total_uncompressed = 0
+    for member in members:
+        total_uncompressed += member.file_size
+        if total_uncompressed > limits.MAX_ZIP_UNCOMPRESSED_BYTES:
+            raise ExtractionError("Office ZIP total uncompressed size exceeds 100 MiB budget")
+        if (
+            member.filename.lower().endswith((".xml", ".rels"))
+            and member.file_size > limits.MAX_ZIP_SINGLE_XML_BYTES
+        ):
+            raise ExtractionError("Office ZIP single XML member exceeds budget")
+        if member.file_size > limits.ZIP_RATIO_MIN_UNCOMPRESSED_BYTES:
+            if member.compress_size == 0:
+                raise ExtractionError("Office ZIP compression ratio exceeds budget")
+            if member.file_size / member.compress_size > limits.MAX_ZIP_COMPRESSION_RATIO:
+                raise ExtractionError("Office ZIP compression ratio exceeds budget")
+
+
+def _table_fragments(table: Table, table_number: int) -> list[Fragment]:
+    fragments: list[Fragment] = []
+    seen_cells: set[int] = set()
+    for row_number, row in enumerate(table.rows, 1):
+        values: list[str] = []
+        positions: list[int] = []
+        for cell_number, cell in enumerate(row.cells, 1):
+            identity = id(cell._tc)
+            if identity in seen_cells:
+                continue
+            seen_cells.add(identity)
+            value = cell.text.strip()
+            if value:
+                positions.append(cell_number)
+                values.append(value)
+        if values:
+            locator = (
+                f"table:{table_number};row:{row_number};"
+                f"cells:{positions[0]}-{positions[-1]}"
+            )
+            fragments.append(Fragment(locator, "\t".join(values)))
+    return fragments
 
 
 def _extract_docx_snapshot(path: Path) -> Extraction:
+    _validate_office_zip(path)
     try:
-        document = Document(path)
+        with path.open("rb") as stream:
+            document = Document(stream)
     except Exception as exc:
         raise ExtractionError(f"failed to read DOCX file: {path}") from exc
-    return Extraction(
-        "extracted",
-        [
-            Fragment(f"paragraph:{index}", paragraph.text)
-            for index, paragraph in enumerate(document.paragraphs, 1)
-            if paragraph.text.strip()
-        ],
-    )
+
+    fragments: list[Fragment] = []
+    paragraph_number = 0
+    table_number = 0
+    for item in document.iter_inner_content():
+        if isinstance(item, Paragraph):
+            paragraph_number += 1
+            if item.text.strip():
+                fragments.append(Fragment(f"paragraph:{paragraph_number}", item.text))
+        elif isinstance(item, Table):
+            table_number += 1
+            fragments.extend(_table_fragments(item, table_number))
+    return Extraction("extracted", fragments)
 
 
 def extract_docx(path: Path) -> Extraction:
     with snapshot_file(path) as snapshot:
-        return _extract_docx_snapshot(snapshot)
+        return enforce_extraction_budget(_extract_docx_snapshot(snapshot))
 
 
 def _extract_xlsx_snapshot(path: Path) -> Extraction:
+    _validate_office_zip(path)
+    stream = path.open("rb")
     try:
         book = load_workbook(
-            path,
+            stream,
             read_only=True,
             data_only=True,
             keep_links=False,
         )
     except Exception as exc:
+        stream.close()
         raise ExtractionError(f"failed to read spreadsheet file: {path}") from exc
 
     try:
         fragments: list[Fragment] = []
+        for sheet in book.worksheets:
+            max_row = sheet.max_row or 0
+            max_column = sheet.max_column or 0
+            if (
+                max_row > limits.MAX_WORKSHEET_ROWS
+                or max_column > limits.MAX_WORKSHEET_COLUMNS
+                or max_row * max_column > limits.MAX_WORKSHEET_CELLS
+            ):
+                raise ExtractionError(
+                    f"worksheet dimensions exceed budget: {sheet.title} "
+                    f"({max_row} rows x {max_column} columns)"
+                )
         for sheet in book.worksheets:
             for row_number, row in enumerate(sheet.iter_rows(), 1):
                 values = ["" if cell.value is None else str(cell.value) for cell in row]
@@ -54,15 +140,20 @@ def _extract_xlsx_snapshot(path: Path) -> Extraction:
                     )
                     fragments.append(Fragment(locator, "\t".join(values)))
         return Extraction("extracted", fragments)
+    except ExtractionError:
+        raise
     except Exception as exc:
         raise ExtractionError(f"failed to extract spreadsheet file: {path}") from exc
     finally:
-        book.close()
+        try:
+            book.close()
+        finally:
+            stream.close()
 
 
 def extract_xlsx(path: Path) -> Extraction:
     with snapshot_file(path) as snapshot:
-        return _extract_xlsx_snapshot(snapshot)
+        return enforce_extraction_budget(_extract_xlsx_snapshot(snapshot))
 
 
 class DocxExtractor:

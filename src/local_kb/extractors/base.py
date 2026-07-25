@@ -13,6 +13,19 @@ import time
 from typing import Callable, Protocol
 
 
+MAX_SOURCE_BYTES = 100 * 1024 * 1024
+MAX_ZIP_MEMBERS = 2_000
+MAX_ZIP_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+MAX_ZIP_SINGLE_XML_BYTES = 25 * 1024 * 1024
+MAX_ZIP_COMPRESSION_RATIO = 200
+ZIP_RATIO_MIN_UNCOMPRESSED_BYTES = 10 * 1024 * 1024
+MAX_WORKSHEET_ROWS = 100_000
+MAX_WORKSHEET_COLUMNS = 256
+MAX_WORKSHEET_CELLS = 1_000_000
+MAX_FRAGMENT_COUNT = 20_000
+MAX_EXTRACTION_CHARACTERS = 2_000_000
+
+
 @dataclass(frozen=True)
 class Fragment:
     locator: str
@@ -28,6 +41,23 @@ class Extraction:
 
 class ExtractionError(RuntimeError):
     """A supported local document could not safely be read."""
+
+
+def enforce_extraction_budget(extraction: Extraction) -> Extraction:
+    """Reject extractor output that exceeds the shared evidence budget."""
+    if len(extraction.fragments) > MAX_FRAGMENT_COUNT:
+        raise ExtractionError(
+            f"extraction fragment count exceeds budget of {MAX_FRAGMENT_COUNT}"
+        )
+    characters = 0
+    for fragment in extraction.fragments:
+        characters += len(fragment.text)
+        if characters > MAX_EXTRACTION_CHARACTERS:
+            raise ExtractionError(
+                "extraction character count exceeds budget of "
+                f"{MAX_EXTRACTION_CHARACTERS}"
+            )
+    return extraction
 
 
 class SnapshotCleanupError(RuntimeError):
@@ -244,6 +274,16 @@ def _cleanup_snapshot_directory(snapshot_directory: Path) -> None:
 def snapshot_file(path: Path):
     """Copy a pinned, regular local source to a private immutable parser input."""
     candidate, source_fd, directory_handles, close_directory = _open_safe_source(path)
+    try:
+        source_size = os.fstat(source_fd).st_size
+    except Exception:
+        _close_source(source_fd, directory_handles, close_directory)
+        raise
+    if source_size > MAX_SOURCE_BYTES:
+        _close_source(source_fd, directory_handles, close_directory)
+        raise ExtractionError(
+            f"supported source exceeds 100 MiB budget: {candidate}"
+        )
     snapshot_directory: Path | None = None
     destination_fd: int | None = None
     try:
@@ -304,8 +344,8 @@ class Registry:
             with snapshot_file(path) as snapshot:
                 extract_snapshot = getattr(extractor, "extract_snapshot", None)
                 if extract_snapshot is not None:
-                    return extract_snapshot(snapshot)
-                return extractor.extract(snapshot)
+                    return enforce_extraction_budget(extract_snapshot(snapshot))
+                return enforce_extraction_budget(extractor.extract(snapshot))
         from .unsupported import pending_extractor
 
         validate_regular_file(path)

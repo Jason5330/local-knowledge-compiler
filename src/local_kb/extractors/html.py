@@ -6,7 +6,14 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 
-from .base import Extraction, ExtractionError, Fragment, registry, snapshot_file
+from .base import (
+    Extraction,
+    ExtractionError,
+    Fragment,
+    enforce_extraction_budget,
+    registry,
+    snapshot_file,
+)
 
 
 def _extract_html_snapshot(path: Path) -> Extraction:
@@ -24,7 +31,7 @@ def _extract_html_snapshot(path: Path) -> Extraction:
 
 def extract_html(path: Path) -> Extraction:
     with snapshot_file(path) as snapshot:
-        return _extract_html_snapshot(snapshot)
+        return enforce_extraction_budget(_extract_html_snapshot(snapshot))
 
 
 class HtmlExtractor:

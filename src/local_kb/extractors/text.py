@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import Extraction, ExtractionError, Fragment, registry, snapshot_file
+from .base import (
+    Extraction,
+    ExtractionError,
+    Fragment,
+    enforce_extraction_budget,
+    registry,
+    snapshot_file,
+)
 
 
 def _extract_text_snapshot(path: Path) -> Extraction:
@@ -27,7 +34,7 @@ class TextExtractor:
 
     def extract(self, path: Path) -> Extraction:
         with snapshot_file(path) as snapshot:
-            return _extract_text_snapshot(snapshot)
+            return enforce_extraction_budget(_extract_text_snapshot(snapshot))
 
     extract_snapshot = staticmethod(_extract_text_snapshot)
 

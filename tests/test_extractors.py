@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import zipfile
 
 import pytest
 from docx import Document
@@ -162,6 +163,24 @@ def test_docx_uses_only_nonempty_paragraphs_with_paragraph_locators(tmp_path: Pa
     ]
 
 
+def test_docx_extracts_table_only_rows_and_deduplicates_merged_cells(tmp_path: Path) -> None:
+    path = tmp_path / "table-only.docx"
+    document = Document()
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "名稱"
+    table.cell(0, 1).text = "重要值"
+    merged = table.cell(1, 0).merge(table.cell(1, 1))
+    merged.text = "合併內容"
+    document.save(path)
+
+    result = registry.extract(path)
+
+    assert result.fragments == [
+        Fragment("table:1;row:1;cells:1-2", "名稱\t重要值"),
+        Fragment("table:1;row:2;cells:1-1", "合併內容"),
+    ]
+
+
 def test_xlsx_extracts_each_nonempty_row_across_sheets_and_keeps_none_cells(tmp_path: Path) -> None:
     path = tmp_path / "table.xlsx"
     book = Workbook()
@@ -184,7 +203,9 @@ def test_xlsx_workbook_is_closed_after_extraction(tmp_path: Path, monkeypatch: p
     from local_kb.extractors import office
 
     path = tmp_path / "table.xlsx"
-    path.write_bytes(b"placeholder")
+    real_book = Workbook()
+    real_book.save(path)
+    real_book.close()
 
     class Cell:
         def __init__(self, coordinate: str, value: object) -> None:
@@ -193,6 +214,8 @@ def test_xlsx_workbook_is_closed_after_extraction(tmp_path: Path, monkeypatch: p
 
     class Sheet:
         title = "Data"
+        max_row = 1
+        max_column = 1
 
         def iter_rows(self):
             yield (Cell("A1", "value"),)
@@ -211,6 +234,53 @@ def test_xlsx_workbook_is_closed_after_extraction(tmp_path: Path, monkeypatch: p
 
     assert result.fragments == [Fragment("sheet:Data;cells:A1-A1", "value")]
     assert book.closed is True
+
+
+@pytest.mark.parametrize("far_cell", ["A100001", "IW1", "IQ4000"])
+def test_xlsx_rejects_sparse_dimensions_before_iterating_and_closes_book(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, far_cell: str
+) -> None:
+    from local_kb.extractors import office
+
+    path = tmp_path / "sparse.xlsx"
+    source_book = Workbook()
+    source_book.active[far_cell] = "far away"
+    source_book.save(path)
+    source_book.close()
+    real_load_workbook = office.load_workbook
+    loaded: list[object] = []
+
+    class SheetProxy:
+        def __init__(self, sheet) -> None:
+            self.title = sheet.title
+            self.max_row = sheet.max_row
+            self.max_column = sheet.max_column
+
+        def iter_rows(self):
+            raise AssertionError("dimension budget must be checked before iter_rows")
+
+    class BookProxy:
+        def __init__(self, book) -> None:
+            self.book = book
+            self.worksheets = [SheetProxy(sheet) for sheet in book.worksheets]
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+            self.book.close()
+
+    def tracked_load(*args, **kwargs):
+        proxy = BookProxy(real_load_workbook(*args, **kwargs))
+        loaded.append(proxy)
+        return proxy
+
+    monkeypatch.setattr(office, "load_workbook", tracked_load)
+
+    with pytest.raises(base.ExtractionError, match="worksheet dimensions exceed budget"):
+        registry.extract(path)
+
+    assert len(loaded) == 1
+    assert loaded[0].closed is True
 
 
 @pytest.mark.parametrize("suffix", [".pdf", ".docx", ".xlsx"])
@@ -400,3 +470,132 @@ def test_registry_raises_if_a_parser_leaves_its_snapshot_open(tmp_path: Path) ->
     held.close()
     shutil.rmtree(error.value.snapshot_directory)
     assert not error.value.snapshot_directory.exists()
+
+
+def test_supported_raw_source_budget_is_exact_and_unknown_files_are_not_limited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert base.MAX_SOURCE_BYTES == 100 * 1024 * 1024
+    monkeypatch.setattr(base, "MAX_SOURCE_BYTES", 16)
+    exact = tmp_path / "exact.txt"
+    exact.write_bytes(b"x" * 16)
+    oversized = tmp_path / "oversized.txt"
+    oversized.write_bytes(b"x" * 17)
+    unknown = tmp_path / "oversized.mp4"
+    unknown.write_bytes(b"x" * 17)
+
+    assert registry.extract(exact).status == "extracted"
+    with pytest.raises(base.ExtractionError, match="source exceeds 100 MiB budget"):
+        registry.extract(oversized)
+    renamed = tmp_path / "released.txt"
+    oversized.rename(renamed)
+    assert renamed.exists()
+    assert registry.extract(unknown).status == "pending_extractor"
+
+
+def test_high_compression_docx_is_rejected_from_zip_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb.extractors import office
+
+    path = tmp_path / "bomb.docx"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b"x" * (11 * 1024 * 1024))
+
+    snapshots: list[Path] = []
+    validate_zip = office._validate_office_zip
+
+    def tracked_validation(snapshot: Path) -> None:
+        snapshots.append(snapshot)
+        validate_zip(snapshot)
+
+    monkeypatch.setattr(office, "_validate_office_zip", tracked_validation)
+
+    assert path.stat().st_size < 100_000
+    with pytest.raises(base.ExtractionError, match="compression ratio exceeds budget"):
+        registry.extract(path)
+    assert not snapshots[0].exists()
+    assert not snapshots[0].parent.exists()
+
+
+def test_single_large_office_xml_is_rejected_before_parser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb.extractors import office
+
+    monkeypatch.setattr(base, "MAX_ZIP_SINGLE_XML_BYTES", 64)
+    path = tmp_path / "expanded.docx"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("word/document.xml", b"x" * 65)
+    parser_called = False
+
+    def parser_spy(path):
+        nonlocal parser_called
+        parser_called = True
+        raise AssertionError("Document parser must not run")
+
+    monkeypatch.setattr(office, "Document", parser_spy)
+
+    with pytest.raises(base.ExtractionError, match="single XML member exceeds budget"):
+        registry.extract(path)
+
+    assert parser_called is False
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "fragments", "message"),
+    [
+        ("MAX_FRAGMENT_COUNT", [Fragment("1", "a"), Fragment("2", "b")], "fragment count"),
+        ("MAX_EXTRACTION_CHARACTERS", [Fragment("1", "abc")], "character count"),
+    ],
+)
+def test_registry_rejects_over_budget_extractor_output_and_cleans_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    fragments: list[Fragment],
+    message: str,
+) -> None:
+    source = tmp_path / "output.budget"
+    source.write_text("source", encoding="utf-8")
+    monkeypatch.setattr(base, limit_name, 1 if limit_name == "MAX_FRAGMENT_COUNT" else 2)
+    snapshots: list[Path] = []
+
+    class OversizedOutputExtractor:
+        suffixes = {".budget"}
+
+        def extract(self, path: Path) -> Extraction:
+            snapshots.append(path)
+            return Extraction("extracted", fragments)
+
+    isolated = Registry()
+    isolated.register(OversizedOutputExtractor())
+
+    with pytest.raises(base.ExtractionError, match=message):
+        isolated.extract(source)
+
+    assert not snapshots[0].exists()
+    assert not snapshots[0].parent.exists()
+
+
+def test_direct_text_extractor_enforces_output_budget_and_cleans_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb.extractors import text
+
+    source = tmp_path / "direct.txt"
+    source.write_text("source", encoding="utf-8")
+    monkeypatch.setattr(base, "MAX_FRAGMENT_COUNT", 1)
+    snapshots: list[Path] = []
+
+    def oversized_output(path: Path) -> Extraction:
+        snapshots.append(path)
+        return Extraction("extracted", [Fragment("1", "a"), Fragment("2", "b")])
+
+    monkeypatch.setattr(text, "_extract_text_snapshot", oversized_output)
+
+    with pytest.raises(base.ExtractionError, match="fragment count"):
+        text.TextExtractor().extract(source)
+
+    assert not snapshots[0].exists()
+    assert not snapshots[0].parent.exists()
