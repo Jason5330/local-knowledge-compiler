@@ -19,6 +19,15 @@ JobState = Literal[
     "pending_attention",
 ]
 
+SourceStatus = Literal[
+    "archived",
+    "extracted",
+    "pending_extractor",
+    "compiled",
+    "validated",
+    "published",
+]
+
 
 @dataclass(frozen=True)
 class SourceVersion:
@@ -29,7 +38,7 @@ class SourceVersion:
     relative_path: str
     sha256: str
     media_type: str
-    status: JobState
+    status: SourceStatus
     previous_version_id: str | None = None
 
 
