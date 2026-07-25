@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import json
 import os
@@ -503,3 +504,124 @@ def test_atomic_publish_failure_does_not_return_success_or_leave_temp_artifacts(
 
     assert not list(raw_root.rglob("manifest.json"))
     assert not list(raw_root.rglob(".ver_*.tmp-*"))
+
+
+def test_posix_publish_refuses_target_created_after_final_precheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb import source_store
+
+    raw_root = tmp_path / "10_raw"
+    incoming = write_file(tmp_path / "race-target.txt", b"new payload")
+    digest = hashlib.sha256(b"new payload").hexdigest()
+    source_id = f"src_{digest[:16]}"
+    target = raw_root / "work" / source_id / f"ver_{digest}"
+    marker = b"existing target"
+
+    def race_in_target(
+        old_parent_fd: int,
+        old_name: str,
+        new_parent_fd: int,
+        new_name: str,
+    ) -> None:
+        target.mkdir()
+        (target / "marker").write_bytes(marker)
+        raise FileExistsError(errno.EEXIST, "target exists")
+
+    monkeypatch.setattr(source_store, "_IS_WINDOWS", False, raising=False)
+    monkeypatch.setattr(
+        source_store, "_posix_rename_noreplace", race_in_target, raising=False
+    )
+
+    with pytest.raises(FileExistsError):
+        source_store.SourceStore(raw_root).archive(incoming, "work")
+
+    assert (target / "marker").read_bytes() == marker
+    assert not (target / "race-target.txt").exists()
+    assert not list(raw_root.rglob(".ver_*.tmp-*"))
+
+
+def test_posix_component_open_is_dirfd_relative_and_nofollow_when_parent_races(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb import source_store
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    calls: list[tuple[object, int, int | None]] = []
+
+    def raced_open(
+        path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        calls.append((path, flags, dir_fd))
+        raise OSError(errno.ELOOP, "parent was replaced by symlink")
+
+    monkeypatch.setattr(source_store.os, "open", raced_open)
+
+    with pytest.raises(OSError) as captured:
+        source_store._open_posix_directory_at(41, "source")
+
+    assert captured.value.errno == errno.ELOOP
+    assert calls == [
+        (
+            "source",
+            source_store._POSIX_DIRECTORY_OPEN_FLAGS,
+            41,
+        )
+    ]
+    assert source_store._POSIX_DIRECTORY_OPEN_FLAGS & source_store._O_NOFOLLOW
+    assert list(outside.iterdir()) == []
+
+
+def test_posix_new_directory_sync_failure_closes_opened_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb import source_store
+
+    store = source_store.SourceStore(tmp_path / "10_raw")
+    closed: list[int] = []
+    removed: list[tuple[str, int | None]] = []
+    opens = 0
+
+    def open_after_create(parent_fd: int, component: str) -> int:
+        nonlocal opens
+        opens += 1
+        if opens == 1:
+            raise FileNotFoundError(component)
+        return 73
+
+    monkeypatch.setattr(
+        source_store,
+        "_open_posix_directory_at",
+        open_after_create,
+    )
+    monkeypatch.setattr(
+        source_store.os,
+        "mkdir",
+        lambda component, mode, *, dir_fd: None,
+    )
+    monkeypatch.setattr(
+        source_store.os,
+        "close",
+        lambda descriptor: closed.append(descriptor),
+    )
+    monkeypatch.setattr(
+        source_store.os,
+        "rmdir",
+        lambda component, *, dir_fd: removed.append((component, dir_fd)),
+    )
+    monkeypatch.setattr(
+        store,
+        "_sync_pinned_directory",
+        lambda descriptor: (_ for _ in ()).throw(OSError("sync failed")),
+    )
+
+    with pytest.raises(OSError, match="sync failed"):
+        store._open_or_create_posix_directory(41, "new-source")
+
+    assert closed == [73]
+    assert removed == [("new-source", 41)]

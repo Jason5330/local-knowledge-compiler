@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import sys
 import time
 from typing import BinaryIO, Iterator
 from uuid import uuid4
@@ -24,6 +25,14 @@ _SOURCE_ID_RE = re.compile(r"src_[a-z0-9][a-z0-9_-]{0,127}\Z")
 _VERSION_ID_RE = re.compile(r"ver_[0-9a-f]{64}\Z")
 _MANIFEST_NAME = "manifest.json"
 _LOCK_NAME = ".archive.lock"
+_IS_WINDOWS = os.name == "nt"
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0x20000)
+_POSIX_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | _O_NOFOLLOW
+    | getattr(os, "O_CLOEXEC", 0)
+)
 _WINDOWS_FORBIDDEN_FILENAME_CHARACTERS = frozenset('<>:"|?*')
 _RESERVED_WINDOWS_NAMES = {
     "con",
@@ -33,6 +42,89 @@ _RESERVED_WINDOWS_NAMES = {
     *(f"com{number}" for number in range(1, 10)),
     *(f"lpt{number}" for number in range(1, 10)),
 }
+
+
+def _open_posix_directory_at(parent_fd: int, component: str) -> int:
+    descriptor = os.open(
+        component,
+        _POSIX_DIRECTORY_OPEN_FLAGS,
+        dir_fd=parent_fd,
+    )
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise NotADirectoryError(component)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _posix_rename_noreplace(
+    old_parent_fd: int,
+    old_name: str,
+    new_parent_fd: int,
+    new_name: str,
+) -> None:
+    """Atomically rename without replacement, or fail closed."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    old_encoded = os.fsencode(old_name)
+    new_encoded = os.fsencode(new_name)
+    if sys.platform.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        if rename is None:
+            raise OSError(
+                errno.ENOSYS, "renameat2 is unavailable; refusing unsafe publish"
+            )
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            old_parent_fd,
+            old_encoded,
+            new_parent_fd,
+            new_encoded,
+            1,  # RENAME_NOREPLACE
+        )
+    elif sys.platform == "darwin":
+        rename = getattr(libc, "renameatx_np", None)
+        if rename is None:
+            raise OSError(
+                errno.ENOSYS,
+                "renameatx_np is unavailable; refusing unsafe publish",
+            )
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            old_parent_fd,
+            old_encoded,
+            new_parent_fd,
+            new_encoded,
+            0x00000004,  # RENAME_EXCL
+        )
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "no atomic no-replace rename primitive for this POSIX platform",
+        )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, "immutable target already exists")
+    raise OSError(error_number, os.strerror(error_number))
 
 
 def _windows_kernel32():
@@ -281,7 +373,9 @@ class SourceStore:
         source_digest = file_sha256(incoming_path)
         version_id = f"ver_{source_digest}"
 
-        with self._archive_lock(), self._pin_directory(self.raw_root):
+        with self._archive_lock(), self._pin_directory(
+            self.raw_root
+        ) as root_handle:
             duplicate = self._find_by_digest(source_digest)
             if duplicate is not None:
                 return duplicate
@@ -304,10 +398,15 @@ class SourceStore:
                 status="archived",
                 previous_version_id=previous_version_id,
             )
-            self._publish(incoming_path, source)
+            self._publish(incoming_path, source, root_handle=root_handle)
             return source
 
-    def _publish(self, incoming: Path, source: SourceVersion) -> None:
+    def _publish(
+        self, incoming: Path, source: SourceVersion, *, root_handle: int
+    ) -> None:
+        if os.name != "nt":
+            self._publish_posix(incoming, source, root_handle)
+            return
         with ExitStack() as pins:
             parent = self._safe_directory(self.raw_root / source.space)
             pins.enter_context(self._pin_directory(parent))
@@ -343,6 +442,195 @@ class SourceStore:
                 if stage.exists():
                     shutil.rmtree(stage)
                 raise
+
+    def _publish_posix(
+        self, incoming: Path, source: SourceVersion, root_fd: int
+    ) -> None:
+        space_fd = self._open_or_create_posix_directory(
+            root_fd, source.space
+        )
+        try:
+            source_fd = self._open_or_create_posix_directory(
+                space_fd, source.source_id
+            )
+            try:
+                try:
+                    os.stat(
+                        source.version_id,
+                        dir_fd=source_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise FileExistsError("immutable target already exists")
+
+                stage_name = f".{source.version_id}.tmp-{uuid4().hex}"
+                os.mkdir(stage_name, mode=0o755, dir_fd=source_fd)
+                stage_fd: int | None = None
+                published = False
+                try:
+                    stage_fd = _open_posix_directory_at(
+                        source_fd, stage_name
+                    )
+                    self._sync_pinned_directory(stage_fd)
+                    self._sync_pinned_directory(source_fd)
+                    self._copy_posix_file(
+                        incoming,
+                        stage_fd,
+                        source.original_name,
+                        source.sha256,
+                    )
+                    self._write_posix_manifest(stage_fd, source)
+                    self._sync_pinned_directory(stage_fd)
+                    _posix_rename_noreplace(
+                        source_fd,
+                        stage_name,
+                        source_fd,
+                        source.version_id,
+                    )
+                    published = True
+                    self._sync_pinned_directory(source_fd)
+                except BaseException:
+                    if stage_fd is not None:
+                        os.close(stage_fd)
+                        stage_fd = None
+                    if not published:
+                        self._cleanup_posix_stage(
+                            source_fd,
+                            stage_name,
+                            (source.original_name, _MANIFEST_NAME),
+                        )
+                    raise
+                finally:
+                    if stage_fd is not None:
+                        os.close(stage_fd)
+            finally:
+                os.close(source_fd)
+        finally:
+            os.close(space_fd)
+
+    def _open_or_create_posix_directory(
+        self, parent_fd: int, component: str
+    ) -> int:
+        try:
+            return _open_posix_directory_at(parent_fd, component)
+        except FileNotFoundError:
+            os.mkdir(component, mode=0o755, dir_fd=parent_fd)
+            try:
+                descriptor = _open_posix_directory_at(
+                    parent_fd, component
+                )
+            except BaseException:
+                try:
+                    os.rmdir(component, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+                raise
+            try:
+                self._sync_pinned_directory(descriptor)
+                self._sync_pinned_directory(parent_fd)
+            except BaseException:
+                os.close(descriptor)
+                try:
+                    os.rmdir(component, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+                raise
+            return descriptor
+
+    def _copy_posix_file(
+        self,
+        incoming: Path,
+        stage_fd: int,
+        original_name: str,
+        expected_digest: str,
+    ) -> None:
+        write_flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | _O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        output_fd = os.open(
+            original_name,
+            write_flags,
+            0o600,
+            dir_fd=stage_fd,
+        )
+        try:
+            with incoming.open("rb") as input_file, os.fdopen(
+                output_fd, "wb", closefd=False
+            ) as output_file:
+                while chunk := input_file.read(_CHUNK_SIZE):
+                    output_file.write(chunk)
+                self._flush_file(output_file)
+        finally:
+            os.close(output_fd)
+
+        read_fd = os.open(
+            original_name,
+            os.O_RDONLY | _O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=stage_fd,
+        )
+        try:
+            if self._descriptor_sha256(read_fd) != expected_digest:
+                raise ValueError("copied file checksum does not match source")
+        finally:
+            os.close(read_fd)
+
+    def _write_posix_manifest(
+        self, stage_fd: int, source: SourceVersion
+    ) -> None:
+        encoded = (
+            json.dumps(
+                asdict(source), sort_keys=True, ensure_ascii=False
+            ).encode("utf-8")
+            + b"\n"
+        )
+        descriptor = os.open(
+            _MANIFEST_NAME,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | _O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=stage_fd,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as manifest:
+                manifest.write(encoded)
+                self._flush_file(manifest)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _descriptor_sha256(descriptor: int) -> str:
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, _CHUNK_SIZE):
+            digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _cleanup_posix_stage(
+        parent_fd: int, stage_name: str, owned_names: tuple[str, ...]
+    ) -> None:
+        stage_fd: int | None = None
+        try:
+            stage_fd = _open_posix_directory_at(parent_fd, stage_name)
+            for name in owned_names:
+                try:
+                    os.unlink(name, dir_fd=stage_fd)
+                except FileNotFoundError:
+                    pass
+        except FileNotFoundError:
+            return
+        finally:
+            if stage_fd is not None:
+                os.close(stage_fd)
+        os.rmdir(stage_name, dir_fd=parent_fd)
 
     @contextmanager
     def _archive_lock(self) -> Iterator[None]:
@@ -648,14 +936,14 @@ class SourceStore:
         self._ensure_contained(target)
         if os.path.lexists(target):
             raise FileExistsError("immutable target already exists")
-        if os.name == "nt":
+        if _IS_WINDOWS:
             _windows_rename_directory_handle(source_handle, target)
             return
-        os.rename(
+        _posix_rename_noreplace(
+            parent_handle,
             source.name,
+            parent_handle,
             target.name,
-            src_dir_fd=parent_handle,
-            dst_dir_fd=parent_handle,
         )
 
     @staticmethod
