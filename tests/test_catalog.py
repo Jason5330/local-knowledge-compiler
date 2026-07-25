@@ -89,6 +89,60 @@ def test_upsert_ignores_blank_fragments(tmp_path):
     assert [hit.locator for hit in hits] == ["line:2"]
 
 
+def test_fts_rows_store_the_source_space(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(make_source(space="work"), [("line:1", "space stored")])
+
+    with catalog.connect() as connection:
+        row = connection.execute(
+            "SELECT space FROM source_fts WHERE version_id = ?", ("version-1",)
+        ).fetchone()
+
+    assert row is not None
+    assert row["space"] == "work"
+
+
+def test_fts_schema_marks_space_unindexed(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+
+    with catalog.connect() as connection:
+        schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'source_fts'"
+        ).fetchone()["sql"]
+
+    assert "space UNINDEXED" in schema
+
+
+def test_upsert_does_not_store_blank_fragments(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(
+        make_source(), [("line:1", " \n\t "), ("line:2", "usable fragment")]
+    )
+
+    with catalog.connect() as connection:
+        stored_locators = {
+            table: [
+                row["locator"]
+                for row in connection.execute(f"SELECT locator FROM {table}")
+            ]
+            for table in ("source_fragments", "source_fts")
+        }
+
+    assert stored_locators == {
+        "source_fragments": ["line:2"],
+        "source_fts": ["line:2"],
+    }
+
+
 def test_latest_source_returns_newest_matching_original_name(tmp_path):
     from local_kb.catalog import Catalog
 

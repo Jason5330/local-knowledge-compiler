@@ -52,6 +52,7 @@ class Catalog:
                     source_id UNINDEXED,
                     relative_path UNINDEXED,
                     locator UNINDEXED,
+                    space UNINDEXED,
                     body,
                     tokenize='unicode61'
                 )
@@ -104,8 +105,8 @@ class Catalog:
             connection.executemany(
                 """
                 INSERT INTO source_fts (
-                    version_id, source_id, relative_path, locator, body
-                ) VALUES (?, ?, ?, ?, ?)
+                    version_id, source_id, relative_path, locator, space, body
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -113,6 +114,7 @@ class Catalog:
                         source.source_id,
                         source.relative_path,
                         locator,
+                        source.space,
                         self._searchable_text(text),
                     )
                     for locator, text in nonblank_fragments
