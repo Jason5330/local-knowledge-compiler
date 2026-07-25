@@ -34,7 +34,7 @@ class WikiPage:
     timeline_entry: str
     aliases: tuple[str, ...] | list[str] = ()
     status: str = "active"
-    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = "1970-01-01T00:00:00Z"
     related: tuple[str, ...] | list[str] = ()
 
     def __post_init__(self) -> None:
@@ -117,8 +117,10 @@ def validate_page(page: WikiPage) -> None:
         for item in group:
             _validate_line_safe(item, label)
     _validate_body(page.current_state, "current_state")
-    if not isinstance(page.conflicts, str) or _has_control(page.conflicts, allow_tab=True):
+    if not isinstance(page.conflicts, str):
         raise ValueError("conflicts must be safe text")
+    if page.conflicts:
+        _validate_body(page.conflicts, "conflicts")
     _validate_body(page.timeline_entry, "timeline_entry")
 
 

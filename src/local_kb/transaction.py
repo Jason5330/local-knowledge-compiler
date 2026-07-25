@@ -27,6 +27,10 @@ _THREAD_LOCKS: dict[str, threading.Lock] = {}
 
 class RollbackError(RuntimeError):
     """Rollback could not completely restore an externally visible transaction."""
+    def __init__(self, original: BaseException, errors: list[BaseException]) -> None:
+        self.original = original
+        self.errors = tuple(errors)
+        super().__init__(f"rollback incomplete after {original}: " + "; ".join(str(error) for error in errors))
 
 
 def _is_reparse(path: Path) -> bool:
@@ -236,6 +240,19 @@ class ChangeTransaction:
                     old_stat = target.stat() if target.exists() else None
                     old_bytes = target.read_bytes() if old_stat is not None else None
                     prepared.append((target, self._write_live_temp(target, staged), old_bytes, old_stat))
+                # Commit point: the private stage must be gone before any live
+                # replacement; backups are already retained in memory.
+                stage_error: OSError | None = None
+                for _ in range(2):
+                    try:
+                        shutil.rmtree(self.stage_root, ignore_errors=False)
+                        stage_error = None
+                        break
+                    except OSError as exc:
+                        stage_error = exc
+                if stage_error is not None:
+                    self._cleanup_created_dirs()
+                    raise stage_error
                 published: list[tuple[Path, bytes | None, os.stat_result | None]] = []
                 try:
                     for target, temporary, old_bytes, old_stat in prepared:
@@ -264,18 +281,17 @@ class ChangeTransaction:
                                     rollback_errors.append(exc)
                     self._cleanup_created_dirs()
                     if rollback_errors:
-                        original.add_note("rollback incomplete: " + "; ".join(str(error) for error in rollback_errors))
+                        raise RollbackError(original, rollback_errors) from original
                     raise
+            except BaseException:
+                self._cleanup_created_dirs()
+                raise
             finally:
                 for _, temporary, _, _ in prepared:
                     try:
                         temporary.unlink()
                     except FileNotFoundError:
                         pass
-            try:
-                shutil.rmtree(self.stage_root, ignore_errors=False)
-            except OSError as exc:
-                self.cleanup_warning = f"published; stale staging retained: {exc}"
             self._staged.clear()
 
     def _cleanup_created_dirs(self) -> None:

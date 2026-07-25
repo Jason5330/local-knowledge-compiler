@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from local_kb.transaction import ChangeTransaction
+from local_kb.transaction import ChangeTransaction, RollbackError
 from local_kb.wiki import WikiPage, render_page, validate_page
 
 
@@ -43,6 +43,13 @@ def test_legacy_nine_positional_page_normalizes_lists_and_multiline_bodies() -> 
     assert "First line\nSecond line\nThird line" in rendered
     assert "## Conflicts and Gaps\n\nNo conflicts" in rendered
     assert "\r" not in rendered
+    assert render_page(legacy) == render_page(WikiPage("wiki-legacy", "Legacy", "topic", "work", "medium", ["source-1"], "First line\r\nSecond line\rThird line", "No conflicts", "One\rTwo"))
+
+
+def test_conflicts_is_safe_normalized_multiline_body() -> None:
+    assert "line one\nline two" in render_page(page(conflicts="line one\r\nline two"))
+    with pytest.raises(ValueError, match="reserved"):
+        render_page(page(conflicts="## Related\ntrick"))
 
 
 @pytest.mark.parametrize("changes", [
@@ -135,7 +142,7 @@ def test_publish_rolls_back_a_replace_when_its_fsync_fails(vault: Path, monkeypa
     tx.stage("20_wiki/old.md", "updated")
 
     monkeypatch.setattr("local_kb.transaction._fsync_file", lambda _: (_ for _ in ()).throw(OSError("fsync failure")))
-    with pytest.raises(OSError, match="fsync failure"):
+    with pytest.raises((OSError, RollbackError), match="fsync failure"):
         tx.publish(lambda staged: None)
     assert original.read_text(encoding="utf-8") == "old"
     assert not list(vault.rglob("*.new"))
