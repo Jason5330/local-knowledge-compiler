@@ -303,6 +303,16 @@ def test_pending_counts_separate_matched_and_unknown(seeded_catalog, tmp_path):
     assert (pending["total"],pending["shown"],pending["related_total"],pending["related_shown"],pending["unknown_total"],pending["unknown_shown"]) == (2,2,1,1,1,1)
 
 
+def test_pending_empty_and_unavailable_have_fixed_schema(seeded_catalog):
+    from local_kb.query import QueryService
+    keys={"scope","jobs","total","shown","truncated","related_total","related_shown","unknown_total","unknown_shown"}
+    assert set(QueryService(seeded_catalog).prepare("Aurora",{"work"})["pending_jobs"]) == keys
+    class Broken:
+        def iter_jobs(self): raise ValueError("broken")
+    pending=QueryService(seeded_catalog,queue=Broken()).prepare("Aurora",{"work"})["pending_jobs"]
+    assert keys <= set(pending) and pending["error"] == "queue_unavailable"
+
+
 def test_prepare_keeps_derived_wiki_when_raw_hits_fill_limit(tmp_path):
     from local_kb.catalog import Catalog
     from local_kb.cli import build_vault

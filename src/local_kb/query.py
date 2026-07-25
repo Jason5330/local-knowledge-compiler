@@ -197,8 +197,8 @@ def _safe_read_wiki(catalog: Catalog, vault: VaultPaths, question: str, spaces: 
     if all_ids:
         marks = ", ".join("?" for _ in all_ids)
         with catalog.connection() as connection:
-            for row in connection.execute(f"SELECT source_id, relative_path FROM sources WHERE source_id IN ({marks})", all_ids):
-                paths_by_source.setdefault(row["source_id"], []).append(row["relative_path"])
+            for row in connection.execute(f"SELECT source_id, space, relative_path FROM sources WHERE source_id IN ({marks})", all_ids):
+                paths_by_source.setdefault(row["source_id"], []).append((row["space"], row["relative_path"]))
     findings: list[dict[str, object]] = []
     for item in candidates:
         if not _valid_wiki_provenance_paths(vault, item["source_ids"], paths_by_source, str(item["space"])):
@@ -255,12 +255,14 @@ def _valid_wiki_provenance(catalog: Catalog, vault: VaultPaths, source_ids: list
     return False
 
 
-def _valid_wiki_provenance_paths(vault: VaultPaths, source_ids: list[str], paths_by_source: dict[str, list[str]], space: str) -> bool:
+def _valid_wiki_provenance_paths(vault: VaultPaths, source_ids: list[str], paths_by_source: dict[str, list[tuple[str, str]]], space: str) -> bool:
     if not source_ids or any(source_id not in paths_by_source for source_id in source_ids):
         return False
     for source_id in source_ids:
         readable = False
-        for relative in paths_by_source[source_id]:
+        for row_space, relative in paths_by_source[source_id]:
+            if row_space != space:
+                continue
             expected = f"10_raw/{space}/{source_id}/"
             if not str(relative).replace("\\", "/").startswith(expected):
                 continue
@@ -329,13 +331,13 @@ def _short(value: object) -> str | None:
 
 def _pending_jobs(queue: DiskQueue | None, spaces: tuple[str, ...], question: str) -> dict[str, object]:
     if queue is None:
-        return {"scope": "selected_spaces", "jobs": [], "total": 0, "shown": 0, "truncated": False}
+        return {"scope": "selected_spaces", "jobs": [], "total": 0, "shown": 0, "truncated": False, "related_total": 0, "related_shown": 0, "unknown_total": 0, "unknown_shown": 0}
     jobs: list[dict[str, object]] = []
     unknown_space = False
     try:
         candidates = queue.iter_jobs()
     except (OSError, ValueError):
-        return {"scope": "all-active", "jobs": [], "total": 0, "shown": 0, "truncated": True, "error": "queue_unavailable"}
+        return {"scope": "all-active", "jobs": [], "total": 0, "shown": 0, "truncated": True, "related_total": 0, "related_shown": 0, "unknown_total": 0, "unknown_shown": 0, "error": "queue_unavailable"}
     for job in candidates:
         source_metadata = job.metadata.get("source")
         source_values = source_metadata if isinstance(source_metadata, dict) else {}
