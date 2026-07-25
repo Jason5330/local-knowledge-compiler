@@ -9,7 +9,8 @@ from pathlib import Path
 import shutil
 import stat
 import tempfile
-from typing import Protocol
+import time
+from typing import Callable, Protocol
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,14 @@ class Extraction:
 
 class ExtractionError(RuntimeError):
     """A supported local document could not safely be read."""
+
+
+class SnapshotCleanupError(RuntimeError):
+    """A private parser snapshot could not be removed after use."""
+
+    def __init__(self, snapshot_directory: Path) -> None:
+        self.snapshot_directory = snapshot_directory
+        super().__init__(f"failed to remove extraction snapshot: {snapshot_directory}")
 
 
 class Extractor(Protocol):
@@ -181,22 +190,60 @@ def _open_windows_source(candidate: Path) -> tuple[int, list[int]]:
         raise
 
 
-@contextmanager
-def snapshot_file(path: Path):
-    """Copy a pinned, regular local source to a private immutable parser input."""
+def _open_safe_source(path: Path) -> tuple[Path, int, list[int], Callable[[list[int]], None]]:
     candidate = Path(os.path.abspath(os.fspath(path)))
     try:
         if os.name == "nt":
             source_fd, directory_handles = _open_windows_source(candidate)
-            close_directory = _close_windows_handles
-        else:
-            source_fd, directory_handles = _open_posix_source(candidate)
-            close_directory = _close_posix_fds
+            return candidate, source_fd, directory_handles, _close_windows_handles
+        source_fd, directory_handles = _open_posix_source(candidate)
+        return candidate, source_fd, directory_handles, _close_posix_fds
     except ValueError:
         raise
     except OSError as exc:
         raise ValueError(f"extractor input must be a safe existing regular file: {candidate}") from exc
 
+
+def _close_source(
+    source_fd: int,
+    directory_handles: list[int],
+    close_directory: Callable[[list[int]], None],
+) -> None:
+    try:
+        os.close(source_fd)
+    finally:
+        close_directory(directory_handles)
+
+
+def validate_regular_file(path: Path) -> None:
+    """Safely validate an unhandled file without copying its contents."""
+    _, source_fd, directory_handles, close_directory = _open_safe_source(path)
+    _close_source(source_fd, directory_handles, close_directory)
+
+
+def _cleanup_snapshot_directory(snapshot_directory: Path) -> None:
+    """Remove only this extraction's private temporary directory, or fail loudly."""
+    failure: OSError | None = None
+    for attempt in range(3):
+        try:
+            shutil.rmtree(snapshot_directory)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            failure = exc
+            if not snapshot_directory.exists():
+                return
+            if attempt < 2:
+                time.sleep(0.02)
+    assert failure is not None
+    raise SnapshotCleanupError(snapshot_directory) from failure
+
+
+@contextmanager
+def snapshot_file(path: Path):
+    """Copy a pinned, regular local source to a private immutable parser input."""
+    candidate, source_fd, directory_handles, close_directory = _open_safe_source(path)
     snapshot_directory: Path | None = None
     destination_fd: int | None = None
     try:
@@ -217,13 +264,10 @@ def snapshot_file(path: Path):
         if destination_fd is not None:
             os.close(destination_fd)
         try:
-            os.close(source_fd)
+            _close_source(source_fd, directory_handles, close_directory)
         finally:
-            try:
-                close_directory(directory_handles)
-            finally:
-                if snapshot_directory is not None:
-                    shutil.rmtree(snapshot_directory, ignore_errors=True)
+            if snapshot_directory is not None:
+                _cleanup_snapshot_directory(snapshot_directory)
 
 
 def _close_posix_fds(file_descriptors: list[int]) -> None:
@@ -264,8 +308,8 @@ class Registry:
                 return extractor.extract(snapshot)
         from .unsupported import pending_extractor
 
-        with snapshot_file(path):
-            return pending_extractor(Path(path))
+        validate_regular_file(path)
+        return pending_extractor(Path(path))
 
 
 registry = Registry()

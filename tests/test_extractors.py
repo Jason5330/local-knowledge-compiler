@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 
 import pytest
 from docx import Document
 from openpyxl import Workbook
 
-from local_kb.extractors.base import Extraction, Fragment, Registry, registry
+from local_kb.extractors import base
+from local_kb.extractors.base import (
+    Extraction,
+    Fragment,
+    Registry,
+    SnapshotCleanupError,
+    registry,
+)
 
 
 def test_text_extractor_preserves_chinese_nonempty_line_locators(tmp_path: Path) -> None:
@@ -33,6 +41,26 @@ def test_unknown_media_is_pending_not_fabricated(tmp_path: Path) -> None:
     assert result.status == "pending_extractor"
     assert result.fragments == []
     assert result.warning == "no extractor for .mp4"
+
+
+def test_unknown_format_validates_a_large_file_without_copying_a_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "large.mp4"
+    path.write_bytes(b"x" * (2 * 1024 * 1024))
+    copied = 0
+
+    def copy_spy(fd: int, data: bytes) -> None:
+        nonlocal copied
+        copied += len(data)
+
+    monkeypatch.setattr(base, "_write_all", copy_spy)
+
+    result = registry.extract(path)
+
+    assert result.status == "pending_extractor"
+    assert result.fragments == []
+    assert copied == 0
 
 
 def test_suffix_matching_is_case_insensitive(tmp_path: Path) -> None:
@@ -244,7 +272,7 @@ def test_registry_rejects_a_file_below_a_parent_junction(tmp_path: Path) -> None
         pytest.skip("junctions are a Windows-only filesystem feature")
     outside = tmp_path / "outside"
     outside.mkdir()
-    (outside / "secret.txt").write_text("must not be read", encoding="utf-8")
+    (outside / "secret.mp4").write_text("must not be read", encoding="utf-8")
     junction = tmp_path / "linked-parent"
     created = subprocess.run(
         ["cmd.exe", "/d", "/c", "mklink /J linked-parent outside"],
@@ -256,7 +284,7 @@ def test_registry_rejects_a_file_below_a_parent_junction(tmp_path: Path) -> None
     assert created.returncode == 0, created.stderr
 
     with pytest.raises(ValueError, match="reparse"):
-        registry.extract(junction / "secret.txt")
+        registry.extract(junction / "secret.mp4")
 
 
 def test_registry_extracts_a_stable_snapshot_not_a_path_reopened_after_dispatch(
@@ -346,3 +374,29 @@ def test_registry_removes_snapshot_after_success_and_parser_failure(tmp_path: Pa
         failing.extract(failing_source)
     assert not seen_paths[1].exists()
     assert not seen_paths[1].parent.exists()
+
+
+def test_registry_raises_if_a_parser_leaves_its_snapshot_open(tmp_path: Path) -> None:
+    source = tmp_path / "held.open"
+    source.write_text("content", encoding="utf-8")
+    held = None
+
+    class HandleHoldingExtractor:
+        suffixes = {".open"}
+
+        def extract(self, path: Path) -> Extraction:
+            nonlocal held
+            held = path.open("rb")
+            return Extraction("extracted", [Fragment("snapshot", "content")])
+
+    isolated = Registry()
+    isolated.register(HandleHoldingExtractor())
+
+    with pytest.raises(SnapshotCleanupError) as error:
+        isolated.extract(source)
+
+    assert error.value.snapshot_directory.exists()
+    assert held is not None
+    held.close()
+    shutil.rmtree(error.value.snapshot_directory)
+    assert not error.value.snapshot_directory.exists()
