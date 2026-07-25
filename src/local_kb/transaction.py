@@ -122,6 +122,15 @@ def _recover_journal(vault: Path, journal: Path) -> None:
                 raise ConflictError(f"unsafe recovery target: {relative}")
         new_path = journal / Path(*PurePosixPath(new_rel).parts)
         backup = journal / Path(*PurePosixPath(backup_rel).parts)
+        if manifest["state"] == "committed":
+            expected = item.get("new_fingerprint")
+            if not target.exists() or not isinstance(expected, dict):
+                raise ConflictError(f"committed live target missing: {relative}")
+            actual = _fingerprint(target)
+            if actual["sha256"] != expected.get("sha256") or actual["size"] != expected.get("size"):
+                raise ConflictError(f"committed live target changed: {relative}")
+            validated.append((item, target, new_path, backup))
+            continue
         if not new_path.exists():
             raise RuntimeError("corrupt transaction journal new file")
         for candidate, expected, links in ((new_path, item.get("new_fingerprint"), {1, 2}),
@@ -141,6 +150,18 @@ def _recover_journal(vault: Path, journal: Path) -> None:
         if (str(pure_dir) != relative or pure_dir.is_absolute() or ".." in pure_dir.parts
                 or pure_dir.parts[0] not in {"20_wiki", "30_answers", "40_index", "90_logs"}):
             raise RuntimeError("corrupt transaction created dirs")
+    if manifest["state"] == "committed":
+        cleanup_error: OSError | None = None
+        for _ in range(2):
+            try:
+                shutil.rmtree(journal)
+                cleanup_error = None
+                break
+            except OSError as exc:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            raise cleanup_error
+        return
     if manifest["state"] == "prepared":
         for item, target, new_path, backup in reversed(validated):
             if backup.exists():

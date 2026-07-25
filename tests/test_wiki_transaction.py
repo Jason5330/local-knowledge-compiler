@@ -141,6 +141,39 @@ def test_committed_cleanup_failure_is_success_and_next_recovery_cleans(vault: Pa
     assert not list((vault / ".kb/staging").iterdir())
 
 
+def test_committed_partial_cleanup_recovers_from_live_evidence(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tx = ChangeTransaction(vault)
+    tx.stage("20_wiki/page.md", "new")
+    real_rmtree = __import__("local_kb.transaction", fromlist=["shutil"]).shutil.rmtree
+    failures = 0
+    def partial_then_fail(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal failures
+        failures += 1
+        if failures <= 2:
+            (Path(path) / "new/0.new").unlink(missing_ok=True)
+            raise OSError("partial cleanup")
+        real_rmtree(path, *args, **kwargs)
+    monkeypatch.setattr("local_kb.transaction.shutil.rmtree", partial_then_fail)
+    tx.publish(lambda _: None)
+    assert tx.cleanup_warning and (vault / "20_wiki/page.md").read_text(encoding="utf-8") == "new"
+    recover_pending_transactions(vault)
+    assert not list((vault / ".kb/staging").iterdir())
+    followup = ChangeTransaction(vault)
+    followup.stage("20_wiki/next.md", "next")
+    followup.publish(lambda _: None)
+
+
+def test_committed_partial_journal_rejects_changed_live(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tx = ChangeTransaction(vault)
+    tx.stage("20_wiki/page.md", "new")
+    monkeypatch.setattr("local_kb.transaction.shutil.rmtree", lambda *a, **k: (_ for _ in ()).throw(OSError("blocked")))
+    tx.publish(lambda _: None)
+    (vault / "20_wiki/page.md").write_text("foreign", encoding="utf-8")
+    with pytest.raises(Exception, match="committed live target changed"):
+        recover_pending_transactions(vault)
+    assert tx.stage_root.exists()
+
+
 def test_publish_rolls_back_existing_and_new_files_on_replace_failure(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     original = vault / "20_wiki" / "old.md"
     original.write_text("old", encoding="utf-8")
