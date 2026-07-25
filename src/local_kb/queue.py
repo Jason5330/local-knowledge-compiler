@@ -26,10 +26,164 @@ _JOB_STATES = frozenset(get_args(JobState))
 MAX_JOB_BYTES = 4 * 1024 * 1024
 MAX_QUEUE_BATCH_BYTES = 64 * 1024 * 1024
 DEFAULT_QUEUE_BATCH_BYTES = 16 * 1024 * 1024
+_WRITER_LOCK_FORMAT = "local-kb-writer-lock-v1"
+_MAX_WRITER_LOCK_BYTES = 4096
 
 
 class _BatchBudgetExceeded(Exception):
     pass
+
+
+class WriterLock:
+    """Kernel-backed single-writer lock with a persistent diagnostic record.
+
+    The pathname is never deleted on release.  This avoids stale-lock recovery
+    races entirely: the kernel lock is authoritative, while the JSON record is
+    only an owner diagnostic that is refreshed after each successful acquire.
+    """
+
+    def __init__(self, path: Path | str, timeout: float = 30) -> None:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout < 0
+            or timeout > 3600
+        ):
+            raise ValueError("timeout must be between 0 and 3600 seconds")
+        self.path = Path(os.path.abspath(os.fspath(path)))
+        if self.path.name in {"", ".", ".."}:
+            raise ValueError("writer lock path is unsafe")
+        self.timeout = float(timeout)
+        self.handle: int | None = None
+        self._root: DiskQueue | None = None
+        self._token: str | None = None
+
+    def __enter__(self) -> "WriterLock":
+        deadline = time.monotonic() + self.timeout
+        root = DiskQueue(self.path.parent)
+        self._root = root
+        created = False
+        try:
+            while True:
+                flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+                try:
+                    descriptor = root._open_entry(
+                        self.path.name,
+                        flags | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                    )
+                    created = True
+                except FileExistsError:
+                    descriptor = root._open_entry(
+                        self.path.name,
+                        flags | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                    created = False
+                if self._try_lock(descriptor):
+                    self.handle = descriptor
+                    break
+                os.close(descriptor)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("writer lock unavailable")
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+            if not created:
+                existing = self._read_record(self.handle)
+                if existing.get("format") != _WRITER_LOCK_FORMAT:
+                    raise ValueError("writer lock is not a local knowledge lock")
+            self._token = uuid4().hex
+            record = {
+                "format": _WRITER_LOCK_FORMAT,
+                "pid": os.getpid(),
+                "token": self._token,
+            }
+            encoded = _bounded_lock_json(record)
+            os.lseek(self.handle, 0, os.SEEK_SET)
+            os.ftruncate(self.handle, 0)
+            offset = 0
+            while offset < len(encoded):
+                offset += os.write(self.handle, encoded[offset:])
+            os.fsync(self.handle)
+            root._sync_directory()
+            return self
+        except BaseException:
+            self._release()
+            raise
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._release()
+
+    @staticmethod
+    def _try_lock(descriptor: int) -> bool:
+        if os.name == "nt":
+            import msvcrt
+
+            # Lock a byte beyond the bounded JSON record so diagnostics remain
+            # readable while another process owns the writer lock.
+            os.lseek(descriptor, _MAX_WRITER_LOCK_BYTES, os.SEEK_SET)
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                return False
+        import fcntl
+
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+
+    @staticmethod
+    def _read_record(descriptor: int) -> dict[str, object]:
+        size = os.fstat(descriptor).st_size
+        if size < 1 or size > _MAX_WRITER_LOCK_BYTES:
+            raise ValueError("writer lock is not a local knowledge lock")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        encoded = DiskQueue._read_descriptor(descriptor, _MAX_WRITER_LOCK_BYTES + 1)
+        try:
+            value = json.loads(encoded.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("writer lock is not a local knowledge lock") from error
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"format", "pid", "token"}
+            or value.get("format") != _WRITER_LOCK_FORMAT
+            or isinstance(value.get("pid"), bool)
+            or not isinstance(value.get("pid"), int)
+            or not isinstance(value.get("token"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", value["token"])
+        ):
+            raise ValueError("writer lock is not a local knowledge lock")
+        return value
+
+    def _release(self) -> None:
+        descriptor, self.handle = self.handle, None
+        if descriptor is not None:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(descriptor, _MAX_WRITER_LOCK_BYTES, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+        root, self._root = self._root, None
+        if root is not None:
+            root.close()
+
+
+def _bounded_lock_json(value: object) -> bytes:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    if len(encoded) > _MAX_WRITER_LOCK_BYTES:
+        raise ValueError("writer lock record exceeds size limit")
+    return encoded
 
 
 def _bounded_json(value: object) -> str:

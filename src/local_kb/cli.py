@@ -10,9 +10,10 @@ from typing import Sequence
 from .catalog import Catalog
 from .config import Config
 from .finalize import finalize_and_enqueue, read_json_document
+from .health import lint, rebuild_catalog
 from .ingest import IngestService
 from .paths import VaultPaths
-from .queue import DiskQueue
+from .queue import DiskQueue, WriterLock
 from .query import QueryService, write_packet
 from .search import ranked_search
 from .watcher import StableTracker
@@ -97,6 +98,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     finalize_parser.add_argument("--vault", type=Path, default=Path.cwd())
     finalize_parser.add_argument("--packet", type=Path, required=True)
     finalize_parser.add_argument("--answer", type=Path, required=True)
+    lint_parser = subcommands.add_parser("lint", help="inspect vault health without changing it")
+    lint_parser.add_argument("--vault", type=Path, default=Path.cwd())
+    rebuild_parser = subcommands.add_parser("rebuild", help="rebuild the search catalog from cache")
+    rebuild_parser.add_argument("--vault", type=Path, default=Path.cwd())
     arguments = parser.parse_args(argv)
 
     if arguments.command == "init":
@@ -106,6 +111,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     paths = VaultPaths(arguments.vault.resolve())
     try:
+        if arguments.command == "lint":
+            import json
+
+            print(json.dumps(lint(paths), ensure_ascii=False, sort_keys=True))
+            return 0
+        if arguments.command == "rebuild":
+            print(f"Indexed sources: {rebuild_catalog(paths)}")
+            return 0
         config = Config.load(paths.config)
         if arguments.command == "prepare":
             catalog = Catalog(paths.index / "catalog.sqlite3")
@@ -117,23 +130,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(write_packet(paths, packet, arguments.output))
             return 0
         if arguments.command == "finalize":
-            queue = DiskQueue(paths.queue, config.max_retries)
-            result = finalize_and_enqueue(
-                paths,
-                queue,
-                read_json_document(arguments.packet),
-                read_json_document(arguments.answer),
-            )
+            with WriterLock(paths.runtime / "write.lock", timeout=0):
+                queue = DiskQueue(paths.queue, config.max_retries)
+                result = finalize_and_enqueue(
+                    paths,
+                    queue,
+                    read_json_document(arguments.packet),
+                    read_json_document(arguments.answer),
+                )
             print(f"Saved answer: {result.path}")
             print(f"Queued derived update: {result.job_id}")
             return 0
         if arguments.command == "ingest-once":
-            queue = DiskQueue(paths.queue, config.max_retries)
-            service = IngestService(paths, queue, Catalog(paths.index / "catalog.sqlite3"))
-            source_path = arguments.path.resolve(strict=True)
-            service._hash_pinned_regular(source_path)
-            job = queue.enqueue(source_path)
-            source = service.process(job.job_id, space=arguments.space)
+            with WriterLock(paths.runtime / "write.lock", timeout=0):
+                queue = DiskQueue(paths.queue, config.max_retries)
+                service = IngestService(paths, queue, Catalog(paths.index / "catalog.sqlite3"))
+                source_path = arguments.path.resolve(strict=True)
+                service._hash_pinned_regular(source_path)
+                job = queue.enqueue(source_path)
+                source = service.process(job.job_id, space=arguments.space)
             print(f"{source.version_id} {source.status}")
             return 0
         tracker = StableTracker(config.stable_seconds, trusted_root=paths.inbox)
