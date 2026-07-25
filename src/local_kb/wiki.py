@@ -69,7 +69,7 @@ def _validate_body(value: str, label: str) -> None:
     if (not isinstance(value, str) or not value.strip()
             or any((ord(char) < 32 and char not in {"\t", "\n"}) or ord(char) == 127 for char in value)):
         raise ValueError(f"{label} must be non-empty safe text")
-    if re.search(r"<h2\b[^>]*>.*?</h2\s*>", value, re.IGNORECASE | re.DOTALL):
+    if re.search(r"<\s*/?\s*h2\b", value, re.IGNORECASE):
         raise ValueError(f"{label} may not contain a reserved H2 heading")
     lines = value.splitlines()
     for index, line in enumerate(lines):

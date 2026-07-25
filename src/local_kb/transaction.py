@@ -142,13 +142,7 @@ def _recover_journal(vault: Path, journal: Path) -> None:
                     raise RuntimeError("corrupt transaction journal file")
         requires_owned_target = backup.exists() or not bool(item["existed"])
         if requires_owned_target and target.exists():
-            same_binding = os.path.samefile(target, new_path)
-            target_fp = _fingerprint(target)
-            expected_fp = item.get("new_fingerprint")
-            same_bytes = (isinstance(expected_fp, dict)
-                          and target_fp["sha256"] == expected_fp.get("sha256")
-                          and target_fp["size"] == expected_fp.get("size"))
-            if not (same_binding or same_bytes):
+            if not new_path.exists() or not os.path.samefile(target, new_path):
                 raise ConflictError(f"recovery target conflict: {item['relative']}")
         validated.append((item, target, new_path, backup))
     created = manifest.get("created_live_dirs", [])

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from local_kb.transaction import ChangeTransaction, RollbackError, recover_pending_transactions
+from local_kb.transaction import ChangeTransaction, ConflictError, RollbackError, recover_pending_transactions
 from local_kb.wiki import WikiPage, render_page, validate_page
 
 
@@ -76,6 +76,13 @@ def test_body_rejects_every_h2_variant(body: str) -> None:
 
 def test_body_keeps_regular_markdown_and_h3() -> None:
     render_page(page(current_state="**bold** and [link](https://example.test)\n\n### H3 is fine"))
+    render_page(page(current_state="<h3>fine</h3> and <span>fine</span>"))
+
+
+@pytest.mark.parametrize("body", ["<H2 class=x>", "prefix </ h2 > suffix", "<\n h2 attr=x>"])
+def test_body_rejects_any_raw_html_h2_token(body: str) -> None:
+    with pytest.raises(ValueError, match="H2"):
+        render_page(page(current_state=body))
 
 
 @pytest.mark.parametrize("changes", [
@@ -214,6 +221,24 @@ def test_publish_rolls_back_existing_and_new_files_on_replace_failure(vault: Pat
     assert original.read_text(encoding="utf-8") == "old"
     assert not (vault / "30_answers" / "new.md").exists()
     assert not list(vault.rglob("*.new"))
+
+
+def test_prepared_recovery_rejects_independent_same_bytes_target(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = vault / "20_wiki/page.md"
+    target.write_text("old", encoding="utf-8")
+    tx = ChangeTransaction(vault)
+    tx.stage("20_wiki/page.md", "new")
+    def copy_but_not_link(source: Path, destination: Path) -> None:
+        destination.write_bytes(Path(source).read_bytes())
+        raise FileExistsError("foreign same bytes")
+    monkeypatch.setattr("local_kb.transaction.os.link", copy_but_not_link)
+    with pytest.raises(ConflictError):
+        tx.publish(lambda _: None)
+    assert target.read_text(encoding="utf-8") == "new"
+    assert tx.stage_root.exists()
+    target.unlink()
+    recover_pending_transactions(vault)
+    assert target.read_text(encoding="utf-8") == "old"
 
 
 def test_publish_rolls_back_a_replace_when_its_fsync_fails(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:
