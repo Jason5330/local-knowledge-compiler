@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 import re
 from typing import Iterable
@@ -28,18 +28,28 @@ class WikiPage:
     page_type: str
     space: str
     confidence: str
-    source_ids: tuple[str, ...]
+    source_ids: tuple[str, ...] | list[str]
     current_state: str
-    conflicts: tuple[str, ...]
+    conflicts: str
     timeline_entry: str
-    aliases: tuple[str, ...] = ()
+    aliases: tuple[str, ...] | list[str] = ()
     status: str = "active"
-    updated_at: str = ""
-    related: tuple[str, ...] = ()
+    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    related: tuple[str, ...] | list[str] = ()
+
+    def __post_init__(self) -> None:
+        for name in ("source_ids", "aliases", "related"):
+            value = getattr(self, name)
+            if isinstance(value, list):
+                object.__setattr__(self, name, tuple(value))
+        for name in ("current_state", "conflicts", "timeline_entry"):
+            value = getattr(self, name)
+            if isinstance(value, str):
+                object.__setattr__(self, name, value.replace("\r\n", "\n").replace("\r", "\n"))
 
 
-def _has_control(value: str) -> bool:
-    return any(ord(char) < 32 or ord(char) == 127 for char in value)
+def _has_control(value: str, *, allow_tab: bool = False) -> bool:
+    return any((ord(char) < 32 and not (allow_tab and char == "\t")) or ord(char) == 127 for char in value)
 
 
 def _as_strings(value: object, label: str) -> tuple[str, ...]:
@@ -56,7 +66,9 @@ def _validate_line_safe(value: str, label: str) -> None:
 
 
 def _validate_body(value: str, label: str) -> None:
-    _validate_line_safe(value, label)
+    if (not isinstance(value, str) or not value.strip()
+            or any((ord(char) < 32 and char not in {"\t", "\n"}) or ord(char) == 127 for char in value)):
+        raise ValueError(f"{label} must be non-empty safe text")
     for line in value.splitlines():
         if line.strip() in {f"## {heading}" for heading in _HEADINGS}:
             raise ValueError(f"{label} may not inject a reserved section heading")
@@ -99,13 +111,14 @@ def validate_page(page: WikiPage) -> None:
 
     aliases = _as_strings(page.aliases, "aliases")
     related = _as_strings(page.related, "related")
-    conflicts = _as_strings(page.conflicts, "conflicts")
-    for group, label in ((aliases, "aliases"), (related, "related"), (conflicts, "conflicts")):
+    for group, label in ((aliases, "aliases"), (related, "related")):
         if len(set(group)) != len(group):
             raise ValueError(f"{label} must be unique")
         for item in group:
             _validate_line_safe(item, label)
     _validate_body(page.current_state, "current_state")
+    if not isinstance(page.conflicts, str) or _has_control(page.conflicts, allow_tab=True):
+        raise ValueError("conflicts must be safe text")
     _validate_body(page.timeline_entry, "timeline_entry")
 
 
@@ -144,7 +157,7 @@ def render_page(page: WikiPage) -> str:
     sections = [
         "## Current State", page.current_state,
         "## Evidence", _list_or_none(page.source_ids),
-        "## Conflicts and Gaps", _list_or_none(page.conflicts),
+        "## Conflicts and Gaps", page.conflicts or "無",
         "## Related", _list_or_none(page.related),
         "## Timeline", page.timeline_entry,
     ]

@@ -25,6 +25,10 @@ _LOCK_GUARD = threading.Lock()
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
 
 
+class RollbackError(RuntimeError):
+    """Rollback could not completely restore an externally visible transaction."""
+
+
 def _is_reparse(path: Path) -> bool:
     try:
         attrs = path.lstat().st_file_attributes
@@ -59,6 +63,8 @@ class ChangeTransaction:
         self.transaction_id = uuid.uuid4().hex
         self.stage_root = self.vault / ".kb" / "staging" / self.transaction_id
         self._staged: dict[str, Path] = {}
+        self._created_live_dirs: list[Path] = []
+        self.cleanup_warning: str | None = None
 
     def _relative(self, relative_path: str | Path) -> str:
         raw = str(relative_path)
@@ -98,12 +104,25 @@ class ChangeTransaction:
                     raise ValueError("path parent is a symlink, reparse point, or non-directory")
             elif create:
                 cursor.mkdir()
+                if not str(cursor).startswith(str(self.stage_root)):
+                    self._created_live_dirs.append(cursor)
         # Resolve is a final defense against a directory unexpectedly redirecting us.
         parent = path.parent.resolve(strict=False)
         try:
             parent.relative_to(self.vault.resolve())
         except ValueError as exc:
             raise ValueError("path escapes vault") from exc
+
+    def _case_safe(self, path: Path) -> None:
+        """Reject a spelling that aliases a sibling on case-insensitive vaults."""
+        cursor = self.vault
+        relative = path.relative_to(self.vault)
+        for part in relative.parts:
+            if cursor.exists():
+                matches = [entry.name for entry in cursor.iterdir() if entry.name.casefold() == part.casefold()]
+                if matches and part not in matches:
+                    raise ValueError("path case aliases an existing live entry")
+            cursor = cursor / part
 
     def _atomic_write(self, destination: Path, content: str) -> None:
         self._safe_parents(destination, create=True)
@@ -147,12 +166,25 @@ class ChangeTransaction:
         with _LOCK_GUARD:
             thread_lock = _THREAD_LOCKS.setdefault(lock_key, threading.Lock())
         with thread_lock:
-            with lock_path.open("a+b") as handle:
+            created = False
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(lock_path, flags, 0o600)
+                created = True
+            except FileExistsError:
+                info = lock_path.lstat()
+                if _is_reparse(lock_path) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError("write.lock must be a single-link regular file")
+                fd = os.open(lock_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "r+b", closefd=True) as handle:
+                if created:
+                    handle.write(b"0")
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 if os.name == "nt":
                     import msvcrt
                     handle.seek(0)
-                    handle.write(b"0")
-                    handle.flush()
                     msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
                     unlock = lambda: msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
@@ -199,6 +231,7 @@ class ChangeTransaction:
             try:
                 for relative, staged in entries:
                     target = self.vault / Path(*PurePosixPath(relative).parts)
+                    self._case_safe(target)
                     self._safe_parents(target, create=False)
                     old_stat = target.stat() if target.exists() else None
                     old_bytes = target.read_bytes() if old_stat is not None else None
@@ -213,15 +246,25 @@ class ChangeTransaction:
                         published.append((target, old_bytes, old_stat))
                         _fsync_file(target)
                         _fsync_dir(target.parent)
-                except BaseException:
+                except BaseException as original:
+                    rollback_errors: list[BaseException] = []
                     for target, old_bytes, old_stat in reversed(published):
-                        if old_bytes is None:
+                        for attempt in range(2):
                             try:
-                                target.unlink()
-                            except FileNotFoundError:
-                                pass
-                        else:
-                            self._restore(target, old_bytes, old_stat)
+                                if old_bytes is None:
+                                    try:
+                                        target.unlink()
+                                    except FileNotFoundError:
+                                        pass
+                                else:
+                                    self._restore(target, old_bytes, old_stat)
+                                break
+                            except BaseException as exc:
+                                if attempt:
+                                    rollback_errors.append(exc)
+                    self._cleanup_created_dirs()
+                    if rollback_errors:
+                        original.add_note("rollback incomplete: " + "; ".join(str(error) for error in rollback_errors))
                     raise
             finally:
                 for _, temporary, _, _ in prepared:
@@ -229,8 +272,20 @@ class ChangeTransaction:
                         temporary.unlink()
                     except FileNotFoundError:
                         pass
-            shutil.rmtree(self.stage_root, ignore_errors=False)
+            try:
+                shutil.rmtree(self.stage_root, ignore_errors=False)
+            except OSError as exc:
+                self.cleanup_warning = f"published; stale staging retained: {exc}"
             self._staged.clear()
+
+    def _cleanup_created_dirs(self) -> None:
+        for directory in reversed(self._created_live_dirs):
+            try:
+                if directory.exists() and not _is_reparse(directory):
+                    directory.rmdir()
+            except OSError:
+                pass
+        self._created_live_dirs.clear()
 
     def _restore(self, target: Path, data: bytes, metadata: os.stat_result | None) -> None:
         temporary = self._write_live_temp_from_bytes(target, data)
@@ -260,22 +315,30 @@ class ChangeTransaction:
                                     text=True, capture_output=True, check=False).returncode == 0
             if not inside:
                 subprocess.run(["git", "init"], cwd=self.vault, text=True, capture_output=True, check=True)
-            status = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--", *_MANAGED_ROOTS], cwd=self.vault,
-                                    text=False, capture_output=True, check=True)
-            records = [record for record in status.stdout.split(b"\0") if record]
-            paths = [record[3:].decode("utf-8", "surrogateescape") for record in records if len(record) >= 4]
-            if not paths:
+            pathspecs = [path for path in _MANAGED_ROOTS if (self.vault / path).exists()]
+            tracked = subprocess.run(["git", "ls-files", "-z", "--", *_MANAGED_ROOTS], cwd=self.vault,
+                                     text=False, capture_output=True, check=True).stdout.split(b"\0")
+            pathspecs.extend(path.decode("utf-8", "surrogateescape") for path in tracked if path)
+            pathspecs = list(dict.fromkeys(pathspecs))
+            if not pathspecs:
                 return False
+            subprocess.run(["git", "add", "-A", "--", *pathspecs], cwd=self.vault,
+                           text=True, capture_output=True, check=True)
+            cached = subprocess.run(["git", "diff", "--cached", "--quiet", "--", *pathspecs], cwd=self.vault,
+                                    text=True, capture_output=True, check=False)
+            if cached.returncode == 0:
+                return False
+            if cached.returncode != 1:
+                raise RuntimeError(cached.stderr or "unable to inspect managed Git changes")
+            changed = subprocess.run(["git", "diff", "--cached", "--name-only", "-z", "--", *pathspecs], cwd=self.vault,
+                                     text=False, capture_output=True, check=True).stdout.split(b"\0")
+            commit_paths = [path.decode("utf-8", "surrogateescape") for path in changed if path]
             # --only records the working-tree content, but Git requires untracked
             # pathspecs to be known to its index first.  Intent-to-add does not
             # stage their bytes and leaves unrelated user staging untouched.
-            new_paths = [path for path in paths if (self.vault / path).exists()]
-            if new_paths:
-                subprocess.run(["git", "add", "--intent-to-add", "--", *new_paths], cwd=self.vault,
-                               text=True, capture_output=True, check=True)
             command = [
                 "git", "-c", "user.name=Local Knowledge Compiler", "-c", "user.email=kb@local",
-                "-c", "commit.gpgsign=false", "commit", "--only", "-m", message, "--", *paths,
+                "-c", "commit.gpgsign=false", "commit", "--only", "-m", message, "--", *commit_paths,
             ]
             subprocess.run(command, cwd=self.vault, text=True, capture_output=True, check=True,
                            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})

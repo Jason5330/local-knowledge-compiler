@@ -15,7 +15,7 @@ from local_kb.wiki import WikiPage, render_page, validate_page
 def page(**changes: object) -> WikiPage:
     base = WikiPage(
         "wiki-1", "A safe title", "concept", "personal", "high", ("source-1",),
-        "The current, supported conclusion.", (), "2026-07-25: page created.",
+        "The current, supported conclusion.", "", "2026-07-25: page created.",
         aliases=("Safe alias",), updated_at="2026-07-25T12:30:00+00:00", related=("wiki-2",),
     )
     return replace(base, **changes)
@@ -32,6 +32,17 @@ def test_valid_page_renders_deterministic_safe_schema() -> None:
     assert "## Conflicts and Gaps\n\n無\n" in rendered
     assert "## Related\n\n- wiki-2\n" in rendered
     assert rendered.endswith("## Timeline\n\n2026-07-25: page created.\n")
+
+
+def test_legacy_nine_positional_page_normalizes_lists_and_multiline_bodies() -> None:
+    legacy = WikiPage("wiki-legacy", "Legacy", "topic", "work", "medium", ["source-1"],
+                      "First line\r\nSecond line\rThird line", "No conflicts", "One\rTwo")
+    assert isinstance(legacy.source_ids, tuple)
+    assert legacy.updated_at
+    rendered = render_page(legacy)
+    assert "First line\nSecond line\nThird line" in rendered
+    assert "## Conflicts and Gaps\n\nNo conflicts" in rendered
+    assert "\r" not in rendered
 
 
 @pytest.mark.parametrize("changes", [
@@ -68,6 +79,19 @@ def test_stage_rejects_unsafe_or_unmanaged_paths(vault: Path) -> None:
     tx.stage("20_wiki/a.md", "x")
     with pytest.raises(ValueError, match="duplicate"):
         tx.stage("20_wiki/A.md", "y")
+
+
+def test_publish_rejects_live_case_aliases(vault: Path) -> None:
+    (vault / "20_wiki" / "a.md").write_text("old", encoding="utf-8")
+    tx = ChangeTransaction(vault)
+    tx.stage("20_wiki/A.md", "new")
+    with pytest.raises(ValueError, match="case"):
+        tx.publish(lambda _: None)
+    (vault / "20_wiki" / "Folder").mkdir()
+    other = ChangeTransaction(vault)
+    other.stage("20_wiki/folder/page.md", "new")
+    with pytest.raises(ValueError, match="case"):
+        other.publish(lambda _: None)
 
 
 def test_publish_calls_validator_before_any_live_change(vault: Path) -> None:
