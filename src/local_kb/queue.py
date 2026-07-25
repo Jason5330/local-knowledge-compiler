@@ -23,6 +23,10 @@ MAX_QUEUE_BATCH_BYTES = 64 * 1024 * 1024
 DEFAULT_QUEUE_BATCH_BYTES = 16 * 1024 * 1024
 
 
+class _BatchBudgetExceeded(Exception):
+    pass
+
+
 def _bounded_json(value: object) -> str:
     chunks=[]; size=0
     encoder=json.JSONEncoder(ensure_ascii=False,sort_keys=True,separators=(",", ":"),allow_nan=False)
@@ -91,27 +95,25 @@ class DiskQueue:
             raise ValueError("max_bytes must be a positive bounded integer")
         with self._locked():
             paths: list[Path] = []
-            scanned=0; selected_bytes=0
+            scanned=0; scan_truncated=False
             with os.scandir(self.root) as entries:
                 for entry in entries:
                     scanned += 1
                     if scanned > max_jobs + 1:
-                        return [self._read(path) for path in sorted(paths)], True
+                        scan_truncated=True; break
                     if not entry.name.endswith(".json"):
                         continue
-                    try:
-                        info=entry.stat(follow_symlinks=False)
-                    except OSError:
-                        return [self._read(path) for path in sorted(paths)], True
-                    if not stat.S_ISREG(info.st_mode) or entry.is_symlink():
-                        return [self._read(path) for path in sorted(paths)], True
-                    if selected_bytes + info.st_size > max_bytes:
-                        return [self._read(path) for path in sorted(paths)], True
                     if len(paths) >= max_jobs:
-                        return [self._read(path) for path in sorted(paths)], True
+                        scan_truncated=True; break
                     paths.append(Path(entry.path))
-                    selected_bytes += info.st_size
-            return [self._read(path) for path in sorted(paths)], False
+            jobs: list[Job]=[]; used=0
+            for path in sorted(paths):
+                try:
+                    job, actual_size=self._read_pinned(path,max_bytes-used)
+                except _BatchBudgetExceeded:
+                    return jobs, True
+                jobs.append(job); used += actual_size
+            return jobs, scan_truncated
 
     def active_for_source(self, source_path: Path | str) -> Job | None:
         wanted = os.path.normcase(os.path.abspath(os.fspath(source_path)))
@@ -183,6 +185,11 @@ class DiskQueue:
             raise ValueError("job_id must be a canonical safe identifier")
 
     def _read(self, path: Path) -> Job:
+        return self._read_pinned(path, MAX_JOB_BYTES)[0]
+
+    def _read_pinned(self, path: Path, budget: int) -> tuple[Job, int]:
+        if budget < 1:
+            raise _BatchBudgetExceeded
         try:
             before=os.lstat(path)
             if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_size > MAX_JOB_BYTES:
@@ -192,6 +199,8 @@ class DiskQueue:
                 opened=os.fstat(fd)
                 if (opened.st_dev,opened.st_ino,opened.st_size)!=(before.st_dev,before.st_ino,before.st_size) or not stat.S_ISREG(opened.st_mode):
                     raise ValueError(f"corrupt job JSON: {path.name}")
+                if opened.st_size > budget:
+                    raise _BatchBudgetExceeded
                 chunks=[]; remaining=MAX_JOB_BYTES+1
                 while remaining and (chunk:=os.read(fd,min(65536,remaining))):
                     chunks.append(chunk); remaining-=len(chunk)
@@ -215,7 +224,7 @@ class DiskQueue:
         except (TypeError, ValueError) as error:
             raise ValueError(f"corrupt job JSON: {path.name}") from error
         self._validate_job(job, path.name)
-        return self._copy(job)
+        return self._copy(job), len(encoded)
 
     def _write(self, path: Path, job: Job) -> None:
         self._validate_job(job, path.name)

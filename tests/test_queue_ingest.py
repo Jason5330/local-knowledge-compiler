@@ -125,6 +125,30 @@ def test_disk_queue_bounded_scan_stops_at_total_byte_budget(tmp_path):
     assert 0 < len(jobs) < 5
 
 
+def test_disk_queue_batch_budget_uses_pinned_size_after_atomic_replacement(tmp_path, monkeypatch):
+    import json
+    import os
+    import local_kb.queue as queue_module
+    from local_kb.queue import DiskQueue
+
+    queue=DiskQueue(tmp_path/"queue")
+    queue.enqueue("a.txt",job_id="job")
+    target=queue.root/"job.json"; replacement=queue.root/"replacement.tmp"
+    payload={"job_id":"job","source_path":"a.txt","state":"discovered","attempts":0,"error":None,"metadata":{"blob":"x"*3000}}
+    replacement.write_text(json.dumps(payload),encoding="utf-8")
+    real_scandir=os.scandir
+    class SwapAfterScan:
+        def __enter__(self): self.stream=real_scandir(queue.root); return self
+        def __iter__(self): return iter(self.stream)
+        def __exit__(self,*args): self.stream.close(); os.replace(replacement,target)
+    monkeypatch.setattr(queue_module.os,"scandir",lambda _root: SwapAfterScan())
+
+    jobs,truncated=queue.iter_jobs_bounded(10,max_bytes=1000)
+
+    assert jobs == []
+    assert truncated is True
+
+
 def test_stable_tracker_requires_two_matching_observations_and_elapsed_time(tmp_path):
     from local_kb.watcher import StableTracker
 
