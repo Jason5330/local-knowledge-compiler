@@ -151,9 +151,13 @@ def _terminate_process_tree(process: subprocess.Popen) -> None:
 
 
 def _run_bounded_process(
-    command: list[str], prompt: str, *, cwd: Path, timeout: float
+    command: list[str], prompt: str | bytes | None, *, cwd: Path, timeout: float,
+    max_output_bytes: int = MAX_OUTPUT_BYTES,
 ) -> tuple[int, bytes, bool, bool]:
     """Run with bounded combined output; return code, stdout, overflow, timeout."""
+    if (not isinstance(max_output_bytes, int) or isinstance(max_output_bytes, bool)
+            or max_output_bytes <= 0):
+        raise ValueError("max_output_bytes must be a positive integer")
     platform_options: dict[str, Any]
     if os.name == "nt":
         platform_options = {
@@ -181,7 +185,7 @@ def _run_bounded_process(
             while chunk := stream.read(64 * 1024):
                 with lock:
                     used = len(buffers["stdout"]) + len(buffers["stderr"])
-                    remaining = max(0, MAX_OUTPUT_BYTES - used)
+                    remaining = max(0, max_output_bytes - used)
                     if remaining:
                         buffers[name].extend(chunk[:remaining])
                     if len(chunk) > remaining:
@@ -192,7 +196,8 @@ def _run_bounded_process(
 
     def write_prompt() -> None:
         try:
-            process.stdin.write(prompt.encode("utf-8"))
+            input_bytes = prompt.encode("utf-8") if isinstance(prompt, str) else (prompt or b"")
+            process.stdin.write(input_bytes)
             process.stdin.flush()
         except (BrokenPipeError, OSError, ValueError):
             pass

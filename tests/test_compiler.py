@@ -1,5 +1,6 @@
 import json
 import io
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -187,6 +188,25 @@ def test_bounded_process_preserves_tail_of_near_limit_fast_output(tmp_path):
     assert len(stdout) == count + 4
     assert stdout.endswith(b"TAIL")
     assert overflowed is False
+    assert timed_out is False
+
+
+def test_bounded_process_supports_custom_limit_and_empty_stdin(tmp_path):
+    from local_kb.compiler import _run_bounded_process
+
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; assert sys.stdin.buffer.read() == b''; sys.stdout.buffer.write(b'x' * 1025)",
+    ]
+
+    returncode, stdout, overflowed, timed_out = _run_bounded_process(
+        command, None, cwd=tmp_path, timeout=5, max_output_bytes=1024,
+    )
+
+    assert isinstance(returncode, int)
+    assert stdout == b"x" * 1024
+    assert overflowed is True
     assert timed_out is False
 
 
@@ -700,8 +720,8 @@ def test_process_replays_durable_receipt_without_calling_model_after_publish_mar
     job = queue.enqueue(incoming, job_id="receipt-replay")
     original_commit = ChangeTransaction.commit_git
 
-    def commit_then_fail_marker(transaction, message):
-        committed = original_commit(transaction, message)
+    def commit_then_fail_marker(transaction, message, paths=None):
+        committed = original_commit(transaction, message, paths=paths)
         original_write = queue._write
 
         def fail_once(*_args, **_kwargs):
@@ -764,12 +784,12 @@ def test_process_reconciles_git_after_publish_succeeded_but_first_commit_failed(
     original_commit = ChangeTransaction.commit_git
     attempts = 0
 
-    def fail_first_commit(transaction, message):
+    def fail_first_commit(transaction, message, paths=None):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("simulated git failure")
-        return original_commit(transaction, message)
+        return original_commit(transaction, message, paths=paths)
 
     monkeypatch.setattr(ChangeTransaction, "commit_git", fail_first_commit)
     with pytest.raises(RuntimeError, match="simulated git failure"):
@@ -777,6 +797,15 @@ def test_process_reconciles_git_after_publish_succeeded_but_first_commit_failed(
     assert (vault.wiki / "work" / "only.md").is_file()
     assert not (vault.root / ".git").exists()
     assert list(vault.staging.iterdir()) == []
+    user_note = vault.wiki / "work" / "user-note.md"
+    staged_note = vault.wiki / "work" / "staged-note.md"
+    user_note.write_text("private untracked draft", encoding="utf-8")
+    staged_note.write_text("private staged draft", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=vault.root, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "add", "20_wiki/work/staged-note.md"],
+        cwd=vault.root, capture_output=True, check=True,
+    )
 
     service.process(job.job_id, space="work")
 
@@ -790,6 +819,17 @@ def test_process_reconciles_git_after_publish_succeeded_but_first_commit_failed(
     assert attempts == 2
     assert queue.get(job.job_id).state == "published"
     assert list(vault.staging.iterdir()) == []
+    assert subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"],
+        cwd=vault.root, text=True, capture_output=True, check=True,
+    ).stdout.splitlines() == ["20_wiki/work/only.md"]
+    assert "20_wiki/work/user-note.md" in subprocess.run(
+        ["git", "status", "--short"], cwd=vault.root, text=True, capture_output=True, check=True,
+    ).stdout
+    assert subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        cwd=vault.root, text=True, capture_output=True, check=True,
+    ).stdout.splitlines() == ["20_wiki/work/staged-note.md"]
 
 
 def test_process_does_not_complete_while_git_commit_keeps_failing(tmp_path, monkeypatch):
@@ -908,6 +948,147 @@ def test_empty_compilation_receipt_completes_without_creating_git_repository(tmp
     assert list(vault.staging.iterdir()) == []
 
 
+def test_git_receipt_verification_checks_size_before_reading_large_blob(tmp_path, monkeypatch):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path / "vault")
+    (vault.root / ".git").mkdir()
+    service = IngestService(vault, DiskQueue(vault.queue), Catalog(vault.index / "catalog.sqlite3"))
+    expected = b"small receipt page"
+    receipt = {"pages": [{
+        "path": "20_wiki/work/page.md",
+        "content": expected.decode(),
+        "sha256": hashlib.sha256(expected).hexdigest(),
+    }]}
+    commands = []
+    head = b"a" * 40 + b"\n"
+    blob = b"b" * 40 + b"\n"
+
+    def fake_bounded(command, prompt, **kwargs):
+        commands.append(command)
+        if command[1:3] == ["rev-parse", "--show-toplevel"]:
+            return 0, str(vault.root).encode() + b"\n", False, False
+        if command[1:3] == ["rev-parse", "--verify"] and command[-1] == "HEAD^{commit}":
+            return 0, head, False, False
+        if command[1:3] == ["rev-parse", "--verify"]:
+            return 0, blob, False, False
+        if command[1:3] == ["cat-file", "-t"]:
+            return 0, b"blob\n", False, False
+        if command[1:3] == ["cat-file", "-s"]:
+            return 0, b"1000000000\n", False, False
+        raise AssertionError("blob bytes must not be read after a size mismatch")
+
+    monkeypatch.setattr("local_kb.ingest._run_bounded_process", fake_bounded, raising=False)
+    with pytest.raises(RuntimeError, match="size|Git HEAD"):
+        service._verify_receipt_git_head(receipt)
+
+    assert any(command[1:3] == ["cat-file", "-s"] for command in commands)
+    assert not any(command[1:3] == ["cat-file", "blob"] for command in commands)
+
+
+def test_git_receipt_verification_fails_if_head_changes_during_bounded_read(tmp_path, monkeypatch):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path / "vault")
+    (vault.root / ".git").mkdir()
+    service = IngestService(vault, DiskQueue(vault.queue), Catalog(vault.index / "catalog.sqlite3"))
+    expected = b"stable bytes"
+    receipt = {"pages": [{
+        "path": "20_wiki/work/page.md",
+        "content": expected.decode(),
+        "sha256": hashlib.sha256(expected).hexdigest(),
+    }]}
+    head_reads = 0
+
+    def fake_bounded(command, prompt, **kwargs):
+        nonlocal head_reads
+        if command[1:3] == ["rev-parse", "--show-toplevel"]:
+            return 0, str(vault.root).encode() + b"\n", False, False
+        if command[1:3] == ["rev-parse", "--verify"] and command[-1] == "HEAD^{commit}":
+            head_reads += 1
+            value = b"a" * 40 if head_reads == 1 else b"c" * 40
+            return 0, value + b"\n", False, False
+        if command[1:3] == ["rev-parse", "--verify"]:
+            return 0, b"b" * 40 + b"\n", False, False
+        if command[1:3] == ["cat-file", "-t"]:
+            return 0, b"blob\n", False, False
+        if command[1:3] == ["cat-file", "-s"]:
+            return 0, str(len(expected)).encode() + b"\n", False, False
+        if command[1:3] == ["cat-file", "blob"]:
+            return 0, expected, False, False
+        raise AssertionError(command)
+
+    monkeypatch.setattr("local_kb.ingest._run_bounded_process", fake_bounded, raising=False)
+    with pytest.raises(RuntimeError, match="changed"):
+        service._verify_receipt_git_head(receipt)
+    assert head_reads == 2
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "overflow", "timeout"])
+def test_git_receipt_verification_fails_closed_for_bounded_git_errors(
+    tmp_path, monkeypatch, failure
+):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path / "vault")
+    (vault.root / ".git").mkdir()
+    service = IngestService(vault, DiskQueue(vault.queue), Catalog(vault.index / "catalog.sqlite3"))
+    receipt = {"pages": [{
+        "path": "20_wiki/work/page.md", "content": "x",
+        "sha256": hashlib.sha256(b"x").hexdigest(),
+    }]}
+    result = {
+        "nonzero": (1, b"", False, False),
+        "overflow": (0, b"x" * 32, True, False),
+        "timeout": (-1, b"", False, True),
+    }[failure]
+    monkeypatch.setattr(
+        "local_kb.ingest._run_bounded_process",
+        lambda *_args, **_kwargs: result,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="Git"):
+        service._verify_receipt_git_head(receipt)
+
+
+def test_git_receipt_verification_streams_exact_two_megabyte_blob(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path / "vault")
+    content = b"x" * 2_000_000
+    page = vault.wiki / "work" / "large.md"
+    page.parent.mkdir(exist_ok=True)
+    page.write_bytes(content)
+    subprocess.run(["git", "init"], cwd=vault.root, capture_output=True, check=True)
+    subprocess.run(["git", "add", "20_wiki/work/large.md"], cwd=vault.root, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@local",
+         "-c", "commit.gpgsign=false", "commit", "-m", "large"],
+        cwd=vault.root, capture_output=True, check=True,
+    )
+    service = IngestService(vault, DiskQueue(vault.queue), Catalog(vault.index / "catalog.sqlite3"))
+    receipt = {"pages": [{
+        "path": "20_wiki/work/large.md",
+        "content": content.decode(),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }]}
+
+    service._verify_receipt_git_head(receipt)
+
+
 def test_process_fails_closed_when_durable_compilation_receipt_is_tampered(tmp_path, monkeypatch):
     from local_kb.catalog import Catalog
     from local_kb.cli import build_vault
@@ -932,8 +1113,8 @@ def test_process_fails_closed_when_durable_compilation_receipt_is_tampered(tmp_p
     job = queue.enqueue(incoming, job_id="receipt-tamper")
     original_commit = ChangeTransaction.commit_git
 
-    def commit_then_fail_marker(transaction, message):
-        result = original_commit(transaction, message)
+    def commit_then_fail_marker(transaction, message, paths=None):
+        result = original_commit(transaction, message, paths=paths)
         original_write = queue._write
 
         def fail_once(*_args, **_kwargs):
@@ -985,8 +1166,8 @@ def test_resume_replays_durable_receipt_without_reinvoking_replacement_compiler(
     compiler = Compiler()
     original_commit = ChangeTransaction.commit_git
 
-    def commit_then_fail_marker(transaction, message):
-        result = original_commit(transaction, message)
+    def commit_then_fail_marker(transaction, message, paths=None):
+        result = original_commit(transaction, message, paths=paths)
         original_write = queue._write
 
         def fail_once(*_args, **_kwargs):

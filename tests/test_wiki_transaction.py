@@ -359,6 +359,43 @@ def test_commit_git_commits_only_managed_files_and_preserves_unrelated_stage(vau
     assert not tx.commit_git("nothing changed")
 
 
+def test_commit_git_exact_allow_list_preserves_other_managed_drafts_and_stage(vault: Path) -> None:
+    receipt = vault / "20_wiki" / "receipt.md"
+    untracked = vault / "20_wiki" / "user-note.md"
+    staged = vault / "20_wiki" / "staged-note.md"
+    receipt.write_text("receipt", encoding="utf-8")
+    untracked.write_text("private draft", encoding="utf-8")
+    staged.write_text("staged draft", encoding="utf-8")
+    git(vault, "init")
+    git(vault, "add", "20_wiki/staged-note.md")
+
+    tx = ChangeTransaction(vault)
+    assert tx.commit_git("receipt only", paths=["20_wiki/receipt.md"])
+
+    committed = git(vault, "show", "--name-only", "--format=", "HEAD").splitlines()
+    assert committed == ["20_wiki/receipt.md"]
+    assert "20_wiki/user-note.md" in git(vault, "status", "--short")
+    assert git(vault, "diff", "--cached", "--name-only").splitlines() == [
+        "20_wiki/staged-note.md"
+    ]
+
+
+@pytest.mark.parametrize("paths", [
+    ["notes.md"],
+    ["20_wiki/../notes.md"],
+    [":(glob)20_wiki/*.md"],
+    ["20_wiki/*.md"],
+    ["20_wiki/page.md", "20_WIKI/PAGE.md"],
+    ["20_wiki/CON.md"],
+])
+def test_commit_git_exact_allow_list_rejects_unsafe_paths_without_creating_repo(
+    vault: Path, paths: list[str]
+) -> None:
+    with pytest.raises(ValueError, match="path|duplicate|managed|safe"):
+        ChangeTransaction(vault).commit_git("safe message", paths=paths)
+    assert not (vault / ".git").exists()
+
+
 def test_commit_git_rejects_message_and_surfaces_git_failure(vault: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     tx = ChangeTransaction(vault)
     with pytest.raises(ValueError):

@@ -12,12 +12,13 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
-import subprocess
 from typing import Any
 from uuid import uuid4
 
 from .catalog import Catalog
-from .compiler import MAX_CHANGES, MAX_EVIDENCE_CHARS, ManualCompiler
+from .compiler import (
+    MAX_CHANGES, MAX_EVIDENCE_CHARS, ManualCompiler, _run_bounded_process,
+)
 from .extractors import registry as default_registry
 from .models import Job, SourceVersion
 from .paths import VaultPaths
@@ -42,6 +43,8 @@ _WINDOWS_RESERVED = frozenset({
 })
 _RECEIPT_SCHEMA_VERSION = 1
 _MAX_RECEIPT_BYTES = 2_000_000
+_MAX_GIT_METADATA_BYTES = 4_096
+_GIT_TIMEOUT_SECONDS = 30.0
 
 
 def _safe_wiki_path(value: object) -> str:
@@ -369,7 +372,7 @@ class IngestService:
             for page in changed:
                 transaction.stage(page["path"], page["content"])
             transaction.publish(lambda _: None)
-            transaction.commit_git(f"kb: compile {source.version_id}")
+            transaction.commit_git(f"kb: compile {source.version_id}", paths=paths)
             self._verify_receipt_git_head(validated)
         return paths
 
@@ -378,32 +381,68 @@ class IngestService:
         try:
             if not (self.vault.root / ".git").is_dir():
                 raise RuntimeError("Git HEAD does not exist")
-            top = subprocess.run(
+            top = self._bounded_git(
                 ["git", "rev-parse", "--show-toplevel"],
-                cwd=self.vault.root, capture_output=True, text=True, check=True,
-            ).stdout.strip()
+                max_output_bytes=_MAX_GIT_METADATA_BYTES,
+            ).decode("utf-8", errors="strict").strip()
             if Path(top).resolve() != self.vault.root.resolve():
                 raise RuntimeError("Git HEAD belongs to a different repository")
-            subprocess.run(
-                ["git", "rev-parse", "--verify", "HEAD"],
-                cwd=self.vault.root, capture_output=True, check=True,
-            )
+            head = self._git_object_id("HEAD^{commit}")
             for page in receipt["pages"]:
                 relative = page["path"]
-                committed = subprocess.run(
-                    ["git", "cat-file", "blob", f"HEAD:{relative}"],
-                    cwd=self.vault.root, capture_output=True, check=True,
-                ).stdout
+                object_id = self._git_object_id(f"{head}:{relative}")
+                object_type = self._bounded_git(
+                    ["git", "cat-file", "-t", object_id],
+                    max_output_bytes=_MAX_GIT_METADATA_BYTES,
+                ).strip()
+                if object_type != b"blob":
+                    raise RuntimeError(f"Git HEAD receipt path is not a blob: {relative}")
+                expected = page["content"].encode("utf-8")
+                raw_size = self._bounded_git(
+                    ["git", "cat-file", "-s", object_id],
+                    max_output_bytes=_MAX_GIT_METADATA_BYTES,
+                ).strip()
+                if re.fullmatch(rb"[0-9]{1,20}", raw_size) is None:
+                    raise RuntimeError("Git HEAD blob size is invalid")
+                if int(raw_size) != len(expected):
+                    raise RuntimeError(
+                        f"Git HEAD blob size does not match receipt page: {relative}"
+                    )
+                committed = self._bounded_git(
+                    ["git", "cat-file", "blob", object_id],
+                    max_output_bytes=max(1, len(expected)),
+                )
                 if (hashlib.sha256(committed).hexdigest() != page["sha256"]
-                        or committed != page["content"].encode("utf-8")):
+                        or committed != expected):
                     raise RuntimeError(
                         f"Git HEAD does not exactly contain receipt page: {relative}"
                     )
-        except (OSError, subprocess.CalledProcessError) as error:
-            detail = getattr(error, "stderr", b"")
-            if isinstance(detail, bytes):
-                detail = detail.decode("utf-8", errors="replace")
-            raise RuntimeError(f"Git HEAD cannot verify compilation receipt: {detail or error}") from error
+            if self._git_object_id("HEAD^{commit}") != head:
+                raise RuntimeError("Git HEAD changed during compilation receipt verification")
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            raise RuntimeError(f"Git HEAD cannot verify compilation receipt: {error}") from error
+
+    def _bounded_git(self, command: list[str], *, max_output_bytes: int) -> bytes:
+        returncode, stdout, overflowed, timed_out = _run_bounded_process(
+            command, None, cwd=self.vault.root, timeout=_GIT_TIMEOUT_SECONDS,
+            max_output_bytes=max_output_bytes,
+        )
+        if timed_out:
+            raise RuntimeError("Git HEAD verification timed out")
+        if overflowed:
+            raise RuntimeError("Git HEAD verification output exceeded its bound")
+        if returncode != 0:
+            raise RuntimeError("Git HEAD verification command failed")
+        return stdout
+
+    def _git_object_id(self, revision: str) -> str:
+        output = self._bounded_git(
+            ["git", "rev-parse", "--verify", revision],
+            max_output_bytes=_MAX_GIT_METADATA_BYTES,
+        ).strip()
+        if re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", output) is None:
+            raise RuntimeError("Git HEAD object id is invalid")
+        return output.decode("ascii")
 
     def _complete_compilation(self, job_id: str, source: SourceVersion) -> None:
         def complete(current: Job) -> None:

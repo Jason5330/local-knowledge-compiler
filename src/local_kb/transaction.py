@@ -594,11 +594,30 @@ class ChangeTransaction:
             os.fsync(output.fileno())
         return temporary
 
-    def commit_git(self, message: str) -> bool:
+    def commit_git(self, message: str, paths: list[str] | tuple[str, ...] | None = None) -> bool:
         """Commit generated roots only, without absorbing a user's staged files."""
         if (not isinstance(message, str) or not message.strip() or message != message.strip()
                 or any(ord(char) < 32 or ord(char) == 127 for char in message)):
             raise ValueError("commit message must be a single non-empty safe line")
+        exact_paths: list[str] | None = None
+        if paths is not None:
+            if not isinstance(paths, (list, tuple)):
+                raise ValueError("Git paths must be a list or tuple")
+            exact_paths = []
+            seen: set[str] = set()
+            for path in paths:
+                if not isinstance(path, str):
+                    raise ValueError("Git path must be a string")
+                if any(character in path for character in "*?["):
+                    raise ValueError("Git pathspec magic is not allowed")
+                relative = self._relative(path)
+                key = relative.casefold()
+                if key in seen:
+                    raise ValueError("duplicate Git path")
+                seen.add(key)
+                exact_paths.append(relative)
+            if not exact_paths:
+                return False
         index_path: Path | None = None
         index_bytes: bytes | None = None
         index_existed = False
@@ -616,11 +635,16 @@ class ChangeTransaction:
                 index_path = self.vault / index_path
             index_existed = index_path.exists()
             index_bytes = index_path.read_bytes() if index_existed else None
-            pathspecs = [path for path in _MANAGED_ROOTS if (self.vault / path).exists()]
-            tracked = subprocess.run(["git", "ls-files", "-z", "--", *_MANAGED_ROOTS], cwd=self.vault,
-                                     text=False, capture_output=True, check=True).stdout.split(b"\0")
-            pathspecs.extend(path.decode("utf-8", "surrogateescape") for path in tracked if path)
-            pathspecs = list(dict.fromkeys(pathspecs))
+            if exact_paths is None:
+                pathspecs = [path for path in _MANAGED_ROOTS if (self.vault / path).exists()]
+                tracked = subprocess.run(
+                    ["git", "ls-files", "-z", "--", *_MANAGED_ROOTS],
+                    cwd=self.vault, text=False, capture_output=True, check=True,
+                ).stdout.split(b"\0")
+                pathspecs.extend(path.decode("utf-8", "surrogateescape") for path in tracked if path)
+                pathspecs = list(dict.fromkeys(pathspecs))
+            else:
+                pathspecs = exact_paths
             if not pathspecs:
                 return False
             subprocess.run(["git", "add", "-A", "--", *pathspecs], cwd=self.vault,
