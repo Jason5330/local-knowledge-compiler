@@ -257,6 +257,71 @@ def test_lint_reports_complete_wiki_relationship_and_index_issues(tmp_path):
     assert report["issues"]["index_raw_mismatches"]
 
 
+def test_lint_reports_cross_kind_identity_collision_and_ambiguous_related(tmp_path):
+    from local_kb.health import lint
+
+    vault = _vault(tmp_path)
+    source = _seed_cache(vault)
+    template = (
+        "---\nid: \"{id}\"\ntitle: \"{title}\"\naliases:\n{aliases}"
+        "type: \"topic\"\nspace: \"work\"\nstatus: \"active\"\n"
+        "confidence: \"low\"\nupdated_at: \"2026-01-01T00:00:00Z\"\n"
+        "source_ids:\n  - \"{source_id}\"\n---\n\n## Current State\nClaim\n\n"
+        "## Evidence\n- {source_id}\n\n## Conflicts and Gaps\nnone\n\n"
+        "## Related\n- {related}\n\n## Timeline\nCreated\n"
+    )
+    (vault.wiki / "work" / "a.md").write_text(
+        template.format(
+            id="alpha", title="Alpha", aliases='  - "beta"\n',
+            source_id=source.source_id, related="beta",
+        ),
+        encoding="utf-8",
+    )
+    (vault.wiki / "work" / "b.md").write_text(
+        template.format(
+            id="beta", title="Beta Page", aliases=" []\n",
+            source_id=source.source_id, related="alpha",
+        ),
+        encoding="utf-8",
+    )
+    report = lint(vault)
+    assert report["healthy"] is False
+    assert report["issues"]["identity_collisions"] == [
+        {
+            "value": "beta",
+            "bindings": [
+                {"kind": "alias", "page": "20_wiki/work/a.md"},
+                {"kind": "id", "page": "20_wiki/work/b.md"},
+            ],
+        }
+    ]
+    assert {
+        "page": "20_wiki/work/a.md", "target": "beta", "reason": "ambiguous"
+    } in report["issues"]["broken_related"]
+
+
+def test_lint_detects_forged_catalog_fragments_and_fts_body(tmp_path):
+    import sqlite3
+
+    from local_kb.health import lint
+
+    vault = _vault(tmp_path)
+    source = _seed_cache(vault)
+    database = vault.index / "catalog.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE source_fragments SET text = 'FORGED' WHERE version_id = ?",
+            (source.version_id,),
+        )
+        connection.execute(
+            "UPDATE source_fts SET body = 'FORGED' WHERE version_id = ?",
+            (source.version_id,),
+        )
+    report = lint(vault)
+    assert report["healthy"] is False
+    assert f"fragments:{source.version_id}" in report["issues"]["index_content_mismatches"]
+
+
 def test_rebuild_respects_the_single_writer_lock(tmp_path):
     from local_kb.health import rebuild_catalog
     from local_kb.queue import WriterLock
