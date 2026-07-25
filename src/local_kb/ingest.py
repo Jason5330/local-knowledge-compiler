@@ -133,13 +133,13 @@ class IngestService:
             if final.status == "extracted":
                 outcome = self._compile_extraction_outcome(final, extraction)
                 if outcome.handoff is not None:
-                    self._record_compiler_handoff(job_id, outcome.handoff)
+                    self._mark_compiler_pending(
+                        job_id,
+                        final,
+                        processed.relative_to(self.vault.root).as_posix(),
+                        outcome.handoff,
+                    )
             if outcome.handoff is not None:
-                self._mark_compiler_pending(
-                    job_id,
-                    final,
-                    processed.relative_to(self.vault.root).as_posix(),
-                )
                 return final
             self._mark(job_id, "published", source=asdict(final), processed_path=str(processed.relative_to(self.vault.root)))
             return final
@@ -203,9 +203,8 @@ class IngestService:
             raise ValueError("pending compiler job has no extracted evidence")
         outcome = self._compile_extraction_outcome(final, extraction, compiler=compiler)
         if outcome.handoff is not None:
-            self._record_compiler_handoff(job_id, outcome.handoff)
             processed_path = self._safe_processed_metadata(job.metadata.get("processed_path"))
-            self._mark_compiler_pending(job_id, final, processed_path)
+            self._mark_compiler_pending(job_id, final, processed_path, outcome.handoff)
             return final
 
         def complete(current: Job) -> None:
@@ -254,34 +253,58 @@ class IngestService:
             "reason": reason,
         }
 
-    def _record_compiler_handoff(self, job_id: str, handoff: dict[str, str]) -> None:
+    def _mark_compiler_pending(
+        self, job_id: str, source: SourceVersion, processed_path: str, handoff: dict[str, str]
+    ) -> None:
         self._validate_handoff_record(handoff)
 
-        def record(current: Job) -> None:
+        def pending(current: Job) -> None:
             history = current.metadata.get("compiler_handoffs", [])
             if not isinstance(history, list):
                 raise ValueError("compiler handoff history is invalid")
             for item in history:
                 self._validate_handoff_record(item)
-            current.metadata["compiler_handoffs"] = [*history, handoff]
-            current.metadata["compiler_handoff"] = handoff["path"]
-            current.metadata["compiler_status"] = "needs_agent"
-            current.metadata["compiler_requested_at"] = handoff["created_at"]
-
-        self.queue.update(job_id, record)
-
-    def _mark_compiler_pending(
-        self, job_id: str, source: SourceVersion, processed_path: str
-    ) -> None:
-        def pending(current: Job) -> None:
-            self._validate_handoff_history(current.metadata)
             current.state = "pending_attention"
             current.error = "compiler handoff required"
             current.metadata["source"] = asdict(source)
             current.metadata["processed_path"] = processed_path
             current.metadata["compiler_status"] = "needs_agent"
+            current.metadata["compiler_handoffs"] = [*history, handoff]
+            current.metadata["compiler_handoff"] = handoff["path"]
+            current.metadata["compiler_requested_at"] = handoff["created_at"]
 
-        self.queue.update(job_id, pending)
+        try:
+            self.queue.update(job_id, pending)
+        except Exception:
+            if self._handoff_is_durably_pending(job_id, handoff):
+                return
+            self._remove_unpersisted_handoff(handoff)
+            raise
+
+    def _handoff_is_durably_pending(self, job_id: str, handoff: dict[str, str]) -> bool:
+        try:
+            job = self.queue.get(job_id)
+            self._validate_pending_compiler_metadata(job)
+        except (OSError, ValueError):
+            return False
+        history = job.metadata["compiler_handoffs"]
+        return bool(history) and history[-1] == handoff
+
+    def _remove_unpersisted_handoff(self, handoff: dict[str, str]) -> None:
+        """Remove only the packet this failed atomic marker could not reference."""
+        try:
+            self._validate_handoff_record(handoff)
+            candidate = self.vault.root / Path(*PurePosixPath(handoff["path"]).parts)
+            packet = json.loads(candidate.read_text(encoding="utf-8"))
+            reason = packet.get("reason", "manual compilation requested") if isinstance(packet, dict) else None
+            if (not isinstance(packet, dict) or packet.get("status") != "needs_agent"
+                    or packet.get("created_at") != handoff["created_at"]
+                    or reason != handoff["reason"]):
+                return
+            candidate.unlink()
+        except (OSError, ValueError, json.JSONDecodeError):
+            # A missing or modified packet must never trigger a broader cleanup.
+            return
 
     def _validate_pending_compiler_metadata(self, job: Job) -> None:
         if job.state != "pending_attention" or job.metadata.get("compiler_status") != "needs_agent":

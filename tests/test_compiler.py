@@ -283,6 +283,86 @@ def test_process_does_not_recreate_handoff_for_an_already_pending_job(tmp_path):
     assert len(pending.metadata["compiler_handoffs"]) == 1
 
 
+def test_handoff_marker_write_failure_leaves_no_half_metadata_or_orphan_on_retry(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.compiler import ManualCompiler
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue)
+    manual = ManualCompiler(vault.runtime / "manual")
+
+    class FailBeforeMarker:
+        first = True
+
+        def compile(self, evidence):
+            packet = manual.compile(evidence)
+            if self.first:
+                self.first = False
+                original_write = queue._write
+
+                def fail_once(*_args, **_kwargs):
+                    queue._write = original_write
+                    raise OSError("before handoff marker")
+
+                queue._write = fail_once
+            return packet
+
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"), compiler=FailBeforeMarker())
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("atomic handoff", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="marker-before")
+
+    with pytest.raises(OSError, match="before handoff marker"):
+        service.process(job.job_id)
+    retrying = queue.get(job.job_id)
+    assert "compiler_handoff" not in retrying.metadata
+    assert list((vault.runtime / "manual").glob("manual_*.json")) == []
+
+    service.process(job.job_id)
+    pending = queue.get(job.job_id)
+    assert pending.state == "pending_attention"
+    assert len(pending.metadata["compiler_handoffs"]) == 1
+    assert len(list((vault.runtime / "manual").glob("manual_*.json"))) == 1
+
+
+def test_handoff_marker_sync_failure_recognizes_already_persisted_pending_state(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.compiler import ManualCompiler
+    from local_kb.ingest import IngestService
+    from local_kb.queue import DiskQueue
+
+    vault = build_vault(tmp_path / "vault")
+    queue = DiskQueue(vault.queue)
+    manual = ManualCompiler(vault.runtime / "manual")
+
+    class FailAfterMarker:
+        def compile(self, evidence):
+            packet = manual.compile(evidence)
+            original_sync = queue._sync_directory
+
+            def fail_once():
+                queue._sync_directory = original_sync
+                raise OSError("after handoff marker")
+
+            queue._sync_directory = fail_once
+            return packet
+
+    service = IngestService(vault, queue, Catalog(vault.index / "catalog.sqlite3"), compiler=FailAfterMarker())
+    incoming = vault.inbox / "note.txt"
+    incoming.write_text("durable marker", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="marker-after")
+
+    assert service.process(job.job_id).status == "extracted"
+    pending = queue.get(job.job_id)
+    assert pending.state == "pending_attention"
+    assert len(pending.metadata["compiler_handoffs"]) == 1
+    assert len(list((vault.runtime / "manual").glob("manual_*.json"))) == 1
+
+
 def test_resume_compilation_fails_closed_for_forged_handoff_metadata(tmp_path):
     from local_kb.catalog import Catalog
     from local_kb.cli import build_vault
