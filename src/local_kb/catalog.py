@@ -11,7 +11,9 @@ from .models import SearchHit, SourceStatus, SourceVersion, Space
 
 class Catalog:
     MAX_SEARCH_LIMIT = 100
-    SCHEMA_VERSION = 2
+    MAX_QUERY_CHARACTERS = 256
+    MAX_QUERY_TERMS = 64
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -23,9 +25,11 @@ class Catalog:
         return connection
 
     @contextmanager
-    def connection(self) -> Iterator[sqlite3.Connection]:
+    def connection(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection = self.connect()
         try:
+            if immediate:
+                connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
         except BaseException:
@@ -38,6 +42,7 @@ class Catalog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
+        with self.connection(immediate=True) as connection:
             current_version = connection.execute("PRAGMA user_version").fetchone()[0]
             if current_version > self.SCHEMA_VERSION:
                 raise RuntimeError(
@@ -47,12 +52,15 @@ class Catalog:
             sources_exist = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sources'"
             ).fetchone()
+            migration_counts: tuple[int, int] | None = None
             if sources_exist is not None and current_version < self.SCHEMA_VERSION:
+                migration_counts = self._stage_legacy_catalog(connection)
                 self._drop_schema(connection)
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sources (
                     version_id TEXT PRIMARY KEY,
+                    created_sequence INTEGER NOT NULL UNIQUE,
                     source_id TEXT NOT NULL,
                     space TEXT NOT NULL,
                     original_name TEXT NOT NULL,
@@ -63,7 +71,9 @@ class Catalog:
                         'archived', 'extracted', 'pending_extractor',
                         'compiled', 'validated', 'published'
                     )),
-                    previous_version_id TEXT
+                    previous_version_id TEXT,
+                    FOREIGN KEY (previous_version_id) REFERENCES sources(version_id)
+                        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
                 )
                 """
             )
@@ -109,7 +119,191 @@ class Catalog:
                 ON source_fts_map(version_id)
                 """
             )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS sources_before_delete_fts
+                BEFORE DELETE ON sources
+                BEGIN
+                    DELETE FROM source_fts
+                    WHERE rowid IN (
+                        SELECT fts_rowid FROM source_fts_map
+                        WHERE version_id = OLD.version_id
+                    );
+                END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS sources_created_sequence_immutable
+                BEFORE UPDATE OF created_sequence ON sources
+                WHEN NEW.created_sequence <> OLD.created_sequence
+                BEGIN
+                    SELECT RAISE(ABORT, 'created_sequence is immutable');
+                END
+                """
+            )
+            if migration_counts is not None:
+                self._restore_staged_catalog(connection, migration_counts)
+            self._repair_fts_orphans(connection)
             connection.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
+
+    @staticmethod
+    def _repair_fts_orphans(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            DELETE FROM source_fts
+            WHERE rowid NOT IN (
+                SELECT source_fts_map.fts_rowid
+                FROM source_fts_map
+                JOIN sources USING (version_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            DELETE FROM source_fts_map
+            WHERE fts_rowid NOT IN (SELECT rowid FROM source_fts)
+               OR version_id NOT IN (SELECT version_id FROM sources)
+            """
+        )
+
+    @staticmethod
+    def _stage_legacy_catalog(connection: sqlite3.Connection) -> tuple[int, int]:
+        source_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(sources)")
+        }
+        sequence_expression = (
+            "created_sequence" if "created_sequence" in source_columns else "rowid"
+        )
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE migration_sources AS
+            SELECT rowid AS legacy_rowid,
+                   {sequence_expression} AS created_sequence,
+                   version_id, source_id, space,
+                   original_name, relative_path, sha256, media_type, status,
+                   previous_version_id
+            FROM sources
+            """
+        )
+        fragments_exist = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'source_fragments'
+            """
+        ).fetchone()
+        if fragments_exist is None:
+            connection.execute(
+                """
+                CREATE TEMP TABLE migration_fragments (
+                    version_id TEXT, locator TEXT, text TEXT
+                )
+                """
+            )
+        else:
+            connection.execute(
+                """
+                CREATE TEMP TABLE migration_fragments AS
+                SELECT version_id, locator, text FROM source_fragments
+                """
+            )
+        source_count = connection.execute(
+            "SELECT count(*) FROM migration_sources"
+        ).fetchone()[0]
+        fragment_count = connection.execute(
+            "SELECT count(*) FROM migration_fragments"
+        ).fetchone()[0]
+        if source_count != connection.execute("SELECT count(*) FROM sources").fetchone()[0]:
+            raise RuntimeError("legacy source staging count mismatch")
+        if fragments_exist is not None and fragment_count != connection.execute(
+            "SELECT count(*) FROM source_fragments"
+        ).fetchone()[0]:
+            raise RuntimeError("legacy fragment staging count mismatch")
+        return source_count, fragment_count
+
+    def _restore_staged_catalog(
+        self, connection: sqlite3.Connection, expected_counts: tuple[int, int]
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO sources (
+                version_id, created_sequence, source_id, space,
+                original_name, relative_path,
+                sha256, media_type, status, previous_version_id
+            )
+            SELECT version_id, created_sequence, source_id, space,
+                   original_name, relative_path, sha256, media_type, status,
+                   previous_version_id
+            FROM migration_sources
+            ORDER BY legacy_rowid
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_fragments (version_id, locator, text)
+            SELECT version_id, locator, text FROM migration_fragments
+            """
+        )
+        self._validate_catalog_lineage(connection)
+        rows = connection.execute(
+            """
+            SELECT sources.version_id, sources.source_id, sources.relative_path,
+                   sources.space, fragments.locator, fragments.text
+            FROM migration_fragments AS fragments
+            JOIN sources USING (version_id)
+            WHERE trim(fragments.text) <> ''
+            """
+        ).fetchall()
+        for row in rows:
+            self._insert_fts_row(
+                connection,
+                version_id=row["version_id"],
+                source_id=row["source_id"],
+                relative_path=row["relative_path"],
+                locator=row["locator"],
+                space=row["space"],
+                text=row["text"],
+            )
+        actual_counts = (
+            connection.execute("SELECT count(*) FROM sources").fetchone()[0],
+            connection.execute("SELECT count(*) FROM source_fragments").fetchone()[0],
+        )
+        if actual_counts != expected_counts:
+            raise RuntimeError("catalog migration count mismatch")
+        indexed_count = len(rows)
+        rebuilt_counts = (
+            connection.execute("SELECT count(*) FROM source_fts").fetchone()[0],
+            connection.execute("SELECT count(*) FROM source_fts_map").fetchone()[0],
+        )
+        if rebuilt_counts != (indexed_count, indexed_count):
+            raise RuntimeError("catalog migration FTS rebuild count mismatch")
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("catalog migration foreign key check failed")
+        connection.execute("DROP TABLE migration_fragments")
+        connection.execute("DROP TABLE migration_sources")
+
+    @staticmethod
+    def _validate_catalog_lineage(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            "SELECT version_id, source_id, previous_version_id FROM sources"
+        ).fetchall()
+        lineage = {
+            row["version_id"]: (row["source_id"], row["previous_version_id"])
+            for row in rows
+        }
+        for version_id, (source_id, predecessor_id) in lineage.items():
+            seen = {version_id}
+            current = predecessor_id
+            while current is not None:
+                if current in seen:
+                    raise ValueError(f"lineage cycle involving {version_id}")
+                seen.add(current)
+                predecessor = lineage.get(current)
+                if predecessor is None:
+                    raise ValueError(f"missing predecessor {current}")
+                if predecessor[0] != source_id:
+                    raise ValueError("lineage predecessor has a different source_id")
+                current = predecessor[1]
 
     @staticmethod
     def _drop_schema(connection: sqlite3.Connection) -> None:
@@ -118,13 +312,67 @@ class Catalog:
         connection.execute("DROP TABLE IF EXISTS source_fragments")
         connection.execute("DROP TABLE IF EXISTS sources")
 
+    def _insert_fts_row(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        version_id: str,
+        source_id: str,
+        relative_path: str,
+        locator: str,
+        space: Space,
+        text: str,
+    ) -> None:
+        cursor = connection.execute(
+            """
+            INSERT INTO source_fts (
+                version_id, source_id, relative_path, locator, space, body
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                version_id,
+                source_id,
+                relative_path,
+                locator,
+                space,
+                self._searchable_text(text),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO source_fts_map (fts_rowid, version_id, locator)
+            VALUES (?, ?, ?)
+            """,
+            (cursor.lastrowid, version_id, locator),
+        )
+
     def upsert_source(
         self, source: SourceVersion, fragments: list[tuple[str, str]]
     ) -> None:
         nonblank_fragments = [
             (locator, text) for locator, text in fragments if text.strip()
         ]
-        with self.connection() as connection:
+        with self.connection(immediate=True) as connection:
+            existing = connection.execute(
+                "SELECT created_sequence FROM sources WHERE version_id = ?",
+                (source.version_id,),
+            ).fetchone()
+            if existing is not None:
+                created_sequence = existing["created_sequence"]
+                if (
+                    source.created_sequence is not None
+                    and source.created_sequence != created_sequence
+                ):
+                    raise ValueError("created_sequence is immutable")
+            elif source.created_sequence is not None:
+                if isinstance(source.created_sequence, bool) or source.created_sequence <= 0:
+                    raise ValueError("created_sequence must be a positive integer")
+                created_sequence = source.created_sequence
+            else:
+                created_sequence = connection.execute(
+                    "SELECT coalesce(max(created_sequence), 0) + 1 FROM sources"
+                ).fetchone()[0]
+            self._validate_source_lineage(connection, source)
             collision = connection.execute(
                 "SELECT version_id FROM sources WHERE sha256 = ?",
                 (source.sha256,),
@@ -136,9 +384,10 @@ class Catalog:
             connection.execute(
                 """
                 INSERT INTO sources (
-                    version_id, source_id, space, original_name, relative_path,
-                    sha256, media_type, status, previous_version_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    version_id, created_sequence, source_id, space,
+                    original_name, relative_path, sha256, media_type, status,
+                    previous_version_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(version_id) DO UPDATE SET
                     source_id = excluded.source_id,
                     space = excluded.space,
@@ -151,6 +400,7 @@ class Catalog:
                 """,
                 (
                     source.version_id,
+                    created_sequence,
                     source.source_id,
                     source.space,
                     source.original_name,
@@ -189,28 +439,43 @@ class Catalog:
                 ],
             )
             for locator, text in nonblank_fragments:
-                cursor = connection.execute(
-                    """
-                    INSERT INTO source_fts (
-                        version_id, source_id, relative_path, locator, space, body
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        source.version_id,
-                        source.source_id,
-                        source.relative_path,
-                        locator,
-                        source.space,
-                        self._searchable_text(text),
-                    ),
+                self._insert_fts_row(
+                    connection,
+                    version_id=source.version_id,
+                    source_id=source.source_id,
+                    relative_path=source.relative_path,
+                    locator=locator,
+                    space=source.space,
+                    text=text,
                 )
-                connection.execute(
-                    """
-                    INSERT INTO source_fts_map (fts_rowid, version_id, locator)
-                    VALUES (?, ?, ?)
-                    """,
-                    (cursor.lastrowid, source.version_id, locator),
-                )
+
+    @staticmethod
+    def _validate_source_lineage(
+        connection: sqlite3.Connection, source: SourceVersion
+    ) -> None:
+        predecessor_id = source.previous_version_id
+        if predecessor_id is None:
+            return
+        if predecessor_id == source.version_id:
+            raise ValueError("a source version cannot reference itself as predecessor")
+        seen = {source.version_id}
+        current = predecessor_id
+        while current is not None:
+            if current in seen:
+                raise ValueError(f"lineage cycle involving {source.version_id}")
+            seen.add(current)
+            predecessor = connection.execute(
+                """
+                SELECT source_id, previous_version_id
+                FROM sources WHERE version_id = ?
+                """,
+                (current,),
+            ).fetchone()
+            if predecessor is None:
+                raise ValueError(f"missing predecessor {current}")
+            if predecessor["source_id"] != source.source_id:
+                raise ValueError("lineage predecessor has a different source_id")
+            current = predecessor["previous_version_id"]
 
     def latest_source(
         self, space: Space, original_name: str
@@ -218,7 +483,8 @@ class Catalog:
         with self.connection() as connection:
             row = connection.execute(
                 """
-                SELECT candidate.version_id, candidate.source_id, candidate.space,
+                SELECT candidate.version_id, candidate.created_sequence,
+                       candidate.source_id, candidate.space,
                        candidate.original_name, candidate.relative_path,
                        candidate.sha256, candidate.media_type, candidate.status,
                        candidate.previous_version_id
@@ -228,8 +494,9 @@ class Catalog:
                       SELECT 1
                       FROM sources AS successor
                       WHERE successor.previous_version_id = candidate.version_id
+                        AND successor.source_id = candidate.source_id
                   )
-                ORDER BY candidate.rowid DESC
+                ORDER BY candidate.created_sequence DESC
                 LIMIT 1
                 """,
                 (space, original_name),
@@ -247,14 +514,25 @@ class Catalog:
             or not 1 <= limit <= self.MAX_SEARCH_LIMIT
         ):
             raise ValueError(f"limit must be between 1 and {self.MAX_SEARCH_LIMIT}")
+        if len(query) > self.MAX_QUERY_CHARACTERS:
+            raise ValueError(
+                f"query must be at most {self.MAX_QUERY_CHARACTERS} characters"
+            )
         if not spaces:
             return []
 
-        match_query = self._plain_match_query(query)
+        terms = self._plain_query_terms(query)
+        if len(terms) > self.MAX_QUERY_TERMS:
+            raise ValueError(f"query has more than {self.MAX_QUERY_TERMS} terms")
+        match_query = self._match_query(terms)
         if not match_query:
             return []
+        script_runs = self._script_runs(query)
 
         placeholders = ", ".join("?" for _ in spaces)
+        substring_checks = "".join(
+            " AND instr(source_fragments.text, ?) > 0" for _ in script_runs
+        )
         sql = f"""
             SELECT source_fts.version_id, source_fts.source_id, sources.space,
                    source_fts.relative_path, source_fts.locator, source_fragments.text,
@@ -266,11 +544,14 @@ class Catalog:
              AND source_fragments.locator = source_fts.locator
             WHERE source_fts MATCH ?
               AND sources.space IN ({placeholders})
+              {substring_checks}
             ORDER BY bm25(source_fts)
             LIMIT ?
         """
         with self.connection() as connection:
-            rows = connection.execute(sql, (match_query, *spaces, limit)).fetchall()
+            rows = connection.execute(
+                sql, (match_query, *spaces, *script_runs, limit)
+            ).fetchall()
         return [
             SearchHit(
                 version_id=row["version_id"],
@@ -296,42 +577,45 @@ class Catalog:
             media_type=row["media_type"],
             status=cast(SourceStatus, row["status"]),
             previous_version_id=row["previous_version_id"],
+            created_sequence=row["created_sequence"],
         )
 
     @staticmethod
     def _searchable_text(text: str) -> str:
-        """Add bounded CJK n-grams for unicode61 tokenization."""
+        """Add bounded n-grams for continuous CJK, Japanese, and Korean text."""
         searchable = [text]
-        start = 0
-        while start < len(text):
-            if not "\u3400" <= text[start] <= "\u9fff":
-                start += 1
-                continue
-            end = start + 1
-            while end < len(text) and "\u3400" <= text[end] <= "\u9fff":
-                end += 1
-            run = text[start:end]
+        for run in Catalog._script_runs(text):
             searchable.extend(Catalog._cjk_ngrams(run))
-            start = end
-        return " ".join(searchable)
+        return " ".join(dict.fromkeys(searchable))
 
     @staticmethod
     def _cjk_ngrams(text: str) -> list[str]:
-        return [
-            text[index : index + size]
-            for size in range(1, min(3, len(text)) + 1)
-            for index in range(len(text) - size + 1)
-        ]
+        return list(
+            dict.fromkeys(
+                text[index : index + size]
+                for size in range(1, min(3, len(text)) + 1)
+                for index in range(len(text) - size + 1)
+            )
+        )
 
     @staticmethod
     def _plain_match_query(query: str) -> str:
+        return Catalog._match_query(Catalog._plain_query_terms(query))
+
+    @staticmethod
+    def _match_query(terms: list[str]) -> str:
+        return " AND ".join(f'"{term}"' for term in terms)
+
+    @staticmethod
+    def _plain_query_terms(query: str) -> list[str]:
         terms: list[str] = []
         start = 0
         while start < len(query):
             character = query[start]
-            if "\u3400" <= character <= "\u9fff":
+            script = Catalog._script_kind(character)
+            if script is not None:
                 end = start + 1
-                while end < len(query) and "\u3400" <= query[end] <= "\u9fff":
+                while end < len(query) and Catalog._script_kind(query[end]) == script:
                     end += 1
                 terms.extend(Catalog._cjk_ngrams(query[start:end]))
                 start = end
@@ -339,10 +623,46 @@ class Catalog:
                 end = start + 1
                 while end < len(query) and (
                     query[end].isalnum() or query[end] == "_"
-                ) and not "\u3400" <= query[end] <= "\u9fff":
+                ) and Catalog._script_kind(query[end]) is None:
                     end += 1
                 terms.append(query[start:end])
                 start = end
             else:
                 start += 1
-        return " AND ".join(f'"{term}"' for term in terms)
+        return list(dict.fromkeys(terms))
+
+    @staticmethod
+    def _script_kind(character: str) -> str | None:
+        if "\u3400" <= character <= "\u9fff":
+            return "cjk"
+        if "\u3040" <= character <= "\u309f":
+            return "hiragana"
+        if (
+            "\u30a0" <= character <= "\u30ff"
+            or "\u31f0" <= character <= "\u31ff"
+            or "\uff66" <= character <= "\uff9f"
+        ):
+            return "katakana"
+        if (
+            "\u1100" <= character <= "\u11ff"
+            or "\u3130" <= character <= "\u318f"
+            or "\uac00" <= character <= "\ud7af"
+        ):
+            return "hangul"
+        return None
+
+    @staticmethod
+    def _script_runs(text: str) -> list[str]:
+        runs: list[str] = []
+        start = 0
+        while start < len(text):
+            script = Catalog._script_kind(text[start])
+            if script is None:
+                start += 1
+                continue
+            end = start + 1
+            while end < len(text) and Catalog._script_kind(text[end]) == script:
+                end += 1
+            runs.append(text[start:end])
+            start = end
+        return runs

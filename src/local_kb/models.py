@@ -40,6 +40,7 @@ class SourceVersion:
     media_type: str
     status: SourceStatus
     previous_version_id: str | None = None
+    created_sequence: int | None = None
 
 
 @dataclass(frozen=True)

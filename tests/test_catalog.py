@@ -24,6 +24,46 @@ def test_search_returns_indexed_traditional_chinese_source(tmp_path):
     assert hits[0].score > 0
 
 
+def test_cjk_ngram_candidates_require_the_original_contiguous_run(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(
+        make_source(), [("line:1", "累積知，積知識，知識庫")]
+    )
+
+    assert catalog.search("累積知識庫", {"work"}) == []
+
+
+def test_search_finds_japanese_substring_inside_continuous_text(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(
+        make_source(), [("line:1", "これは継続的な知識ベースです")]
+    )
+
+    assert [hit.version_id for hit in catalog.search("知識ベース", {"work"})] == [
+        "version-1"
+    ]
+
+
+def test_search_finds_korean_substring_inside_continuous_text(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(
+        make_source(), [("line:1", "지속적으로축적되는지식베이스")]
+    )
+
+    assert [hit.version_id for hit in catalog.search("지식베이스", {"work"})] == [
+        "version-1"
+    ]
+
+
 def test_cjk_ngrams_are_linearly_bounded_for_1000_characters():
     from local_kb.catalog import Catalog
 
@@ -36,6 +76,18 @@ def test_cjk_ngrams_are_linearly_bounded_for_1000_characters():
     assert sum(map(len, terms)) <= len(text) * 6
     assert len(indexed_text.split()) <= len(text) * 3 + 1
     assert len(indexed_text) <= len(text) * 10
+
+
+def test_repeated_script_ngrams_are_deduplicated():
+    from local_kb.catalog import Catalog
+
+    assert Catalog._cjk_ngrams("知" * 20) == ["知", "知知", "知知知"]
+
+
+def test_plain_query_terms_are_deduplicated():
+    from local_kb.catalog import Catalog
+
+    assert Catalog._plain_match_query("alpha alpha") == '"alpha"'
 
 
 def test_connection_context_commits_and_closes_database(tmp_path):
@@ -52,9 +104,10 @@ def test_connection_context_commits_and_closes_database(tmp_path):
     with catalog.connection() as connection:
         connection.execute(
             "INSERT INTO sources "
-            "(version_id, source_id, space, original_name, relative_path, sha256, "
-            "media_type, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ("v1", "s1", "work", "a.md", "a.md", "b" * 64, "text/plain", "archived"),
+            "(version_id, created_sequence, source_id, space, original_name, "
+            "relative_path, sha256, media_type, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("v1", 1, "s1", "work", "a.md", "a.md", "b" * 64, "text/plain", "archived"),
         )
 
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
@@ -76,9 +129,10 @@ def test_connection_context_rolls_back_on_error(tmp_path):
         with catalog.connection() as connection:
             connection.execute(
                 "INSERT INTO sources "
-                "(version_id, source_id, space, original_name, relative_path, sha256, "
-                "media_type, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                ("v1", "s1", "work", "a.md", "a.md", "b" * 64, "text/plain", "archived"),
+                "(version_id, created_sequence, source_id, space, original_name, "
+                "relative_path, sha256, media_type, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("v1", 1, "s1", "work", "a.md", "a.md", "b" * 64, "text/plain", "archived"),
             )
             raise RuntimeError("abort")
 
@@ -88,7 +142,7 @@ def test_connection_context_rolls_back_on_error(tmp_path):
     assert count == 0
 
 
-def test_initialize_rebuilds_legacy_catalog_schema(tmp_path):
+def test_initialize_migrates_v1_catalog_without_losing_sources_or_lineage(tmp_path):
     import sqlite3
 
     from local_kb.catalog import Catalog
@@ -111,9 +165,37 @@ def test_initialize_rebuilds_legacy_catalog_schema(tmp_path):
         """
     )
     legacy.execute(
-        "INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("legacy", "s1", "work", "old.md", "old.md", "a" * 64, "text/plain", "archived", None),
+        """
+        CREATE TABLE source_fragments (
+            version_id TEXT NOT NULL,
+            locator TEXT NOT NULL,
+            text TEXT NOT NULL,
+            PRIMARY KEY (version_id, locator)
+        )
+        """
     )
+    legacy.execute(
+        """
+        CREATE VIRTUAL TABLE source_fts USING fts5(
+            version_id UNINDEXED, source_id UNINDEXED,
+            relative_path UNINDEXED, locator UNINDEXED,
+            space UNINDEXED, body, tokenize='unicode61'
+        )
+        """
+    )
+    legacy.execute(
+        "INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("old", "s1", "work", "old.md", "old.md", "a" * 64, "text/plain", "archived", None),
+    )
+    legacy.execute(
+        "INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("new", "s1", "work", "old.md", "old.md", "b" * 64, "text/plain", "published", "old"),
+    )
+    legacy.executemany(
+        "INSERT INTO source_fragments VALUES (?, ?, ?)",
+        [("old", "line:1", "legacy old text"), ("new", "line:1", "legacy searchable text")],
+    )
+    legacy.execute("PRAGMA user_version=1")
     legacy.commit()
     legacy.close()
 
@@ -123,13 +205,79 @@ def test_initialize_rebuilds_legacy_catalog_schema(tmp_path):
     with catalog.connection() as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         source_count = connection.execute("SELECT count(*) FROM sources").fetchone()[0]
-        map_exists = connection.execute(
-            "SELECT count(*) FROM sqlite_master WHERE name = 'source_fts_map'"
+        fragment_count = connection.execute(
+            "SELECT count(*) FROM source_fragments"
         ).fetchone()[0]
+        mapping_count = connection.execute(
+            "SELECT count(*) FROM source_fts_map"
+        ).fetchone()[0]
+        predecessor = connection.execute(
+            "SELECT previous_version_id FROM sources WHERE version_id = 'new'"
+        ).fetchone()[0]
+        sequences = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT version_id, created_sequence FROM sources "
+                "ORDER BY created_sequence"
+            )
+        ]
 
     assert version == Catalog.SCHEMA_VERSION
-    assert source_count == 0
-    assert map_exists == 1
+    assert source_count == 2
+    assert fragment_count == 2
+    assert mapping_count == 2
+    assert predecessor == "old"
+    assert sequences == [("old", 1), ("new", 2)]
+    assert catalog.latest_source("work", "old.md").version_id == "new"
+    assert [hit.version_id for hit in catalog.search("searchable", {"work"})] == [
+        "new"
+    ]
+
+
+def test_failed_v1_migration_rolls_back_to_intact_legacy_catalog(tmp_path):
+    import sqlite3
+
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    database = tmp_path / "catalog.sqlite3"
+    legacy = sqlite3.connect(database)
+    legacy.execute(
+        """
+        CREATE TABLE sources (
+            version_id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
+            space TEXT NOT NULL,
+            original_name TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            sha256 TEXT NOT NULL UNIQUE,
+            media_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            previous_version_id TEXT
+        )
+        """
+    )
+    legacy.execute(
+        "INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("legacy", "s1", "work", "old.md", "old.md", "a" * 64, "text/plain", "invalid", None),
+    )
+    legacy.execute("PRAGMA user_version=1")
+    legacy.commit()
+    legacy.close()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        Catalog(database).initialize()
+
+    legacy = sqlite3.connect(database)
+    preserved = legacy.execute(
+        "SELECT version_id, status FROM sources"
+    ).fetchall()
+    version = legacy.execute("PRAGMA user_version").fetchone()[0]
+    legacy.close()
+
+    assert preserved == [("legacy", "invalid")]
+    assert version == 1
 
 
 def test_every_connection_enables_foreign_keys(tmp_path):
@@ -187,6 +335,50 @@ def test_deleting_source_cascades_to_fragments(tmp_path):
         connection.execute("DELETE FROM sources WHERE version_id = ?", ("version-1",))
         remaining = connection.execute(
             "SELECT count(*) FROM source_fragments"
+        ).fetchone()[0]
+
+    assert remaining == 0
+
+
+def test_delete_then_reinsert_cannot_match_orphaned_fts_text(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    source = make_source()
+    catalog.upsert_source(source, [("line:1", "stale orphan term")])
+
+    with catalog.connection() as connection:
+        connection.execute("DELETE FROM sources WHERE version_id = ?", ("version-1",))
+
+    catalog.upsert_source(source, [("line:1", "fresh replacement term")])
+
+    assert catalog.search("stale", {"work"}) == []
+    assert [hit.text for hit in catalog.search("fresh", {"work"})] == [
+        "fresh replacement term"
+    ]
+
+
+def test_initialize_repairs_unmapped_fts_orphans(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    with catalog.connection() as connection:
+        orphan_rowid = connection.execute(
+            """
+            INSERT INTO source_fts (
+                version_id, source_id, relative_path, locator, space, body
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("ghost", "ghost", "ghost.md", "line:1", "work", "orphan"),
+        ).lastrowid
+
+    catalog.initialize()
+
+    with catalog.connection() as connection:
+        remaining = connection.execute(
+            "SELECT count(*) FROM source_fts WHERE rowid = ?", (orphan_rowid,)
         ).fetchone()[0]
 
     assert remaining == 0
@@ -436,15 +628,173 @@ def test_latest_source_is_stable_during_shuffled_rebuild(tmp_path):
 
     catalog = Catalog(tmp_path / "catalog.sqlite3")
     catalog.initialize()
-    old = make_source(version_id="old", sha256="d" * 64)
-    new = make_source(
-        version_id="new", sha256="e" * 64, previous_version_id="old"
-    )
+    old = make_source(version_id="old", sha256="d" * 64, created_sequence=1)
+    new = make_source(version_id="new", sha256="e" * 64, created_sequence=2)
 
     catalog.upsert_source(new, [("line:1", "new")])
     catalog.upsert_source(old, [("line:1", "old")])
 
     assert catalog.latest_source("work", "notes.md").version_id == "new"
+
+
+def test_upsert_retry_preserves_immutable_created_sequence(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    source = make_source(created_sequence=41)
+    catalog.upsert_source(source, [("line:1", "first")])
+    catalog.upsert_source(
+        make_source(created_sequence=None), [("line:2", "retry")]
+    )
+
+    with catalog.connection() as connection:
+        sequence = connection.execute(
+            "SELECT created_sequence FROM sources WHERE version_id = ?",
+            ("version-1",),
+        ).fetchone()[0]
+
+    assert sequence == 41
+
+
+def test_database_rejects_created_sequence_mutation(tmp_path):
+    import sqlite3
+
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(make_source(created_sequence=41), [])
+
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        with catalog.connection() as connection:
+            connection.execute(
+                "UPDATE sources SET created_sequence = 42 WHERE version_id = ?",
+                ("version-1",),
+            )
+
+    assert catalog.latest_source("work", "notes.md").created_sequence == 41
+
+
+def test_upsert_rejects_dangling_predecessor(tmp_path):
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+
+    with pytest.raises(ValueError, match="predecessor"):
+        catalog.upsert_source(
+            make_source(version_id="new", previous_version_id="missing"), []
+        )
+
+
+def test_upsert_rejects_cross_source_predecessor(tmp_path):
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(make_source(version_id="old"), [])
+
+    with pytest.raises(ValueError, match="source_id"):
+        catalog.upsert_source(
+            make_source(
+                source_id="another-source",
+                version_id="new",
+                sha256="b" * 64,
+                previous_version_id="old",
+            ),
+            [],
+        )
+
+
+def test_upsert_rejects_self_predecessor(tmp_path):
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+
+    with pytest.raises(ValueError, match="itself"):
+        catalog.upsert_source(
+            make_source(previous_version_id="version-1"), []
+        )
+
+
+def test_upsert_rejects_lineage_cycle(tmp_path):
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(make_source(version_id="old"), [])
+    catalog.upsert_source(
+        make_source(
+            version_id="new", sha256="b" * 64, previous_version_id="old"
+        ),
+        [],
+    )
+
+    with pytest.raises(ValueError, match="cycle"):
+        catalog.upsert_source(
+            make_source(
+                version_id="old", sha256="a" * 64, previous_version_id="new"
+            ),
+            [],
+        )
+
+
+def test_deleting_predecessor_cannot_create_dangling_lineage(tmp_path):
+    import sqlite3
+
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(make_source(version_id="old"), [])
+    catalog.upsert_source(
+        make_source(
+            version_id="new", sha256="b" * 64, previous_version_id="old"
+        ),
+        [],
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with catalog.connection() as connection:
+            connection.execute("DELETE FROM sources WHERE version_id = 'old'")
+
+    assert catalog.latest_source("work", "notes.md").version_id == "new"
+
+
+def test_latest_ignores_cross_source_successor_in_corrupt_legacy_data(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    with catalog.connection() as connection:
+        connection.executemany(
+            """
+            INSERT INTO sources (
+                version_id, created_sequence, source_id, space, original_name,
+                relative_path, sha256, media_type, status, previous_version_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("old", 1, "source-a", "work", "a.md", "a.md", "a" * 64, "text/plain", "archived", None),
+                ("other", 2, "source-b", "work", "b.md", "b.md", "b" * 64, "text/plain", "archived", "old"),
+            ],
+        )
+
+    assert catalog.latest_source("work", "a.md").version_id == "old"
 
 
 def test_search_with_no_spaces_returns_no_hits(tmp_path):
@@ -502,6 +852,31 @@ def test_search_requires_a_bounded_positive_limit(tmp_path):
     for invalid_limit in (0, -1, 101, True):
         with pytest.raises(ValueError, match="limit"):
             catalog.search("alpha", {"work"}, limit=invalid_limit)
+
+
+def test_search_rejects_oversized_repeated_cjk_query(tmp_path):
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+
+    with pytest.raises(ValueError, match="query"):
+        catalog.search("知" * 500, {"work"})
+
+
+def test_search_rejects_too_many_distinct_terms(tmp_path):
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    query = " ".join(f"t{number}" for number in range(65))
+
+    with pytest.raises(ValueError, match="terms"):
+        catalog.search(query, {"work"})
 
 
 def test_jobs_do_not_share_metadata_instances():
@@ -562,6 +937,7 @@ def make_source(
     sha256="a" * 64,
     status="published",
     previous_version_id=None,
+    created_sequence=None,
 ):
     from local_kb.models import SourceVersion
 
@@ -575,4 +951,5 @@ def make_source(
         media_type="text/markdown",
         status=status,
         previous_version_id=previous_version_id,
+        created_sequence=created_sequence,
     )
