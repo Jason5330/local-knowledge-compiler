@@ -1,7 +1,8 @@
 """Durable, immutable storage for the raw files behind source versions."""
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
+import errno
 import hashlib
 import json
 import mimetypes
@@ -9,8 +10,9 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import time
-from typing import Iterator
+from typing import BinaryIO, Iterator
 from uuid import uuid4
 
 from .models import SourceVersion
@@ -31,6 +33,195 @@ _RESERVED_WINDOWS_NAMES = {
     *(f"com{number}" for number in range(1, 10)),
     *(f"lpt{number}" for number in range(1, 10)),
 }
+
+
+def _windows_kernel32():
+    import ctypes
+
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _windows_close_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = _windows_kernel32()
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    if not kernel32.CloseHandle(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_open_directory(
+    path: Path, raw_root: Path, *, allow_handle_rename: bool = False
+) -> int:
+    """Open and validate a directory without allowing delete/rename sharing."""
+    import ctypes
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = _windows_kernel32()
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.GetFinalPathNameByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    open_existing = 3
+    backup_semantics = 0x02000000
+    open_reparse_point = 0x00200000
+    generic_write = 0x40000000
+    delete_access = 0x00010000
+    handle = kernel32.CreateFileW(
+        str(path),
+        generic_write | (delete_access if allow_handle_rename else 0),
+        file_share_read | file_share_write,
+        None,
+        open_existing,
+        backup_semantics | open_reparse_point,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        information = ByHandleFileInformation()
+        if not kernel32.GetFileInformationByHandle(
+            handle, ctypes.byref(information)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        file_attribute_directory = 0x00000010
+        file_attribute_reparse_point = 0x00000400
+        if not information.file_attributes & file_attribute_directory:
+            raise ValueError("raw store path is not a directory")
+        if information.file_attributes & file_attribute_reparse_point:
+            raise ValueError("raw store path is a reparse point")
+
+        required = kernel32.GetFinalPathNameByHandleW(handle, None, 0, 0)
+        if required == 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        buffer = ctypes.create_unicode_buffer(required + 1)
+        written = kernel32.GetFinalPathNameByHandleW(
+            handle, buffer, len(buffer), 0
+        )
+        if written == 0 or written >= len(buffer):
+            raise ctypes.WinError(ctypes.get_last_error())
+        final_path = buffer.value
+        if final_path.startswith("\\\\?\\UNC\\"):
+            final_path = "\\\\" + final_path[8:]
+        elif final_path.startswith("\\\\?\\"):
+            final_path = final_path[4:]
+        root_text = os.path.normcase(str(raw_root))
+        final_text = os.path.normcase(str(Path(final_path)))
+        if os.path.commonpath((root_text, final_text)) != root_text:
+            raise ValueError("directory handle resolves outside raw_root")
+        return int(handle)
+    except BaseException:
+        _windows_close_handle(int(handle))
+        raise
+
+
+def _windows_rename_directory_handle(
+    source_handle: int, target: Path
+) -> None:
+    """Atomically rename an open directory handle to an absolute contained path."""
+    import ctypes
+    from ctypes import wintypes
+
+    class FileRenameInformation(ctypes.Structure):
+        _fields_ = [
+            ("flags", wintypes.DWORD),
+            ("root_directory", wintypes.HANDLE),
+            ("file_name_length", wintypes.DWORD),
+            ("file_name", wintypes.WCHAR * 1),
+        ]
+
+    encoded_name = str(target).encode("utf-16-le")
+    file_name_offset = FileRenameInformation.file_name.offset
+    buffer = ctypes.create_string_buffer(
+        file_name_offset + len(encoded_name) + ctypes.sizeof(wintypes.WCHAR)
+    )
+    information = ctypes.cast(
+        buffer, ctypes.POINTER(FileRenameInformation)
+    ).contents
+    information.flags = 0
+    information.root_directory = None
+    information.file_name_length = len(encoded_name)
+    ctypes.memmove(
+        ctypes.addressof(buffer) + file_name_offset,
+        encoded_name,
+        len(encoded_name),
+    )
+
+    kernel32 = _windows_kernel32()
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    file_rename_info = 3
+    if not kernel32.SetFileInformationByHandle(
+        source_handle,
+        file_rename_info,
+        buffer,
+        len(buffer),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    _windows_flush_handle(source_handle)
+
+
+def _windows_flush_handle(handle: int) -> None:
+    """Flush a writable Windows file/directory handle with bounded fallbacks."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = _windows_kernel32()
+    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    if kernel32.FlushFileBuffers(handle):
+        return
+    error_code = ctypes.get_last_error()
+    explicitly_unsupported = {
+        6,  # ERROR_INVALID_HANDLE on filesystems without directory flush
+        50,  # ERROR_NOT_SUPPORTED
+        87,  # ERROR_INVALID_PARAMETER
+    }
+    if error_code not in explicitly_unsupported:
+        raise ctypes.WinError(error_code)
 
 
 def file_sha256(path: Path) -> str:
@@ -60,8 +251,12 @@ class SourceStore:
             candidate.is_symlink() or _is_junction(candidate) or not candidate.is_dir()
         ):
             raise ValueError("raw_root must be a directory and not a symlink")
+        created = not candidate.exists()
         candidate.mkdir(parents=True, exist_ok=True)
         self.raw_root = candidate.resolve()
+        if created:
+            self._sync_directory(self.raw_root)
+            self._sync_directory(self.raw_root.parent)
 
     def archive(
         self,
@@ -86,7 +281,7 @@ class SourceStore:
         source_digest = file_sha256(incoming_path)
         version_id = f"ver_{source_digest}"
 
-        with self._archive_lock():
+        with self._archive_lock(), self._pin_directory(self.raw_root):
             duplicate = self._find_by_digest(source_digest)
             if duplicate is not None:
                 return duplicate
@@ -113,64 +308,111 @@ class SourceStore:
             return source
 
     def _publish(self, incoming: Path, source: SourceVersion) -> None:
-        parent = self._safe_directory(self.raw_root / source.space)
-        parent = self._safe_directory(parent / source.source_id)
-        target = parent / source.version_id
-        self._ensure_contained(target)
-        if os.path.lexists(target):
-            raise FileExistsError("immutable target already exists")
-
-        stage = parent / f".{source.version_id}.tmp-{uuid4().hex}"
-        self._ensure_contained(stage)
-        stage.mkdir()
-        try:
-            copied = stage / source.original_name
-            self._copy_with_fsync(incoming, copied)
-            if file_sha256(copied) != source.sha256:
-                raise ValueError("copied file checksum does not match source")
-            self._write_manifest(stage / _MANIFEST_NAME, source)
-            self._fsync_directory(stage)
+        with ExitStack() as pins:
+            parent = self._safe_directory(self.raw_root / source.space)
+            pins.enter_context(self._pin_directory(parent))
+            parent = self._safe_directory(parent / source.source_id)
+            parent_handle = pins.enter_context(self._pin_directory(parent))
+            target = parent / source.version_id
+            self._ensure_contained(target)
             if os.path.lexists(target):
                 raise FileExistsError("immutable target already exists")
+
+            stage = parent / f".{source.version_id}.tmp-{uuid4().hex}"
+            self._create_new_directory(stage)
             try:
-                os.rename(stage, target)
-            except FileExistsError as error:
-                raise FileExistsError("immutable target already exists") from error
-            self._fsync_directory(parent)
-        except BaseException:
-            if stage.exists():
-                shutil.rmtree(stage)
-            raise
+                with self._pin_directory(
+                    stage, allow_handle_rename=True
+                ) as stage_handle:
+                    copied = stage / source.original_name
+                    self._copy_with_fsync(incoming, copied)
+                    if file_sha256(copied) != source.sha256:
+                        raise ValueError("copied file checksum does not match source")
+                    self._write_manifest(stage / _MANIFEST_NAME, source)
+                    self._sync_pinned_directory(stage_handle)
+                    if os.path.lexists(target):
+                        raise FileExistsError("immutable target already exists")
+                    self._atomic_publish(
+                        stage,
+                        target,
+                        source_handle=stage_handle,
+                        parent_handle=parent_handle,
+                    )
+                self._sync_directory(parent)
+            except BaseException:
+                if stage.exists():
+                    shutil.rmtree(stage)
+                raise
 
     @contextmanager
     def _archive_lock(self) -> Iterator[None]:
-        """Serialize scanners and publishers without a mutable dedupe index."""
+        """Serialize archives with a process-owned kernel lock."""
         lock = self.raw_root / _LOCK_NAME
         self._ensure_contained(lock)
+        if os.path.lexists(lock) and (
+            lock.is_symlink() or _is_junction(lock) or lock.is_dir()
+        ):
+            raise ValueError("archive lock is unsafe")
+        lock_file = lock.open("a+b", buffering=0)
+        acquired = False
         deadline = time.monotonic() + 30
-        while True:
-            try:
-                lock.mkdir()
-                break
-            except (FileExistsError, PermissionError):
-                if not os.path.lexists(lock):
-                    if time.monotonic() >= deadline:
-                        raise
-                    time.sleep(0.01)
-                    continue
-                if lock.is_symlink() or _is_junction(lock):
-                    raise ValueError("archive lock is unsafe")
-                if not lock.is_dir():
-                    if not os.path.lexists(lock):
-                        continue
-                    raise ValueError("archive lock is unsafe")
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("timed out waiting for source archive lock")
-                time.sleep(0.01)
         try:
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                self._flush_file(lock_file)
+            while True:
+                try:
+                    self._try_lock_file(lock_file)
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "timed out waiting for source archive lock"
+                        )
+                    time.sleep(0.01)
             yield
         finally:
-            lock.rmdir()
+            try:
+                if acquired:
+                    self._unlock_file(lock_file)
+            finally:
+                lock_file.close()
+
+    @staticmethod
+    def _try_lock_file(lock_file: BinaryIO) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0)
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as error:
+                if error.errno in {errno.EACCES, errno.EDEADLK}:
+                    raise BlockingIOError from error
+                raise
+            return
+        import fcntl
+
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                raise BlockingIOError from error
+            raise
+
+    @staticmethod
+    def _unlock_file(lock_file: BinaryIO) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _find_by_digest(self, digest: str) -> SourceVersion | None:
         for space_dir in self.raw_root.iterdir():
@@ -286,37 +528,135 @@ class SourceStore:
         if file_sha256(content) != source.sha256:
             raise ValueError("source manifest content checksum does not match")
 
-    @staticmethod
-    def _copy_with_fsync(source: Path, destination: Path) -> None:
+    def _copy_with_fsync(self, source: Path, destination: Path) -> None:
         with source.open("rb") as input_file, destination.open("xb") as output_file:
             while chunk := input_file.read(_CHUNK_SIZE):
                 output_file.write(chunk)
-            output_file.flush()
-            os.fsync(output_file.fileno())
+            self._flush_file(output_file)
 
-    @staticmethod
-    def _write_manifest(path: Path, source: SourceVersion) -> None:
+    def _write_manifest(self, path: Path, source: SourceVersion) -> None:
         encoded = json.dumps(asdict(source), sort_keys=True, ensure_ascii=False).encode(
             "utf-8"
         )
         with path.open("xb") as manifest:
             manifest.write(encoded)
             manifest.write(b"\n")
-            manifest.flush()
-            os.fsync(manifest.fileno())
+            self._flush_file(manifest)
 
     @staticmethod
-    def _fsync_directory(path: Path) -> None:
+    def _flush_file(file_object: BinaryIO) -> None:
+        file_object.flush()
+        os.fsync(file_object.fileno())
+
+    def _sync_directory(self, path: Path) -> None:
         if os.name == "nt":
+            validation_root = self.raw_root
+            if path.resolve() == self.raw_root.parent:
+                validation_root = path.resolve()
+            handle = _windows_open_directory(path, validation_root)
+            try:
+                _windows_flush_handle(handle)
+            finally:
+                _windows_close_handle(handle)
             return
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
         try:
-            descriptor = os.open(path, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(descriptor)
+            try:
+                os.fsync(descriptor)
+            except OSError as error:
+                unsupported = {
+                    errno.EBADF,
+                    errno.EINVAL,
+                    getattr(errno, "ENOTSUP", errno.EINVAL),
+                    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+                }
+                if error.errno not in unsupported:
+                    raise
         finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _sync_pinned_directory(handle: int) -> None:
+        if os.name == "nt":
+            _windows_flush_handle(handle)
+            return
+        try:
+            os.fsync(handle)
+        except OSError as error:
+            unsupported = {
+                errno.EBADF,
+                errno.EINVAL,
+                getattr(errno, "ENOTSUP", errno.EINVAL),
+                getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+            }
+            if error.errno not in unsupported:
+                raise
+
+    @contextmanager
+    def _pin_directory(
+        self, path: Path, *, allow_handle_rename: bool = False
+    ) -> Iterator[int]:
+        self._ensure_contained(path)
+        if os.name == "nt":
+            handle = _windows_open_directory(
+                path,
+                self.raw_root,
+                allow_handle_rename=allow_handle_rename,
+            )
+            try:
+                yield handle
+            finally:
+                _windows_close_handle(handle)
+            return
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise ValueError("raw store path is not a directory")
+            proc_handle = Path("/proc/self/fd") / str(descriptor)
+            if proc_handle.exists():
+                try:
+                    proc_handle.resolve().relative_to(self.raw_root)
+                except ValueError as error:
+                    raise ValueError(
+                        "directory handle resolves outside raw_root"
+                    ) from error
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    def _create_new_directory(self, path: Path) -> None:
+        self._ensure_contained(path)
+        path.mkdir()
+        self._ensure_contained(path)
+        self._sync_directory(path)
+        self._sync_directory(path.parent)
+
+    def _atomic_publish(
+        self,
+        source: Path,
+        target: Path,
+        *,
+        source_handle: int,
+        parent_handle: int,
+    ) -> None:
+        self._ensure_contained(source)
+        self._ensure_contained(target)
+        if os.path.lexists(target):
+            raise FileExistsError("immutable target already exists")
+        if os.name == "nt":
+            _windows_rename_directory_handle(source_handle, target)
+            return
+        os.rename(
+            source.name,
+            target.name,
+            src_dir_fd=parent_handle,
+            dst_dir_fd=parent_handle,
+        )
 
     @staticmethod
     def _validate_input(path: Path) -> None:
@@ -365,12 +705,17 @@ class SourceStore:
 
     def _safe_directory(self, path: Path) -> Path:
         self._ensure_contained(path)
+        created = False
         if os.path.lexists(path):
             if path.is_symlink() or _is_junction(path) or not path.is_dir():
                 raise ValueError("raw store path is unsafe")
         else:
             path.mkdir()
+            created = True
         self._ensure_contained(path)
+        if created:
+            self._sync_directory(path)
+            self._sync_directory(path.parent)
         return path
 
     def _ensure_contained(self, path: Path) -> None:
