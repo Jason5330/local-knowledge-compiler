@@ -343,6 +343,23 @@ def test_raw_route_coverage_is_stable_and_beats_single_common_route(tmp_path):
     assert len(first[0]["routes"]) == len(set(first[0]["routes"]))
 
 
+def test_decision_and_year_direct_wiki_boost_stays_below_raw(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.query import QueryService
+    vault = build_vault(tmp_path / "vault"); catalog = Catalog(vault.index / "catalog.sqlite3"); catalog.initialize()
+    for number in range(3):
+        sid=f"src-date-{number}"; vid=f"ver-date-{number}"; raw=vault.root/f"10_raw/work/{sid}/{vid}/a.txt"; raw.parent.mkdir(parents=True); raw.write_text("x",encoding="utf-8")
+        catalog.upsert_source(_source(source_id=sid,version_id=vid,space="work",name="a.txt",digest=f"{number+9:x}"),[("line:1","decision 2026 raw")])
+    pages=[("a","topic","2025-01-01T00:00:00Z"),("b","decision","2026-01-01T00:00:00Z"),("c","topic","2026-01-01T00:00:00Z")]
+    for name,typ,date in pages:
+        (vault.wiki/"work"/f"{name}.md").write_text(f"---\ntitle: \"decision 2026 {name}\"\ntype: \"{typ}\"\nspace: \"work\"\nupdated_at: \"{date}\"\nsource_ids:\n  - \"src-date-{ord(name)-97}\"\n---\n\n## Current State\n\ndecision 2026\n",encoding="utf-8")
+    evidence=QueryService(catalog,vault=vault).prepare("決策 2026",{"work"})["evidence"]
+    assert evidence[0]["kind"] == "raw_fragment"
+    wiki=[x for x in evidence if x["kind"]=="derived_wiki"]
+    assert wiki[0]["path"].endswith("b.md")
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX fd-relative open race test")
 def test_prepare_wiki_parent_replacement_cannot_redirect_pinned_read(tmp_path, monkeypatch):
     from contextlib import contextmanager
