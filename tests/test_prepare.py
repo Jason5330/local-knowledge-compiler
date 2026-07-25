@@ -321,6 +321,36 @@ def test_prepare_keeps_derived_wiki_when_raw_hits_fill_limit(tmp_path):
     assert any(item["kind"] == "derived_wiki" for item in evidence)
 
 
+def test_prepare_quota_keeps_eleven_raw_and_one_wiki(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.query import QueryService
+    vault=build_vault(tmp_path/"vault"); catalog=Catalog(vault.index/"catalog.sqlite3"); catalog.initialize()
+    for n in range(12):
+        sid=f"src-q{n}"; vid=f"ver-q{n}"; raw=vault.root/f"10_raw/work/{sid}/{vid}/a.txt"; raw.parent.mkdir(parents=True); raw.write_text("x",encoding="utf-8")
+        catalog.upsert_source(_source(source_id=sid,version_id=vid,space="work",name="a.txt",digest=f"{n+1:x}"),[("line:1","Aurora raw")])
+    (vault.wiki/"work"/"q.md").write_text("---\ntitle: \"Aurora\"\nspace: \"work\"\nsource_ids:\n  - \"src-q0\"\n---\n\n## Current State\n\nAurora summary\n",encoding="utf-8")
+    packet=QueryService(catalog,vault=vault).prepare("Aurora",{"work"},limit=12)
+    assert sum(x["kind"]=="raw_fragment" for x in packet["evidence"]) == 11
+    assert sum(x["kind"]=="derived_wiki" for x in packet["evidence"]) == 1
+    assert packet["truncated"]["raw_results"] is True
+
+
+def test_wiki_rejects_missing_or_cross_space_cited_raw(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.cli import build_vault
+    from local_kb.query import QueryService
+    vault=build_vault(tmp_path/"vault"); catalog=Catalog(vault.index/"catalog.sqlite3"); catalog.initialize()
+    raw=vault.root/"10_raw/personal/src-p/ver-p/a.txt"; raw.parent.mkdir(parents=True); raw.write_text("x",encoding="utf-8")
+    catalog.upsert_source(_source(source_id="src-p",version_id="ver-p",space="personal",name="a.txt",digest="d"),[("line:1","secret")])
+    for name,ids in (("missing",'  - "missing"'),("cross",'  - "src-p"')):
+        (vault.wiki/"work"/f"{name}.md").write_text(f"---\ntitle: \"{name} route\"\nspace: \"work\"\nsource_ids:\n{ids}\n---\n\n## Current State\n\n{name} route\n",encoding="utf-8")
+    packet=QueryService(catalog,vault=vault).prepare("missing route",{"work"})
+    assert packet["status"] == "insufficient_evidence" and "wiki_page_skipped_invalid_provenance" in packet["warnings"]
+    packet=QueryService(catalog,vault=vault).prepare("cross route",{"work"})
+    assert packet["status"] == "insufficient_evidence" and "wiki_page_skipped_invalid_provenance" in packet["warnings"]
+
+
 def test_wiki_expansion_is_same_space_bounded_and_lower_than_direct(tmp_path):
     from local_kb.catalog import Catalog
     from local_kb.cli import build_vault
