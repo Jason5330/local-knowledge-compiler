@@ -22,6 +22,7 @@ _SOURCE_ID_RE = re.compile(r"src_[a-z0-9][a-z0-9_-]{0,127}\Z")
 _VERSION_ID_RE = re.compile(r"ver_[0-9a-f]{64}\Z")
 _MANIFEST_NAME = "manifest.json"
 _LOCK_NAME = ".archive.lock"
+_WINDOWS_FORBIDDEN_FILENAME_CHARACTERS = frozenset('<>:"|?*')
 _RESERVED_WINDOWS_NAMES = {
     "con",
     "prn",
@@ -344,12 +345,19 @@ class SourceStore:
     @staticmethod
     def _validate_filename(value: str) -> None:
         if (
+            isinstance(value, str)
+            and value.rstrip(". ").casefold() == _MANIFEST_NAME
+        ):
+            raise ValueError("reserved original filename manifest.json")
+        if (
             not isinstance(value, str)
             or not value
             or value in {".", ".."}
             or Path(value).name != value
             or "/" in value
             or "\\" in value
+            or any(character in _WINDOWS_FORBIDDEN_FILENAME_CHARACTERS for character in value)
+            or value.endswith((".", " "))
             or any(ord(character) < 32 for character in value)
             or SourceStore._is_windows_reserved(value)
         ):

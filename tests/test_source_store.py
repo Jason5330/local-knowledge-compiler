@@ -299,3 +299,53 @@ def test_source_store_rejects_a_raw_root_junction(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="raw_root"):
         SourceStore(raw_root)
+
+
+@pytest.mark.parametrize("name", ["manifest.json", "MANIFEST.JSON"])
+def test_archive_rejects_reserved_manifest_filename_before_copying(
+    tmp_path: Path, name: str
+) -> None:
+    from local_kb.source_store import SourceStore
+
+    raw_root = tmp_path / "10_raw"
+    incoming = write_file(tmp_path / name, b"not metadata")
+
+    with pytest.raises(ValueError, match="reserved.*manifest"):
+        SourceStore(raw_root).archive(incoming, "work")
+
+    assert list(raw_root.rglob("*")) == []
+
+
+@pytest.mark.parametrize("name", ["note<bad>.txt", "note|bad.txt", "note?.txt"])
+def test_archive_rejects_windows_forbidden_filename_characters(
+    tmp_path: Path, name: str
+) -> None:
+    from local_kb.source_store import SourceStore
+
+    if os.name == "nt":
+        pytest.skip("Windows refuses these names before this portable validation")
+    raw_root = tmp_path / "10_raw"
+    incoming = write_file(tmp_path / name, b"unsafe name")
+
+    with pytest.raises(ValueError, match="invalid original filename"):
+        SourceStore(raw_root).archive(incoming, "work")
+
+    assert not list(raw_root.rglob(".ver_*.tmp-*"))
+    assert list(raw_root.rglob("*")) == []
+
+
+def test_archive_rejects_colon_stream_name_before_publishing(tmp_path: Path) -> None:
+    from local_kb.source_store import SourceStore
+
+    raw_root = tmp_path / "10_raw"
+    incoming = tmp_path / "note.txt:stream"
+    try:
+        incoming.write_bytes(b"unsafe stream")
+    except OSError as error:
+        pytest.skip(f"cannot create portable colon regression input: {error}")
+
+    with pytest.raises(ValueError, match="filename|regular file"):
+        SourceStore(raw_root).archive(incoming, "work")
+
+    assert not list(raw_root.rglob(".ver_*.tmp-*"))
+    assert list(raw_root.rglob("*")) == []
