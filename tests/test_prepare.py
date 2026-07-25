@@ -329,6 +329,20 @@ def test_wiki_expansion_is_same_space_bounded_and_lower_than_direct(tmp_path):
     assert all(item["score"] < wiki[0]["score"] for item in wiki[1:])
 
 
+def test_raw_route_coverage_is_stable_and_beats_single_common_route(tmp_path):
+    from local_kb.catalog import Catalog
+    from local_kb.query import QueryService
+    catalog = Catalog(tmp_path / "catalog.sqlite3"); catalog.initialize()
+    catalog.upsert_source(_source(source_id="src-many", version_id="ver-many", space="work", name="many.txt", digest="b"), [("line:1", "knowledge decision roadmap")])
+    catalog.upsert_source(_source(source_id="src-one", version_id="ver-one", space="work", name="one.txt", digest="c"), [("line:1", "knowledge")])
+    first = QueryService(catalog).prepare("how knowledge decision", {"work"})["evidence"]
+    second = QueryService(catalog).prepare("how knowledge decision", {"work"})["evidence"]
+    assert first == second
+    assert first[0]["source_id"] == "src-many"
+    assert first[0]["coverage"] > first[1]["coverage"]
+    assert len(first[0]["routes"]) == len(set(first[0]["routes"]))
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX fd-relative open race test")
 def test_prepare_wiki_parent_replacement_cannot_redirect_pinned_read(tmp_path, monkeypatch):
     from contextlib import contextmanager
