@@ -48,6 +48,18 @@ class DiskQueue:
         with self._locked():
             return self._read(self._job_path(job_id))
 
+    def iter_jobs(self) -> list[Job]:
+        with self._locked():
+            return [self._read(path) for path in sorted(self.root.glob("*.json"))]
+
+    def active_for_source(self, source_path: Path | str) -> Job | None:
+        wanted = os.path.normcase(os.path.abspath(os.fspath(source_path)))
+        for job in self.iter_jobs():
+            original = job.metadata.get("original_source_path", job.source_path)
+            if job.state not in {"pending_attention", "published"} and os.path.normcase(os.path.abspath(str(original))) == wanted:
+                return job
+        return None
+
     def update(self, job_id: str, change: Callable[[Job], Job | None]) -> Job:
         """Atomically apply *change* to a fresh job copy and persist it."""
         with self._locked():

@@ -98,7 +98,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "ingest-once":
             queue = DiskQueue(paths.queue, config.max_retries)
             service = IngestService(paths, queue, Catalog(paths.index / "catalog.sqlite3"))
-            job = queue.enqueue(arguments.path)
+            source_path = arguments.path.resolve(strict=True)
+            service._hash_pinned_regular(source_path)
+            job = queue.enqueue(source_path)
             source = service.process(job.job_id, space=arguments.space)
             print(f"{source.version_id} {source.status}")
             return 0
@@ -132,10 +134,38 @@ def watch_once(
     queue = DiskQueue(paths.queue, config.max_retries)
     service = IngestService(paths, queue, Catalog(paths.index / "catalog.sqlite3"))
     results = []
+    for job in queue.iter_jobs():
+        if job.state == "pending_attention":
+            original = Path(str(job.metadata.get("original_source_path", job.source_path)))
+            submitted.discard(original)
+            tracker.forget(original)
+            continue
+        if job.state == "published":
+            continue
+        try:
+            result = service.process(job.job_id, space=str(job.metadata.get("space", space)))
+        except Exception as error:
+            print(f"kb watch: {job.job_id}: {error}", file=__import__("sys").stderr)
+            continue
+        results.append(result)
+        original = Path(str(job.metadata.get("original_source_path", job.source_path)))
+        submitted.discard(original)
+        tracker.forget(original)
     for candidate in sorted(tracker.iter_trusted_children()):
         if candidate in submitted or not tracker.observe(candidate):
             continue
+        candidate = candidate.resolve(strict=True)
+        active = queue.active_for_source(candidate)
+        if active is not None:
+            continue
         job = queue.enqueue(candidate)
         submitted.add(candidate)
-        results.append(service.process(job.job_id, space=space))
+        try:
+            results.append(service.process(job.job_id, space=space))
+        except Exception as error:
+            print(f"kb watch: {job.job_id}: {error}", file=__import__("sys").stderr)
+            continue
+        submitted.discard(candidate)
+        tracker.forget(candidate)
+    tracker.prune()
     return results

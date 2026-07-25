@@ -100,6 +100,16 @@ def test_disk_queue_does_not_lose_concurrent_process_failure_attempts(tmp_path):
     assert queue.get("job").attempts == 4
 
 
+def test_disk_queue_lists_valid_jobs_stably_and_finds_active_source(tmp_path):
+    from local_kb.queue import DiskQueue
+
+    queue = DiskQueue(tmp_path / "queue")
+    queue.enqueue("C:/inbox/b.txt", job_id="b")
+    queue.enqueue("C:/inbox/a.txt", job_id="a")
+    assert [job.job_id for job in queue.iter_jobs()] == ["a", "b"]
+    assert queue.active_for_source("C:/inbox/a.txt").job_id == "a"
+
+
 def test_stable_tracker_requires_two_matching_observations_and_elapsed_time(tmp_path):
     from local_kb.watcher import StableTracker
 
@@ -153,6 +163,23 @@ def test_stable_tracker_trusted_root_accepts_only_direct_safe_children(tmp_path)
     assert tracker.observe(direct) is False
     assert tracker.observe(direct) is True
     assert tracker.observe(child) is False
+    tracker.forget(direct)
+    assert tracker.observe(direct) is False
+
+
+def test_stable_tracker_resets_when_same_signature_has_new_identity(tmp_path):
+    from local_kb.watcher import StableTracker
+
+    source = tmp_path / "same.txt"
+    source.write_text("one", encoding="utf-8")
+    timestamp = source.stat().st_mtime_ns
+    tracker = StableTracker(0)
+    assert tracker.observe(source) is False
+    replacement = tmp_path / "replacement.txt"
+    replacement.write_text("two", encoding="utf-8")
+    os.utime(replacement, ns=(timestamp, timestamp))
+    os.replace(replacement, source)
+    assert tracker.observe(source) is False
 
 
 def test_stable_tracker_rejects_symlinked_trusted_root_and_parent(tmp_path):
@@ -208,6 +235,51 @@ def test_ingest_text_archives_indexes_caches_and_moves_inbox_file(tmp_path):
     completed = queue.get(job.job_id)
     assert completed.metadata["processed_path"].endswith("note.txt")
     assert (vault.root / completed.metadata["processed_path"]).is_file()
+
+
+def test_ingest_claim_prevents_new_same_name_from_being_deleted(tmp_path, monkeypatch):
+    vault, queue, _catalog, service = make_service(tmp_path)
+    incoming = vault.inbox / "claim.txt"
+    incoming.write_text("OLD", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="claim")
+    original_archive = service._archive
+
+    def replace_name_after_claim(claimed_job, space):
+        assert Path(claimed_job.source_path).parent == vault.staging / job.job_id
+        incoming.write_text("NEW", encoding="utf-8")
+        return original_archive(claimed_job, space)
+
+    monkeypatch.setattr(service, "_archive", replace_name_after_claim)
+    service.process(job.job_id)
+    assert incoming.read_text(encoding="utf-8") == "NEW"
+    completed = queue.get(job.job_id)
+    assert completed.metadata["original_source_path"] == str(incoming.resolve())
+
+
+def test_windows_claim_handle_blocks_path_replacement_before_rename(tmp_path, monkeypatch):
+    if os.name != "nt":
+        pytest.skip("Windows handle semantics")
+    import local_kb.source_store as source_store
+
+    vault, queue, _catalog, service = make_service(tmp_path)
+    incoming = vault.inbox / "pinned.txt"
+    incoming.write_text("OLD", encoding="utf-8")
+    replacement = vault.inbox / "replacement.txt"
+    replacement.write_text("NEW", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="pinned")
+    original_rename = source_store._windows_rename_directory_handle
+
+    def try_replace_while_handle_is_held(handle, target):
+        if ".kb" in Path(target).parts and "staging" in Path(target).parts:
+            with pytest.raises(OSError):
+                os.replace(replacement, incoming)
+        return original_rename(handle, target)
+
+    monkeypatch.setattr(
+        source_store, "_windows_rename_directory_handle", try_replace_while_handle_is_held
+    )
+    service.process(job.job_id)
+    assert replacement.read_text(encoding="utf-8") == "NEW"
 
 
 def test_ingest_pending_format_never_invents_fragments(tmp_path):
@@ -310,7 +382,8 @@ def test_processed_job_junction_is_rejected_without_writing_outside_vault(tmp_pa
     with pytest.raises((OSError, ValueError), match="link|junction|safe"):
         service.process(job.job_id)
     assert not (outside / "junction.txt").exists()
-    assert incoming.exists()
+    failed = queue.get(job.job_id)
+    assert Path(failed.metadata["claimed_path"]).is_file()
     assert queue.get(job.job_id).state == "retrying"
 
 
@@ -326,12 +399,11 @@ def test_processed_publish_rehashes_incoming_after_archive_before_removal(tmp_pa
         original_cache(source, extraction)
 
     monkeypatch.setattr(service, "_write_cache", change_then_cache)
-    with pytest.raises(ValueError, match="checksum|changed"):
-        service.process(job.job_id)
+    service.process(job.job_id)
     assert incoming.read_text(encoding="utf-8") == "B"
-    assert not (vault.trash / "processed-inbox" / job.job_id / incoming.name).exists()
+    assert (vault.trash / "processed-inbox" / job.job_id / incoming.name).read_text() == "A"
     assert catalog.latest_source("unclassified", incoming.name) is not None
-    assert queue.get(job.job_id).state == "retrying"
+    assert queue.get(job.job_id).state == "published"
 
 
 def test_ingest_rejects_untrusted_resume_metadata(tmp_path):
@@ -423,6 +495,8 @@ def test_ingest_retry_recovers_after_each_recoverable_stage_failure(tmp_path, mo
     with pytest.raises(OSError, match=stage):
         service.process(job.job_id)
     assert queue.get(job.job_id).state == "retrying"
+    if stage in {"cache", "move"}:
+        assert catalog.search("recover", {"unclassified"}) == []
     completed = service.process(job.job_id)
     assert completed.status == "extracted"
     assert (vault.index / "cache" / f"{completed.version_id}.json").is_file()
@@ -447,3 +521,21 @@ def test_cli_ingest_once_prints_version_and_watch_once_gates_unseen_stable_file(
     results = watch_once(vault, tracker, submitted)
     assert len(results) == 1
     assert watch_once(vault, tracker, submitted) == []
+
+
+def test_watch_reingests_a_new_file_with_the_same_name_without_growing_submitted(tmp_path):
+    from local_kb.cli import watch_once
+    from local_kb.watcher import StableTracker
+
+    vault = make_vault(tmp_path)
+    tracker = StableTracker(0, trusted_root=vault.inbox)
+    submitted = set()
+    same = vault.inbox / "same-name.txt"
+    same.write_text("first", encoding="utf-8")
+    assert watch_once(vault, tracker, submitted) == []
+    assert len(watch_once(vault, tracker, submitted)) == 1
+    assert submitted == set()
+    same.write_text("second", encoding="utf-8")
+    assert watch_once(vault, tracker, submitted) == []
+    assert len(watch_once(vault, tracker, submitted)) == 1
+    assert submitted == set()

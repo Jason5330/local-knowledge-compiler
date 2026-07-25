@@ -31,7 +31,7 @@ class StableTracker:
             raise ValueError("required_seconds must be greater than or equal to 0")
         self.required_seconds = float(required_seconds)
         self.clock = clock
-        self._seen: dict[Path, tuple[tuple[int, int], float, int]] = {}
+        self._seen: dict[Path, tuple[tuple[int, int, int, int], float, int]] = {}
         self.trusted_root: Path | None = None
         self._root_identity: tuple[int, int] | None = None
         if trusted_root is not None:
@@ -74,7 +74,7 @@ class StableTracker:
         except OSError:
             self._seen.pop(candidate, None)
             return False
-        signature = (info.st_size, info.st_mtime_ns)
+        signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
         now = self.clock()
         previous = self._seen.get(candidate)
         if previous is None or previous[0] != signature:
@@ -82,6 +82,14 @@ class StableTracker:
             return False
         self._seen[candidate] = (signature, previous[1], previous[2] + 1)
         return previous[2] >= 1 and now - previous[1] >= self.required_seconds
+
+    def forget(self, path: Path | str) -> None:
+        self._seen.pop(Path(os.path.abspath(os.fspath(path))), None)
+
+    def prune(self) -> None:
+        for path in list(self._seen):
+            if not os.path.lexists(path):
+                self._seen.pop(path, None)
 
     def _checked_root(self) -> Path:
         if self.trusted_root is None or self._root_identity is None:

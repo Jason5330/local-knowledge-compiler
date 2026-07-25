@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import asdict, replace
+import errno
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ class IngestService:
         job = self.queue.get(job_id)
         try:
             self.catalog.initialize()
+            job = self._claim(job)
             source = self._source_for(job)
             if source is None:
                 source = self._archive(job, space)
@@ -40,15 +42,117 @@ class IngestService:
             extraction = self._extraction_for(job, source)
             final = replace(source, status=extraction["status"])
             fragments = [(item["locator"], item["text"]) for item in extraction["fragments"]]
-            self.catalog.upsert_source(final, fragments)
-            self._mark(job_id, "compiled", source=asdict(final))
             self._write_cache(final, extraction)
             processed = self._move_processed(self.queue.get(job_id), final)
+            self._mark(job_id, "validated", source=asdict(final), processed_path=str(processed.relative_to(self.vault.root)))
+            self.catalog.upsert_source(final, fragments)
             self._mark(job_id, "published", source=asdict(final), processed_path=str(processed.relative_to(self.vault.root)))
             return final
         except BaseException as error:
             self.queue.fail(job_id, error)
             raise
+
+    def _claim(self, job: Job) -> Job:
+        claimed_value = job.metadata.get("claimed_path")
+        if isinstance(claimed_value, str):
+            claimed = Path(claimed_value)
+            if claimed.exists():
+                claimed_hash = self._hash_pinned_regular(claimed)
+                original_value = job.metadata.get("original_source_path")
+                if isinstance(original_value, str) and Path(original_value).exists():
+                    original_hash, identity = self._hash_pinned_regular(
+                        Path(original_value), identity=True
+                    )
+                    if original_hash == claimed_hash:
+                        self._remove_if_unchanged(Path(original_value), identity)
+                return job
+            processed = job.metadata.get("processed_path")
+            if isinstance(processed, str) and (self.vault.root / processed).is_file():
+                return job
+            raise ValueError("claimed input is missing")
+        original = Path(os.path.abspath(job.source_path))
+        name = original.name
+        staging = self._safe_child_directory(self.vault.runtime, "staging")
+        job_directory = self._safe_child_directory(staging, job.job_id)
+        claimed = job_directory / name
+        preserved = False
+        if os.path.lexists(claimed):
+            if original.exists() and self._hash_pinned_regular(claimed) != self._hash_pinned_regular(original):
+                raise FileExistsError("claimed target contains different file")
+        else:
+            try:
+                self._atomic_claim_no_replace(original, claimed)
+            except OSError as error:
+                cross_volume = error.errno == getattr(errno, "EXDEV", 18) or getattr(error, "winerror", None) == 17
+                if not cross_volume:
+                    raise
+                digest = self._hash_pinned_regular(original)
+                self._copy_pinned_no_replace(original, claimed, digest)
+                preserved = True
+
+        def record(current: Job) -> None:
+            current.metadata.update(
+                original_source_path=str(original),
+                claimed_path=str(claimed),
+                original_preserved=preserved,
+                phase="claimed",
+            )
+            current.source_path = str(claimed)
+            current.state = "stable"
+        return self.queue.update(job.job_id, record)
+
+    @staticmethod
+    def _atomic_claim_no_replace(source: Path, target: Path) -> None:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            from .source_store import (
+                _windows_close_handle,
+                _windows_rename_directory_handle,
+            )
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            create_file = kernel32.CreateFileW
+            create_file.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            create_file.restype = wintypes.HANDLE
+            handle = create_file(
+                str(source),
+                0xC0000000 | 0x00010000,  # GENERIC_READ | GENERIC_WRITE | DELETE
+                0x00000001,  # SHARE_READ: deny WRITE and DELETE replacement
+                None,
+                3,  # OPEN_EXISTING
+                0x00200000,  # OPEN_REPARSE_POINT
+                None,
+            )
+            if handle == ctypes.c_void_p(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                info = os.lstat(source)
+                if not stat.S_ISREG(info.st_mode) or source.is_symlink():
+                    raise ValueError("claim source must be a safe regular file")
+                _windows_rename_directory_handle(int(handle), target)
+            finally:
+                _windows_close_handle(int(handle))
+            return
+        from .source_store import _posix_rename_noreplace
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        source_parent = os.open(source.parent, flags)
+        target_parent = os.open(target.parent, flags)
+        try:
+            _posix_rename_noreplace(source_parent, source.name, target_parent, target.name)
+            os.fsync(target_parent)
+        finally:
+            os.close(target_parent)
+            os.close(source_parent)
 
     def _source_for(self, job: Job) -> SourceVersion | None:
         if "source" not in job.metadata:
