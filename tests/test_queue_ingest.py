@@ -69,6 +69,99 @@ def test_disk_queue_rejects_unknown_state_and_bad_field_types(tmp_path):
         queue.get("job")
 
 
+def test_disk_queue_rejects_symlink_root_and_symlinked_ancestor(tmp_path):
+    from local_kb.queue import DiskQueue
+
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    try:
+        linked.symlink_to(real, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    with pytest.raises(ValueError, match="queue root"):
+        DiskQueue(linked)
+    with pytest.raises(ValueError, match="queue root"):
+        DiskQueue(linked / "nested")
+
+
+def test_disk_queue_keeps_all_operations_on_pinned_root_after_path_swap(tmp_path):
+    if os.name == "nt":
+        pytest.skip("Windows holds the queue root open against replacement")
+    from local_kb.queue import DiskQueue
+
+    queue_path = tmp_path / "queue"
+    moved = tmp_path / "moved"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    queue = DiskQueue(queue_path)
+    queue_path.rename(moved)
+    queue_path.symlink_to(outside, target_is_directory=True)
+
+    queue.enqueue("a.txt", job_id="pinned")
+
+    assert (moved / "pinned.json").is_file()
+    assert not (outside / "pinned.json").exists()
+    assert queue.get("pinned").job_id == "pinned"
+    assert [job.job_id for job in queue.iter_jobs()] == ["pinned"]
+
+
+def test_windows_disk_queue_handle_blocks_root_replacement(tmp_path):
+    if os.name != "nt":
+        pytest.skip("Windows handle semantics")
+    from local_kb.queue import DiskQueue
+
+    queue_path = tmp_path / "queue"
+    moved = tmp_path / "moved"
+    queue = DiskQueue(queue_path)
+
+    with pytest.raises(OSError):
+        queue_path.rename(moved)
+    queue.enqueue("a.txt", job_id="still-pinned")
+    assert queue.get("still-pinned").job_id == "still-pinned"
+
+
+def test_disk_queue_rejects_symlink_lock_without_touching_target(tmp_path):
+    from local_kb.queue import DiskQueue
+
+    queue = DiskQueue(tmp_path / "queue")
+    outside = tmp_path / "outside.lock"
+    outside.write_bytes(b"do-not-touch")
+    lock = queue.root / ".queue.lock"
+    try:
+        lock.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks unavailable")
+
+    with pytest.raises(ValueError, match="queue lock"):
+        queue.enqueue("a.txt", job_id="unsafe-lock")
+    assert outside.read_bytes() == b"do-not-touch"
+    assert not (queue.root / "unsafe-lock.json").exists()
+
+
+def test_disk_queue_rejects_windows_junction_root_and_ancestor(tmp_path):
+    if os.name != "nt":
+        pytest.skip("Windows junction semantics")
+    from local_kb.queue import DiskQueue
+
+    real = tmp_path / "real"
+    real.mkdir()
+    junction = tmp_path / "junction"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(real)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        pytest.skip("junctions unavailable")
+
+    with pytest.raises(ValueError, match="queue root"):
+        DiskQueue(junction)
+    with pytest.raises(ValueError, match="queue root"):
+        DiskQueue(junction / "nested")
+
+
 def test_disk_queue_atomic_update_leaves_complete_json_after_replace_failure(tmp_path, monkeypatch):
     from local_kb.queue import DiskQueue
 
@@ -76,7 +169,7 @@ def test_disk_queue_atomic_update_leaves_complete_json_after_replace_failure(tmp
     queue.enqueue("a.txt", job_id="job")
     before = (tmp_path / "queue" / "job.json").read_text(encoding="utf-8")
 
-    def explode(source, target):
+    def explode(source, target, **_kwargs):
         raise OSError("replace failed")
 
     monkeypatch.setattr(os, "replace", explode)

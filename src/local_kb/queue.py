@@ -14,6 +14,11 @@ from typing import Callable, Iterator, get_args
 from uuid import uuid4
 
 from .models import Job, JobState
+from .source_store import (
+    _is_junction,
+    _windows_close_handle,
+    _windows_open_directory,
+)
 
 
 _JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
@@ -48,10 +53,26 @@ class DiskQueue:
     def __init__(self, root: Path | str, max_retries: int = 3) -> None:
         if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 1:
             raise ValueError("max_retries must be a positive integer")
-        self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root = Path(os.path.abspath(os.fspath(root)))
+        self._root_descriptor = self._open_queue_root(self.root)
         self.max_retries = max_retries
         self._lock_path = self.root / ".queue.lock"
+
+    def close(self) -> None:
+        descriptor = getattr(self, "_root_descriptor", None)
+        if descriptor is None:
+            return
+        self._root_descriptor = None
+        if os.name == "nt":
+            _windows_close_handle(descriptor)
+        else:
+            os.close(descriptor)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
 
     def enqueue(self, source_path: Path | str, *, job_id: str | None = None) -> Job:
         identifier = job_id or uuid4().hex
@@ -74,7 +95,7 @@ class DiskQueue:
             pass
         with self._locked():
             path = self._job_path(identifier)
-            if path.exists():
+            if self._entry_exists(path.name):
                 raise FileExistsError(f"job already exists: {identifier}")
             self._write(path, job)
         return self._copy(job)
@@ -85,7 +106,18 @@ class DiskQueue:
 
     def iter_jobs(self) -> list[Job]:
         with self._locked():
-            return [self._read(path) for path in sorted(self.root.glob("*.json"))]
+            scan_target = (
+                self.root
+                if os.name == "nt"
+                else self._require_root_descriptor()
+            )
+            with os.scandir(scan_target) as entries:
+                names = sorted(
+                    entry.name
+                    for entry in entries
+                    if entry.name.endswith(".json")
+                )
+            return [self._read(self.root / name) for name in names]
 
     def iter_jobs_bounded(self, max_jobs: int, max_bytes: int = DEFAULT_QUEUE_BATCH_BYTES) -> tuple[list[Job], bool]:
         if isinstance(max_jobs, bool) or not isinstance(max_jobs, int) or max_jobs < 1:
@@ -96,7 +128,12 @@ class DiskQueue:
         with self._locked():
             paths: list[Path] = []
             scanned=0; scan_truncated=False
-            with os.scandir(self.root) as entries:
+            scan_target = (
+                self.root
+                if os.name == "nt"
+                else self._require_root_descriptor()
+            )
+            with os.scandir(scan_target) as entries:
                 for entry in entries:
                     scanned += 1
                     if scanned > max_jobs + 1:
@@ -191,10 +228,12 @@ class DiskQueue:
         if budget < 1:
             raise _BatchBudgetExceeded
         try:
-            before=os.lstat(path)
+            before = self._entry_stat(path.name)
             if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_size > MAX_JOB_BYTES:
                 raise ValueError(f"corrupt job JSON: {path.name}")
-            fd=os.open(path,os.O_RDONLY|getattr(os,"O_BINARY",0)|getattr(os,"O_NOFOLLOW",0))
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = self._open_entry(path.name, flags)
             try:
                 opened=os.fstat(fd)
                 if (opened.st_dev,opened.st_ino,opened.st_size)!=(before.st_dev,before.st_ino,before.st_size) or not stat.S_ISREG(opened.st_mode):
@@ -232,36 +271,60 @@ class DiskQueue:
     def _write(self, path: Path, job: Job) -> None:
         self._validate_job(job, path.name)
         payload = _bounded_json(job.to_dict())
-        temporary = self.root / f".{path.name}.{uuid4().hex}.tmp"
+        temporary_name = f".{path.name}.{uuid4().hex}.tmp"
+        temporary = self.root / temporary_name
         try:
-            with temporary.open("x", encoding="utf-8", newline="\n") as stream:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = self._open_entry(temporary_name, flags, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, path)
+            if os.name == "nt":
+                os.replace(temporary, path)
+            else:
+                root_fd = self._require_root_descriptor()
+                os.replace(
+                    temporary_name,
+                    path.name,
+                    src_dir_fd=root_fd,
+                    dst_dir_fd=root_fd,
+                )
             self._sync_directory()
         finally:
             try:
-                temporary.unlink(missing_ok=True)
+                if os.name == "nt":
+                    temporary.unlink(missing_ok=True)
+                else:
+                    os.unlink(
+                        temporary_name,
+                        dir_fd=self._require_root_descriptor(),
+                    )
+            except FileNotFoundError:
+                pass
             except OSError:
                 pass
 
     def _sync_directory(self) -> None:
         if os.name == "nt":
             return
-        try:
-            descriptor = os.open(self.root, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        os.fsync(self._require_root_descriptor())
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
-        self._lock_path.touch(exist_ok=True)
-        with self._lock_path.open("a+b") as stream:
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = self._open_entry(self._lock_path.name, flags, 0o600)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("queue lock is unsafe")
+        except BaseException:
+            if "descriptor" in locals():
+                os.close(descriptor)
+            raise
+        with os.fdopen(descriptor, "a+b", buffering=0) as stream:
             if os.name == "nt":
                 import msvcrt
 
@@ -289,6 +352,130 @@ class DiskQueue:
                     yield
                 finally:
                     fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    def _require_root_descriptor(self) -> int:
+        descriptor = self._root_descriptor
+        if descriptor is None:
+            raise RuntimeError("queue is closed")
+        return descriptor
+
+    def _entry_exists(self, name: str) -> bool:
+        try:
+            self._entry_stat(name)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _entry_stat(self, name: str):
+        if os.name == "nt":
+            return os.lstat(self.root / name)
+        return os.stat(
+            name,
+            dir_fd=self._require_root_descriptor(),
+            follow_symlinks=False,
+        )
+
+    def _open_entry(self, name: str, flags: int, mode: int = 0o666) -> int:
+        if Path(name).name != name:
+            raise ValueError("queue entry name is unsafe")
+        if os.name == "nt":
+            candidate = self.root / name
+            before = None
+            if os.path.lexists(candidate):
+                before = os.lstat(candidate)
+                reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                attributes = getattr(before, "st_file_attributes", 0)
+                if stat.S_ISLNK(before.st_mode) or attributes & reparse:
+                    label = "queue lock" if name == ".queue.lock" else "queue entry"
+                    raise ValueError(f"{label} is unsafe")
+            descriptor = os.open(candidate, flags, mode)
+            try:
+                opened = os.fstat(descriptor)
+                current = os.lstat(candidate)
+                reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                attributes = getattr(current, "st_file_attributes", 0)
+                same_open_file = (opened.st_dev, opened.st_ino) == (
+                    current.st_dev,
+                    current.st_ino,
+                )
+                same_original = before is None or (
+                    before.st_dev,
+                    before.st_ino,
+                ) == (current.st_dev, current.st_ino)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or not stat.S_ISREG(current.st_mode)
+                    or stat.S_ISLNK(current.st_mode)
+                    or attributes & reparse
+                    or not same_open_file
+                    or not same_original
+                ):
+                    label = "queue lock" if name == ".queue.lock" else "queue entry"
+                    raise ValueError(f"{label} is unsafe")
+                return descriptor
+            except BaseException:
+                os.close(descriptor)
+                raise
+        return os.open(
+            name,
+            flags,
+            mode,
+            dir_fd=self._require_root_descriptor(),
+        )
+
+    @staticmethod
+    def _open_queue_root(path: Path) -> int:
+        if os.name == "nt":
+            DiskQueue._validate_windows_root_chain(path)
+            path.mkdir(parents=True, exist_ok=True)
+            DiskQueue._validate_windows_root_chain(path)
+            try:
+                return _windows_open_directory(path, path)
+            except (OSError, ValueError) as error:
+                raise ValueError("queue root is unsafe") from error
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        anchor = Path(path.anchor)
+        descriptor = os.open(anchor, flags)
+        try:
+            relative_parts = path.parts[1:] if path.is_absolute() else path.parts
+            for component in relative_parts:
+                try:
+                    child = os.open(component, flags, dir_fd=descriptor)
+                except FileNotFoundError:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                    child = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise ValueError("queue root is unsafe")
+            return descriptor
+        except BaseException as error:
+            os.close(descriptor)
+            if isinstance(error, ValueError):
+                raise
+            raise ValueError("queue root is unsafe") from error
+
+    @staticmethod
+    def _validate_windows_root_chain(path: Path) -> None:
+        chain = list(reversed((path, *path.parents)))
+        for component in chain:
+            if not os.path.lexists(component):
+                continue
+            try:
+                info = os.lstat(component)
+            except OSError as error:
+                raise ValueError("queue root is unsafe") from error
+            reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            attributes = getattr(info, "st_file_attributes", 0)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or attributes & reparse
+                or _is_junction(component)
+            ):
+                raise ValueError("queue root is unsafe")
 
     @staticmethod
     def _copy(job: Job) -> Job:
