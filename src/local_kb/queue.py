@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -56,8 +57,21 @@ class DiskQueue:
         wanted = os.path.normcase(os.path.abspath(os.fspath(source_path)))
         for job in self.iter_jobs():
             original = job.metadata.get("original_source_path", job.source_path)
-            if job.state not in {"pending_attention", "published"} and os.path.normcase(os.path.abspath(str(original))) == wanted:
+            if os.path.normcase(os.path.abspath(str(original))) != wanted:
+                continue
+            if job.state not in {"pending_attention", "published"}:
                 return job
+            if job.state == "published" and job.metadata.get("original_preserved") is True:
+                try:
+                    info = os.stat(wanted, follow_symlinks=False)
+                    identity = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]
+                    if identity != job.metadata.get("original_identity"):
+                        continue
+                    digest = hashlib.sha256(Path(wanted).read_bytes()).hexdigest()
+                    if digest == job.metadata.get("original_sha256"):
+                        return job
+                except OSError:
+                    continue
         return None
 
     def update(self, job_id: str, change: Callable[[Job], Job | None]) -> Job:

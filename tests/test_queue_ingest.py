@@ -1,4 +1,5 @@
 import json
+import errno
 import multiprocessing
 import os
 from pathlib import Path
@@ -254,6 +255,58 @@ def test_ingest_claim_prevents_new_same_name_from_being_deleted(tmp_path, monkey
     assert incoming.read_text(encoding="utf-8") == "NEW"
     completed = queue.get(job.job_id)
     assert completed.metadata["original_source_path"] == str(incoming.resolve())
+
+
+def test_processed_move_before_metadata_failure_recovers_on_retry(tmp_path, monkeypatch):
+    vault, queue, catalog, service = make_service(tmp_path)
+    incoming = vault.inbox / "transition.txt"
+    incoming.write_text("transition evidence", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="transition")
+    original_mark = service._mark
+    failed = [False]
+
+    def fail_validated_once(job_id, state, **metadata):
+        if state == "validated" and not failed[0]:
+            failed[0] = True
+            raise OSError("transition")
+        return original_mark(job_id, state, **metadata)
+
+    monkeypatch.setattr(service, "_mark", fail_validated_once)
+    with pytest.raises(OSError, match="transition"):
+        service.process(job.job_id)
+    assert catalog.search("transition", {"unclassified"}) == []
+    completed = service.process(job.job_id)
+    restored = queue.get(job.job_id)
+    assert completed.status == "extracted"
+    assert restored.state == "published"
+    assert (vault.root / restored.metadata["processed_path"]).is_file()
+    assert catalog.search("transition", {"unclassified"})
+
+
+def test_cross_volume_preserved_original_is_a_tombstone_until_changed(tmp_path, monkeypatch):
+    from local_kb.cli import watch_once
+    from local_kb.watcher import StableTracker
+
+    vault, queue, _catalog, service = make_service(tmp_path)
+    incoming = vault.inbox / "cross.txt"
+    incoming.write_text("old", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="cross")
+    monkeypatch.setattr(
+        service,
+        "_atomic_claim_no_replace",
+        lambda *_: (_ for _ in ()).throw(OSError(errno.EXDEV, "cross volume")),
+    )
+    service.process(job.job_id)
+    assert incoming.exists()
+    tracker = StableTracker(0, trusted_root=vault.inbox)
+    submitted = set()
+    for _ in range(4):
+        assert watch_once(vault, tracker, submitted) == []
+    assert len(queue.iter_jobs()) == 1
+    incoming.write_text("new", encoding="utf-8")
+    assert watch_once(vault, tracker, submitted) == []
+    assert len(watch_once(vault, tracker, submitted)) == 1
+    assert len(queue.iter_jobs()) == 2
 
 
 def test_windows_claim_handle_blocks_path_replacement_before_rename(tmp_path, monkeypatch):

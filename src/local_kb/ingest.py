@@ -69,6 +69,29 @@ class IngestService:
             processed = job.metadata.get("processed_path")
             if isinstance(processed, str) and (self.vault.root / processed).is_file():
                 return job
+            if isinstance(job.metadata.get("source"), dict):
+                source = self._source_for(job)
+                assert source is not None
+                exact = (
+                    self.vault.trash
+                    / "processed-inbox"
+                    / job.job_id
+                    / source.original_name
+                )
+                try:
+                    self._safe_regular_under(self.vault.trash, exact)
+                except (OSError, ValueError) as error:
+                    raise ValueError("claimed input is missing and processed recovery is unsafe") from error
+                if self._hash_pinned_regular(exact) != source.sha256:
+                    raise ValueError("processed recovery checksum does not match source")
+                relative = str(exact.relative_to(self.vault.root))
+                self._mark(
+                    job.job_id,
+                    "validated",
+                    source=job.metadata["source"],
+                    processed_path=relative,
+                )
+                return self.queue.get(job.job_id)
             raise ValueError("claimed input is missing")
         original = Path(os.path.abspath(job.source_path))
         name = original.name
@@ -76,8 +99,18 @@ class IngestService:
         job_directory = self._safe_child_directory(staging, job.job_id)
         claimed = job_directory / name
         preserved = False
+        if original.exists():
+            original_hash, original_identity = self._hash_pinned_regular(
+                original, identity=True
+            )
+        elif os.path.lexists(claimed):
+            original_hash, original_identity = self._hash_pinned_regular(
+                claimed, identity=True
+            )
+        else:
+            raise FileNotFoundError(original)
         if os.path.lexists(claimed):
-            if original.exists() and self._hash_pinned_regular(claimed) != self._hash_pinned_regular(original):
+            if original.exists() and self._hash_pinned_regular(claimed) != original_hash:
                 raise FileExistsError("claimed target contains different file")
         else:
             try:
@@ -86,8 +119,7 @@ class IngestService:
                 cross_volume = error.errno == getattr(errno, "EXDEV", 18) or getattr(error, "winerror", None) == 17
                 if not cross_volume:
                     raise
-                digest = self._hash_pinned_regular(original)
-                self._copy_pinned_no_replace(original, claimed, digest)
+                self._copy_pinned_no_replace(original, claimed, original_hash)
                 preserved = True
 
         def record(current: Job) -> None:
@@ -95,19 +127,21 @@ class IngestService:
                 original_source_path=str(original),
                 claimed_path=str(claimed),
                 original_preserved=preserved,
+                original_identity=list(original_identity),
+                original_sha256=original_hash,
                 phase="claimed",
             )
             current.source_path = str(claimed)
             current.state = "stable"
         return self.queue.update(job.job_id, record)
 
-    @staticmethod
-    def _atomic_claim_no_replace(source: Path, target: Path) -> None:
+    def _atomic_claim_no_replace(self, source: Path, target: Path) -> None:
         if os.name == "nt":
             import ctypes
             from ctypes import wintypes
             from .source_store import (
                 _windows_close_handle,
+                _windows_open_directory,
                 _windows_rename_directory_handle,
             )
 
@@ -123,24 +157,38 @@ class IngestService:
                 wintypes.HANDLE,
             ]
             create_file.restype = wintypes.HANDLE
-            handle = create_file(
-                str(source),
-                0xC0000000 | 0x00010000,  # GENERIC_READ | GENERIC_WRITE | DELETE
-                0x00000001,  # SHARE_READ: deny WRITE and DELETE replacement
-                None,
-                3,  # OPEN_EXISTING
-                0x00200000,  # OPEN_REPARSE_POINT
-                None,
-            )
-            if handle == ctypes.c_void_p(-1).value:
-                raise ctypes.WinError(ctypes.get_last_error())
+            directory_handles: list[int] = []
+            handle = None
             try:
+                for path in (
+                    self.vault.root,
+                    self.vault.runtime,
+                    self.vault.staging,
+                    target.parent,
+                ):
+                    directory_handles.append(
+                        _windows_open_directory(path, self.vault.root)
+                    )
+                handle = create_file(
+                    str(source),
+                    0xC0000000 | 0x00010000,
+                    0x00000001,
+                    None,
+                    3,
+                    0x00200000,
+                    None,
+                )
+                if handle == ctypes.c_void_p(-1).value:
+                    raise ctypes.WinError(ctypes.get_last_error())
                 info = os.lstat(source)
                 if not stat.S_ISREG(info.st_mode) or source.is_symlink():
                     raise ValueError("claim source must be a safe regular file")
                 _windows_rename_directory_handle(int(handle), target)
             finally:
-                _windows_close_handle(int(handle))
+                if handle not in (None, ctypes.c_void_p(-1).value):
+                    _windows_close_handle(int(handle))
+                for directory_handle in reversed(directory_handles):
+                    _windows_close_handle(directory_handle)
             return
         from .source_store import _posix_rename_noreplace
 
