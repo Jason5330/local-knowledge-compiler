@@ -13,7 +13,7 @@ class Catalog:
     MAX_SEARCH_LIMIT = 100
     MAX_QUERY_CHARACTERS = 256
     MAX_QUERY_TERMS = 64
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -139,6 +139,16 @@ class Catalog:
                 WHEN NEW.created_sequence <> OLD.created_sequence
                 BEGIN
                     SELECT RAISE(ABORT, 'created_sequence is immutable');
+                END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS sources_source_id_immutable
+                BEFORE UPDATE OF source_id ON sources
+                WHEN NEW.source_id <> OLD.source_id
+                BEGIN
+                    SELECT RAISE(ABORT, 'source_id is immutable');
                 END
                 """
             )
@@ -354,10 +364,15 @@ class Catalog:
         ]
         with self.connection(immediate=True) as connection:
             existing = connection.execute(
-                "SELECT created_sequence FROM sources WHERE version_id = ?",
+                """
+                SELECT created_sequence, source_id
+                FROM sources WHERE version_id = ?
+                """,
                 (source.version_id,),
             ).fetchone()
             if existing is not None:
+                if existing["source_id"] != source.source_id:
+                    raise ValueError("source_id is immutable for an existing version_id")
                 created_sequence = existing["created_sequence"]
                 if (
                     source.created_sequence is not None
@@ -615,7 +630,7 @@ class Catalog:
             script = Catalog._script_kind(character)
             if script is not None:
                 end = start + 1
-                while end < len(query) and Catalog._script_kind(query[end]) == script:
+                while end < len(query) and Catalog._script_kind(query[end]) is not None:
                     end += 1
                 terms.extend(Catalog._cjk_ngrams(query[start:end]))
                 start = end
@@ -661,7 +676,7 @@ class Catalog:
                 start += 1
                 continue
             end = start + 1
-            while end < len(text) and Catalog._script_kind(text[end]) == script:
+            while end < len(text) and Catalog._script_kind(text[end]) is not None:
                 end += 1
             runs.append(text[start:end])
             start = end

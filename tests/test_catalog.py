@@ -50,6 +50,53 @@ def test_search_finds_japanese_substring_inside_continuous_text(tmp_path):
     ]
 
 
+def test_japanese_mixed_script_query_requires_full_continuity(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(
+        make_source(version_id="separated"),
+        [("line:1", "東京の観光地にタワーがあります")],
+    )
+    catalog.upsert_source(
+        make_source(
+            source_id="source-2", version_id="contiguous", sha256="b" * 64
+        ),
+        [("line:1", "東京タワーがあります")],
+    )
+
+    assert [
+        hit.version_id for hit in catalog.search("東京タワー", {"work"})
+    ] == ["contiguous"]
+
+
+def test_initialize_rebuilds_v3_index_for_mixed_script_ngrams(tmp_path):
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(
+        make_source(), [("line:1", "東京タワーがあります")]
+    )
+    with catalog.connection() as connection:
+        rowid = connection.execute(
+            "SELECT fts_rowid FROM source_fts_map WHERE version_id = ?",
+            ("version-1",),
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE source_fts SET body = ? WHERE rowid = ?",
+            ("東京 タワー 東 京 タ ワ ー 東京 タワ ワー", rowid),
+        )
+        connection.execute("PRAGMA user_version=3")
+
+    catalog.initialize()
+
+    assert [hit.version_id for hit in catalog.search("東京タワー", {"work"})] == [
+        "version-1"
+    ]
+
+
 def test_search_finds_korean_substring_inside_continuous_text(tmp_path):
     from local_kb.catalog import Catalog
 
@@ -676,6 +723,66 @@ def test_database_rejects_created_sequence_mutation(tmp_path):
             )
 
     assert catalog.latest_source("work", "notes.md").created_sequence == 41
+
+
+def test_upsert_rejects_source_id_mutation_without_damaging_lineage(tmp_path):
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(make_source(version_id="old"), [])
+    catalog.upsert_source(
+        make_source(
+            version_id="new", sha256="b" * 64, previous_version_id="old"
+        ),
+        [],
+    )
+
+    with pytest.raises(ValueError, match="source_id.*immutable"):
+        catalog.upsert_source(
+            make_source(
+                source_id="changed-source", version_id="old", sha256="a" * 64
+            ),
+            [],
+        )
+
+    with catalog.connection() as connection:
+        lineage = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT version_id, source_id, previous_version_id "
+                "FROM sources ORDER BY created_sequence"
+            )
+        ]
+
+    assert lineage == [
+        ("old", "source-1", None),
+        ("new", "source-1", "old"),
+    ]
+    assert catalog.latest_source("work", "notes.md").version_id == "new"
+
+
+def test_database_rejects_raw_source_id_mutation(tmp_path):
+    import sqlite3
+
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    catalog = Catalog(tmp_path / "catalog.sqlite3")
+    catalog.initialize()
+    catalog.upsert_source(make_source(), [])
+
+    with pytest.raises(sqlite3.IntegrityError, match="source_id.*immutable"):
+        with catalog.connection() as connection:
+            connection.execute(
+                "UPDATE sources SET source_id = ? WHERE version_id = ?",
+                ("changed-source", "version-1"),
+            )
+
+    assert catalog.latest_source("work", "notes.md").source_id == "source-1"
 
 
 def test_upsert_rejects_dangling_predecessor(tmp_path):
