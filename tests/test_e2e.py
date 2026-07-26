@@ -136,6 +136,21 @@ def test_init_rejects_existing_empty_or_corrupt_catalog(tmp_path, payload):
         build_vault(tmp_path)
 
 
+def test_init_rejects_unsafe_sidecar_when_catalog_main_is_missing(tmp_path):
+    root = tmp_path / "vault"
+    index = root / "40_index"
+    index.mkdir(parents=True)
+    outside = tmp_path / "outside-shm"
+    outside.write_bytes(b"keep-external-bytes")
+    os.link(outside, index / "catalog.sqlite3-shm")
+    before = outside.read_bytes()
+
+    with pytest.raises(ValueError, match="catalog.*unsafe|single-link"):
+        build_vault(root)
+
+    assert outside.read_bytes() == before
+
+
 def test_sixteen_concurrent_initializers_publish_one_valid_vault(tmp_path):
     root = tmp_path / "vault with spaces 知識庫"
     barrier = threading.Barrier(16)

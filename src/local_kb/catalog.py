@@ -7,7 +7,71 @@ import sqlite3
 from typing import Iterator, cast
 
 from .models import SearchHit, SourceStatus, SourceVersion, Space
-from .safety import guarded_catalog_path, secure_directory
+from .safety import guarded_catalog_path, secure_directory, verify_catalog_paths
+
+
+class _GuardedCursor(sqlite3.Cursor):
+    def execute(self, sql, parameters=(), /):
+        self.connection._verify_catalog_guard()
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql, parameters, /):
+        self.connection._verify_catalog_guard()
+        return super().executemany(sql, parameters)
+
+    def executescript(self, sql_script, /):
+        self.connection._verify_catalog_guard()
+        return super().executescript(sql_script)
+
+
+class _GuardedConnection(sqlite3.Connection):
+    _catalog_guard = None
+    _catalog_path: Path | None = None
+
+    def _verify_catalog_guard(self) -> None:
+        if self._catalog_guard is None or self._catalog_path is None:
+            raise sqlite3.ProgrammingError("catalog connection is closed")
+        verify_catalog_paths(self._catalog_path)
+
+    def execute(self, sql, parameters=(), /):
+        self._verify_catalog_guard()
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql, parameters, /):
+        self._verify_catalog_guard()
+        return super().executemany(sql, parameters)
+
+    def executescript(self, sql_script, /):
+        self._verify_catalog_guard()
+        return super().executescript(sql_script)
+
+    def cursor(self, factory=_GuardedCursor):
+        self._verify_catalog_guard()
+        return super().cursor(factory)
+
+    def commit(self) -> None:
+        self._verify_catalog_guard()
+        super().commit()
+
+    def rollback(self) -> None:
+        self._verify_catalog_guard()
+        super().rollback()
+
+    def close(self) -> None:
+        guard = self._catalog_guard
+        if guard is None:
+            return super().close()
+        self._catalog_guard = None
+        try:
+            super().close()
+        finally:
+            guard.__exit__(None, None, None)
+
+    def __del__(self):
+        try:
+            self.close()
+        except BaseException:
+            pass
 
 
 class Catalog:
@@ -20,28 +84,36 @@ class Catalog:
         self.path = Path(path)
 
     def connect(self) -> sqlite3.Connection:
-        with guarded_catalog_path(self.path, allow_missing_main=True):
-            connection = sqlite3.connect(self.path)
+        guard = guarded_catalog_path(self.path, allow_missing_main=True)
+        path = guard.__enter__()
+        connection: _GuardedConnection | None = None
+        try:
+            connection = sqlite3.connect(path, factory=_GuardedConnection)
+            connection._catalog_guard = guard
+            connection._catalog_path = self.path
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
             return connection
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            else:
+                guard.__exit__(None, None, None)
+            raise
 
     @contextmanager
     def connection(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
-        with guarded_catalog_path(self.path, allow_missing_main=True) as path:
-            connection = sqlite3.connect(path)
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys=ON")
-            try:
-                if immediate:
-                    connection.execute("BEGIN IMMEDIATE")
-                yield connection
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
-            finally:
-                connection.close()
+        connection = self.connect()
+        try:
+            if immediate:
+                connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def initialize(self) -> None:
         secure_directory(self.path.parent)

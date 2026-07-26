@@ -221,6 +221,50 @@ def test_catalog_rejects_hardlinked_database_or_sidecar_without_modifying_alias(
     assert outside.read_bytes() == before
 
 
+def test_direct_connection_keeps_guard_and_fails_before_using_new_hardlink_sidecar(
+    tmp_path,
+):
+    import os
+    from pathlib import Path
+
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    database = tmp_path / "catalog.sqlite3"
+    catalog = Catalog(database)
+    catalog.initialize()
+    connection = catalog.connect()
+    outside = tmp_path / "outside-journal"
+    outside.write_bytes(b"keep-external-bytes")
+    journal = Path(f"{database}-journal")
+    os.link(outside, journal)
+    before = outside.read_bytes()
+
+    with pytest.raises(ValueError, match="catalog.*unsafe|single-link"):
+        connection.execute("SELECT 1")
+
+    assert outside.read_bytes() == before
+    journal.unlink()
+    connection.close()
+
+
+def test_catalog_fd_binding_fails_closed_without_proc_or_dev_fd(tmp_path, monkeypatch):
+    import os
+
+    from local_kb.safety import _bound_catalog_path
+
+    descriptor = os.open(tmp_path / "placeholder", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        monkeypatch.setattr(
+            "local_kb.safety._fd_directory_candidates", lambda _descriptor: ()
+        )
+        with pytest.raises(ValueError, match="pinned catalog directory"):
+            _bound_catalog_path(tmp_path / "catalog.sqlite3", descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def test_connection_context_rolls_back_on_error(tmp_path):
     import pytest
 

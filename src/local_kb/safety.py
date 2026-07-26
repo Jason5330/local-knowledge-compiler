@@ -159,6 +159,32 @@ def _pin_catalog_entry(
     return descriptor
 
 
+def _fd_directory_candidates(descriptor: int) -> tuple[Path, ...]:
+    return (
+        Path("/proc/self/fd") / str(descriptor),
+        Path("/dev/fd") / str(descriptor),
+    )
+
+
+def _bound_catalog_path(database: Path, parent_fd: int | None) -> Path:
+    if parent_fd is None:
+        return database
+    pinned = os.fstat(parent_fd)
+    if not stat.S_ISDIR(pinned.st_mode):
+        raise ValueError("pinned catalog directory is not a directory")
+    for candidate in _fd_directory_candidates(parent_fd):
+        try:
+            current = os.stat(candidate)
+        except OSError:
+            continue
+        if (
+            stat.S_ISDIR(current.st_mode)
+            and (current.st_dev, current.st_ino) == (pinned.st_dev, pinned.st_ino)
+        ):
+            return candidate / database.name
+    raise ValueError("platform cannot bind the pinned catalog directory")
+
+
 @contextmanager
 def guarded_catalog_path(
     path: Path | str, *, allow_missing_main: bool = False
@@ -183,10 +209,7 @@ def guarded_catalog_path(
                     continue
                 descriptors[suffix] = _pin_catalog_entry(candidate, parent_fd, info)
                 baseline[suffix] = (info.st_dev, info.st_ino)
-            if parent_fd is not None and Path("/proc/self/fd").is_dir():
-                bound = Path(f"/proc/self/fd/{parent_fd}/{database.name}")
-            else:
-                bound = database
+            bound = _bound_catalog_path(database, parent_fd)
             yield bound
         finally:
             try:
@@ -208,3 +231,11 @@ def guarded_catalog_path(
             finally:
                 for descriptor in descriptors.values():
                     os.close(descriptor)
+
+
+def verify_catalog_paths(
+    path: Path | str, *, allow_missing_main: bool = False
+) -> None:
+    """Perform one complete pinned validation without opening SQLite."""
+    with guarded_catalog_path(path, allow_missing_main=allow_missing_main):
+        pass

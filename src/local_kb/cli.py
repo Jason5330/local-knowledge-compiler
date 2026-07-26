@@ -19,7 +19,7 @@ from .paths import VaultPaths
 from .queue import DiskQueue, WriterLock
 from .query import QueryService, write_packet
 from .search import ranked_search
-from .safety import secure_directory
+from .safety import secure_directory, verify_catalog_paths
 from .watcher import StableTracker
 
 
@@ -67,13 +67,13 @@ def build_vault(root: Path) -> VaultPaths:
             publish_with_link=True,
         )
         catalog_path = paths.index / "catalog.sqlite3"
-        catalog_existed = os.path.lexists(catalog_path)
+        verify_catalog_paths(catalog_path, allow_missing_main=True)
         with tempfile.TemporaryDirectory(prefix="local-kb-catalog-") as catalog_stage:
             staged_catalog = Path(catalog_stage) / "catalog.sqlite3"
             Catalog(staged_catalog).initialize()
             _install_once(paths.root, catalog_path, staged_catalog.read_bytes())
-        if catalog_existed:
-            _validate_initialized_catalog(catalog_path)
+        verify_catalog_paths(catalog_path)
+        _validate_initialized_catalog(catalog_path)
         for template_name, destination in (
             ("KNOWLEDGE_PROTOCOL.md", paths.system / "KNOWLEDGE_PROTOCOL.md"),
             ("AGENTS.md", paths.root / "AGENTS.md"),
