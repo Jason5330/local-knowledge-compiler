@@ -314,6 +314,17 @@ def test_windows_launcher_stays_running_and_reports_bad_vault(tmp_path):
         "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
         "-File", str(launcher), "-Vault", str(vault.root),
     ]
+    if not (repository / ".venv" / "Scripts" / "python.exe").is_file():
+        failed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert failed.returncode != 0
+        assert "Missing .venv" in failed.stderr
+        return
+
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
