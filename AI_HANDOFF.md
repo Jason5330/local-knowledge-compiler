@@ -103,8 +103,11 @@ Obsidian。因此改為設計一套：
 
 - 預設分支：`master`
 - 保留分支：`feature/local-knowledge-compiler`
-- 兩個分支在交接前都指向：
+- 第一版程式的已驗證基準提交：
   `3eac172cfebb88c8dc8ed85c377b5e7eb53b89d4`
+- `feature/local-knowledge-compiler` 保留在上述程式基準。
+- `master` 在上述基準之後加入本交接文件，因此會比功能分支多出文件提交；這不是
+  未合併的程式功能。
 - 第一版最終測試：`433 passed, 25 skipped`
 - 第一版整合審查：沒有剩餘的 Critical 或 Important 問題
 - 儲存庫權限：PRIVATE
