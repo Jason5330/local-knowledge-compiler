@@ -19,6 +19,7 @@ from .paths import VaultPaths
 from .queue import DiskQueue, WriterLock
 from .query import QueryService, write_packet
 from .search import ranked_search
+from .safety import secure_directory
 from .watcher import StableTracker
 
 
@@ -48,48 +49,63 @@ max_retries = 3
 
 def build_vault(root: Path) -> VaultPaths:
     """Create the standard layout and default configuration for a vault."""
-    requested_root = Path(root).absolute()
-    if os.path.lexists(requested_root) and (
-        requested_root.is_symlink()
-        or _is_reparse_path(requested_root)
-        or not requested_root.is_dir()
-    ):
-        raise ValueError("vault root is an unsafe link, reparse point, or non-directory")
-    requested_root.mkdir(parents=True, exist_ok=True)
+    requested_root = secure_directory(Path(root).absolute())
     paths = VaultPaths(requested_root)
-    for name in ROOTS:
-        _ensure_vault_directory(paths.root, getattr(paths, name))
-    for source_root in (paths.raw, paths.wiki):
-        for category in CATEGORIES:
-            _ensure_vault_directory(paths.root, source_root / category)
-    _ensure_vault_directory(paths.root, paths.queue)
-    _ensure_vault_directory(paths.root, paths.staging)
-    _install_once(
-        paths.root,
-        paths.config,
-        DEFAULT_CONFIG.encode("utf-8"),
-        publish_with_link=True,
-    )
-    with tempfile.TemporaryDirectory(prefix="local-kb-catalog-") as catalog_stage:
-        staged_catalog = Path(catalog_stage) / "catalog.sqlite3"
-        Catalog(staged_catalog).initialize()
+    secure_directory(paths.runtime)
+    with WriterLock(paths.runtime / "init.lock", timeout=30):
+        for name in ROOTS:
+            _ensure_vault_directory(paths.root, getattr(paths, name))
+        for source_root in (paths.raw, paths.wiki):
+            for category in CATEGORIES:
+                _ensure_vault_directory(paths.root, source_root / category)
+        _ensure_vault_directory(paths.root, paths.queue)
+        _ensure_vault_directory(paths.root, paths.staging)
         _install_once(
             paths.root,
-            paths.index / "catalog.sqlite3",
-            staged_catalog.read_bytes(),
+            paths.config,
+            DEFAULT_CONFIG.encode("utf-8"),
+            publish_with_link=True,
         )
-    for template_name, destination in (
-        ("KNOWLEDGE_PROTOCOL.md", paths.system / "KNOWLEDGE_PROTOCOL.md"),
-        ("AGENTS.md", paths.root / "AGENTS.md"),
-        ("CLAUDE.md", paths.root / "CLAUDE.md"),
-    ):
-        payload = (
-            resources.files("local_kb")
-            .joinpath("templates", template_name)
-            .read_bytes()
-        )
-        _install_once(paths.root, destination, payload)
+        catalog_path = paths.index / "catalog.sqlite3"
+        catalog_existed = os.path.lexists(catalog_path)
+        with tempfile.TemporaryDirectory(prefix="local-kb-catalog-") as catalog_stage:
+            staged_catalog = Path(catalog_stage) / "catalog.sqlite3"
+            Catalog(staged_catalog).initialize()
+            _install_once(paths.root, catalog_path, staged_catalog.read_bytes())
+        if catalog_existed:
+            _validate_initialized_catalog(catalog_path)
+        for template_name, destination in (
+            ("KNOWLEDGE_PROTOCOL.md", paths.system / "KNOWLEDGE_PROTOCOL.md"),
+            ("AGENTS.md", paths.root / "AGENTS.md"),
+            ("CLAUDE.md", paths.root / "CLAUDE.md"),
+        ):
+            payload = (
+                resources.files("local_kb")
+                .joinpath("templates", template_name)
+                .read_bytes()
+            )
+            _install_once(paths.root, destination, payload)
     return paths
+
+
+def _validate_initialized_catalog(path: Path) -> None:
+    import sqlite3
+
+    try:
+        with Catalog(path).connection() as connection:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            quick = connection.execute("PRAGMA quick_check").fetchone()[0]
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view')"
+                )
+            }
+        required = {"sources", "source_fragments", "source_fts", "source_fts_map"}
+        if version != Catalog.SCHEMA_VERSION or quick != "ok" or not required <= tables:
+            raise ValueError
+    except (OSError, ValueError, sqlite3.Error) as error:
+        raise ValueError("catalog is invalid; run kb rebuild") from error
 
 
 def _is_reparse_path(path: Path) -> bool:
@@ -387,3 +403,7 @@ def _watch_once_locked(
         tracker.forget(candidate)
     tracker.prune()
     return results
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

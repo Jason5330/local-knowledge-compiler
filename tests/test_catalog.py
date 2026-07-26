@@ -1,3 +1,6 @@
+import pytest
+
+
 def test_search_returns_indexed_traditional_chinese_source(tmp_path):
     from local_kb.catalog import Catalog
     from local_kb.models import SourceVersion
@@ -167,9 +170,7 @@ def test_plain_query_terms_are_deduplicated():
 
 def test_connection_context_commits_and_closes_database(tmp_path):
     import sqlite3
-
     import pytest
-
     from local_kb.catalog import Catalog
 
     database = tmp_path / "catalog.sqlite3"
@@ -190,6 +191,34 @@ def test_connection_context_commits_and_closes_database(tmp_path):
 
     database.unlink()
     catalog.initialize()
+
+
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm", "-journal"])
+def test_catalog_rejects_hardlinked_database_or_sidecar_without_modifying_alias(
+    tmp_path, suffix
+):
+    import os
+    from pathlib import Path
+
+    import pytest
+
+    from local_kb.catalog import Catalog
+
+    database = tmp_path / "catalog.sqlite3"
+    catalog = Catalog(database)
+    catalog.initialize()
+    candidate = Path(f"{database}{suffix}")
+    if candidate.exists():
+        candidate.unlink()
+    outside = tmp_path / f"outside{suffix or '-main'}"
+    outside.write_bytes(b"keep-external-bytes")
+    os.link(outside, candidate)
+    before = outside.read_bytes()
+
+    with pytest.raises(ValueError, match="catalog.*unsafe|single-link"):
+        catalog.initialize()
+
+    assert outside.read_bytes() == before
 
 
 def test_connection_context_rolls_back_on_error(tmp_path):

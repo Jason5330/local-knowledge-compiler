@@ -7,6 +7,7 @@ import sqlite3
 from typing import Iterator, cast
 
 from .models import SearchHit, SourceStatus, SourceVersion, Space
+from .safety import guarded_catalog_path, secure_directory
 
 
 class Catalog:
@@ -19,27 +20,31 @@ class Catalog:
         self.path = Path(path)
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        with guarded_catalog_path(self.path, allow_missing_main=True):
+            connection = sqlite3.connect(self.path)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            return connection
 
     @contextmanager
     def connection(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
-        connection = self.connect()
-        try:
-            if immediate:
-                connection.execute("BEGIN IMMEDIATE")
-            yield connection
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+        with guarded_catalog_path(self.path, allow_missing_main=True) as path:
+            connection = sqlite3.connect(path)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            try:
+                if immediate:
+                    connection.execute("BEGIN IMMEDIATE")
+                yield connection
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
 
     def initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        secure_directory(self.path.parent)
         with self.connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
         with self.connection(immediate=True) as connection:

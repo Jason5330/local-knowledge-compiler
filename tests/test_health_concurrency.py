@@ -220,6 +220,24 @@ def test_rebuild_cleans_safe_stale_sidecars_and_is_immediately_healthy(tmp_path)
     assert lint(vault)["healthy"] is True
 
 
+def test_lint_rejects_hardlinked_catalog_journal_without_modifying_alias(tmp_path):
+    from local_kb.health import lint
+
+    vault = _vault(tmp_path)
+    database = vault.index / "catalog.sqlite3"
+    journal = Path(f"{database}-journal")
+    outside = tmp_path / "outside-journal"
+    outside.write_bytes(b"keep-external-bytes")
+    os.link(outside, journal)
+    before = outside.read_bytes()
+
+    report = lint(vault)
+
+    assert report["healthy"] is False
+    assert "catalog_snapshot_unavailable" in report["issues"]["index_raw_mismatches"]
+    assert outside.read_bytes() == before
+
+
 def test_change_transaction_uses_outer_writer_lock_without_nested_deadlock(tmp_path):
     from local_kb.queue import WriterLock
     from local_kb.transaction import ChangeTransaction

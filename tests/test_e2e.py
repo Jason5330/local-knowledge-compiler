@@ -1,6 +1,13 @@
 import json
 import os
 from pathlib import Path
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from http.client import HTTPConnection, HTTPSConnection
 
 import pytest
 
@@ -20,7 +27,20 @@ def _citation(evidence: dict[str, object]) -> dict[str, object]:
     }
 
 
-def test_offline_ingest_prepare_cited_answer_finalize_and_derived_job(tmp_path):
+def test_offline_ingest_prepare_cited_answer_finalize_and_derived_job(
+    tmp_path, monkeypatch
+):
+    network_attempts = []
+
+    def reject_network(*args, **kwargs):
+        network_attempts.append((args, kwargs))
+        raise AssertionError("offline knowledge flow attempted network access")
+
+    monkeypatch.setattr(socket, "create_connection", reject_network)
+    monkeypatch.setattr(socket.socket, "connect", reject_network)
+    monkeypatch.setattr(urllib.request, "urlopen", reject_network)
+    monkeypatch.setattr(HTTPConnection, "connect", reject_network)
+    monkeypatch.setattr(HTTPSConnection, "connect", reject_network)
     paths = build_vault(tmp_path)
     source = paths.inbox / "decision.md"
     source.write_text(
@@ -60,6 +80,7 @@ def test_offline_ingest_prepare_cited_answer_finalize_and_derived_job(tmp_path):
     assert derived.metadata["raw_source_ids"] == [raw["source_id"]]
     assert all(not str(item["path"]).startswith(("http://", "https://"))
                for item in packet["evidence"])
+    assert network_attempts == []
 
 
 def test_init_installs_one_canonical_protocol_and_thin_agent_entries(tmp_path):
@@ -103,6 +124,64 @@ def test_fresh_init_is_immediately_healthy(tmp_path):
 
     assert report["healthy"] is True
     assert report["issues"]["index_raw_mismatches"] == []
+
+
+@pytest.mark.parametrize("payload", [b"", b"not a sqlite database"])
+def test_init_rejects_existing_empty_or_corrupt_catalog(tmp_path, payload):
+    paths = build_vault(tmp_path)
+    database = paths.index / "catalog.sqlite3"
+    database.write_bytes(payload)
+
+    with pytest.raises(ValueError, match="catalog.*invalid|rebuild"):
+        build_vault(tmp_path)
+
+
+def test_sixteen_concurrent_initializers_publish_one_valid_vault(tmp_path):
+    root = tmp_path / "vault with spaces 知識庫"
+    barrier = threading.Barrier(16)
+    results = []
+
+    def initialize():
+        try:
+            barrier.wait(timeout=10)
+            results.append(build_vault(root))
+        except BaseException as error:
+            results.append(error)
+
+    threads = [threading.Thread(target=initialize) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(results) == 16
+    errors = [repr(result) for result in results if isinstance(result, BaseException)]
+    assert errors == []
+    assert lint(results[0])["healthy"] is True
+    assert not list(root.rglob("*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction coverage")
+def test_init_rejects_parent_junction_before_any_external_write(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "marker.txt"
+    marker.write_text("keep", encoding="utf-8")
+    junction = tmp_path / "redirect"
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip("directory junctions are unavailable")
+
+    with pytest.raises(ValueError, match="unsafe|reparse|link"):
+        build_vault(junction / "new-vault")
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert not (outside / "new-vault").exists()
 
 
 def test_repeated_init_preserves_all_user_edited_protocol_files(tmp_path):
@@ -191,3 +270,51 @@ def test_windows_launcher_and_beginner_readme_explain_safe_daily_workflow():
     ):
         assert required in readme
     assert "不代表送給 AI 的內容仍然離線" in readme
+
+
+def test_python_module_entrypoint_invokes_cli_help():
+    completed = subprocess.run(
+        [sys.executable, "-m", "local_kb.cli", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    assert "usage: kb" in completed.stdout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher coverage")
+def test_windows_launcher_stays_running_and_reports_bad_vault(tmp_path):
+    repository = Path(__file__).resolve().parents[1]
+    launcher = repository / "scripts" / "start-kb.ps1"
+    vault = build_vault(tmp_path / "vault with spaces 知識庫")
+    command = [
+        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", str(launcher), "-Vault", str(vault.root),
+    ]
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    try:
+        time.sleep(1.0)
+        assert process.poll() is None
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+
+    failed = subprocess.run(
+        command[:-1] + [str(tmp_path / "missing vault")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert failed.returncode != 0
+    assert "Vault directory not found" in failed.stderr
+
+
+def test_source_distribution_manifest_includes_windows_launcher():
+    repository = Path(__file__).resolve().parents[1]
+    manifest = (repository / "MANIFEST.in").read_text(encoding="ascii")
+
+    assert "include scripts/start-kb.ps1" in manifest

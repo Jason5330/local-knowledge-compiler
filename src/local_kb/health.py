@@ -29,6 +29,7 @@ from .query import (
     _safe_walk_wiki,
 )
 from .source_store import SourceStore
+from .safety import CATALOG_SUFFIXES, guarded_catalog_path, is_reparse
 
 
 MAX_CACHE_FILES = 100_000
@@ -84,7 +85,7 @@ def _rebuild_catalog_unlocked(paths: VaultPaths) -> int:
 
 
 def _quiesce_catalog_sidecars(target: Path, parent_fd: int | None) -> None:
-    sidecars = (Path(f"{target}-wal"), Path(f"{target}-shm"))
+    sidecars = tuple(Path(f"{target}{suffix}") for suffix in CATALOG_SUFFIXES[1:])
     observed: list[tuple[Path, os.stat_result]] = []
     for sidecar in sidecars:
         try:
@@ -94,19 +95,23 @@ def _quiesce_catalog_sidecars(target: Path, parent_fd: int | None) -> None:
             )
         except FileNotFoundError:
             continue
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or is_reparse(sidecar)
+        ):
             raise CatalogBusy("catalog sidecar is unsafe")
         observed.append((sidecar, info))
     if any(info.st_size for _, info in observed):
-        bound_target = _bound_catalog_path(target, parent_fd)
         try:
-            with closing(sqlite3.connect(bound_target, timeout=0)) as connection:
-                result = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-                if result is not None and int(result[0]) != 0:
-                    raise CatalogBusy("catalog WAL is busy")
-                mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
-                if str(mode).casefold() != "delete":
-                    raise CatalogBusy("catalog journal mode is busy")
+            with guarded_catalog_path(target) as bound_target:
+                with closing(sqlite3.connect(bound_target, timeout=0)) as connection:
+                    result = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    if result is not None and int(result[0]) != 0:
+                        raise CatalogBusy("catalog WAL is busy")
+                    mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+                    if str(mode).casefold() != "delete":
+                        raise CatalogBusy("catalog journal mode is busy")
         except sqlite3.OperationalError as error:
             raise CatalogBusy("catalog sidecars are live") from error
     for sidecar in sidecars:
@@ -117,7 +122,12 @@ def _quiesce_catalog_sidecars(target: Path, parent_fd: int | None) -> None:
             )
         except FileNotFoundError:
             continue
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 0:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size != 0
+            or is_reparse(sidecar)
+        ):
             raise CatalogBusy("catalog sidecar is not safely stale")
         if parent_fd is not None:
             os.unlink(sidecar.name, dir_fd=parent_fd)
@@ -132,15 +142,6 @@ def _quiesce_catalog_sidecars(target: Path, parent_fd: int | None) -> None:
         except FileNotFoundError:
             continue
         raise CatalogBusy("catalog sidecar appeared during rebuild")
-
-
-def _bound_catalog_path(target: Path, parent_fd: int | None) -> Path:
-    if parent_fd is None:
-        return target
-    proc_path = Path(f"/proc/self/fd/{parent_fd}/{target.name}")
-    if proc_path.parent.parent.is_dir():
-        return proc_path
-    raise CatalogBusy("cannot safely bind catalog path on this platform")
 
 
 def _publish_rebuilt_catalog(
@@ -536,32 +537,33 @@ def _catalog_snapshot(path: Path):
         except (OSError, ValueError) as error:
             raise CatalogSnapshotUnavailable("catalog changed before snapshot") from error
         if any(
-            name.endswith(("-wal", "-shm")) and token["size"]
+            name.endswith(("-wal", "-shm", "-journal")) and token["size"]
             for name, token in before.items()
         ):
-            raise CatalogBusy("catalog has a live WAL/SHM; retry after the writer stops")
-        uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+            raise CatalogBusy("catalog has a live journal sidecar; retry after the writer stops")
         started = time.monotonic()
-        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as source:
-            source.execute("PRAGMA query_only=ON")
-            source.execute("BEGIN")
-            source.execute("SELECT count(*) FROM sqlite_schema").fetchone()
-            page_size = int(source.execute("PRAGMA page_size").fetchone()[0])
-            page_count = int(source.execute("PRAGMA page_count").fetchone()[0])
-            if page_size <= 0 or page_count < 0 or page_size * page_count > MAX_CATALOG_FILE_BYTES:
-                raise ValueError("catalog exceeds snapshot size limit")
-
-            def progress(_status: int, _remaining: int, total: int) -> None:
-                if total * page_size > MAX_CATALOG_FILE_BYTES:
+        with guarded_catalog_path(path) as bound_path:
+            uri = f"{bound_path.as_uri()}?mode=ro&immutable=1"
+            with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as source:
+                source.execute("PRAGMA query_only=ON")
+                source.execute("BEGIN")
+                source.execute("SELECT count(*) FROM sqlite_schema").fetchone()
+                page_size = int(source.execute("PRAGMA page_size").fetchone()[0])
+                page_count = int(source.execute("PRAGMA page_count").fetchone()[0])
+                if page_size <= 0 or page_count < 0 or page_size * page_count > MAX_CATALOG_FILE_BYTES:
                     raise ValueError("catalog exceeds snapshot size limit")
-                if time.monotonic() - started > 10:
-                    raise TimeoutError("catalog snapshot timed out")
 
-            with closing(sqlite3.connect(destination)) as target:
-                source.backup(target, pages=256, progress=progress, sleep=0.01)
-                if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                    raise CatalogSnapshotUnavailable("catalog snapshot failed integrity check")
-            source.rollback()
+                def progress(_status: int, _remaining: int, total: int) -> None:
+                    if total * page_size > MAX_CATALOG_FILE_BYTES:
+                        raise ValueError("catalog exceeds snapshot size limit")
+                    if time.monotonic() - started > 10:
+                        raise TimeoutError("catalog snapshot timed out")
+
+                with closing(sqlite3.connect(destination)) as target:
+                    source.backup(target, pages=256, progress=progress, sleep=0.01)
+                    if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        raise CatalogSnapshotUnavailable("catalog snapshot failed integrity check")
+                source.rollback()
         try:
             after = _catalog_file_state(path)
         except (OSError, ValueError) as error:
@@ -573,14 +575,19 @@ def _catalog_snapshot(path: Path):
 
 def _catalog_file_state(path: Path) -> dict[str, dict[str, object]]:
     state: dict[str, dict[str, object]] = {}
-    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+    for candidate in tuple(Path(f"{path}{suffix}") for suffix in CATALOG_SUFFIXES):
         try:
             info = candidate.lstat()
         except FileNotFoundError:
             if candidate == path:
                 raise
             continue
-        if not stat.S_ISREG(info.st_mode) or candidate.is_symlink():
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or candidate.is_symlink()
+            or is_reparse(candidate)
+            or info.st_nlink != 1
+        ):
             raise ValueError("catalog path is unsafe")
         if info.st_size > MAX_CATALOG_FILE_BYTES:
             raise ValueError("catalog file exceeds snapshot size limit")
