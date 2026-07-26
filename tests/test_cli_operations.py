@@ -74,6 +74,8 @@ def test_status_is_bounded_json_and_does_not_modify_vault(tmp_path, capsys):
         "healthy": False,
         "attention_required": True,
         "truncated": False,
+        "actionable_count": 1,
+        "actionable_count_is_lower_bound": False,
         "jobs": [
             {
                 "job_id": job.job_id,
@@ -99,6 +101,51 @@ def test_status_with_no_actionable_jobs_is_healthy(tmp_path, capsys):
     assert result == 0
     assert report["healthy"] is True
     assert report["attention_required"] is False
+    assert report["actionable_count"] == 0
+    assert report["actionable_count_is_lower_bound"] is False
+    assert report["jobs"] == []
+    assert _snapshot_tree(paths.root) == before
+
+
+def test_readonly_queue_scan_caps_total_entries_not_only_json(tmp_path):
+    paths = build_vault(tmp_path)
+    for index in range(6):
+        (paths.queue / f"noise-{index}.txt").write_text(
+            "noise", encoding="utf-8"
+        )
+    queue = DiskQueue(paths.queue)
+
+    jobs, truncated = queue.iter_jobs_bounded_readonly(
+        max_jobs=10,
+        max_entries=2,
+    )
+
+    assert jobs == []
+    assert truncated is True
+
+
+def test_status_reports_truncated_count_as_lower_bound_without_writes(
+    tmp_path, monkeypatch, capsys
+):
+    import local_kb.cli as cli_module
+
+    paths = build_vault(tmp_path)
+    for index in range(6):
+        (paths.queue / f"noise-{index}.txt").write_text(
+            "noise", encoding="utf-8"
+        )
+    before = _snapshot_tree(paths.root)
+    monkeypatch.setattr(cli_module, "STATUS_MAX_ENTRIES", 2)
+
+    result = main(["status", "--vault", str(paths.root)])
+
+    report = json.loads(capsys.readouterr().out)
+    assert result == 2
+    assert report["truncated"] is True
+    assert report["attention_required"] is True
+    assert report["healthy"] is False
+    assert report["actionable_count"] == 0
+    assert report["actionable_count_is_lower_bound"] is True
     assert report["jobs"] == []
     assert _snapshot_tree(paths.root) == before
 

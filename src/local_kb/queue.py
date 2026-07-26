@@ -27,6 +27,8 @@ _JOB_STATES = frozenset(get_args(JobState))
 MAX_JOB_BYTES = 4 * 1024 * 1024
 MAX_QUEUE_BATCH_BYTES = 64 * 1024 * 1024
 DEFAULT_QUEUE_BATCH_BYTES = 16 * 1024 * 1024
+DEFAULT_QUEUE_SCAN_ENTRIES = 20_000
+MAX_QUEUE_SCAN_ENTRIES = 100_000
 _WRITER_LOCK_FORMAT = "local-kb-writer-lock-v1"
 _MAX_WRITER_LOCK_BYTES = 4096
 _WRITER_LOCAL = threading.local()
@@ -101,9 +103,20 @@ class WriterLock:
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
             if not created:
-                existing = self._read_record(self.handle)
-                if existing.get("format") != _WRITER_LOCK_FORMAT:
-                    raise ValueError("writer lock is not a local knowledge lock")
+                try:
+                    existing = self._read_record(self.handle)
+                except ValueError:
+                    # Another process may open the just-created pathname and
+                    # win the kernel-lock race before its creator writes the
+                    # first diagnostic record.  Only that exact empty state
+                    # is recoverable; non-empty foreign records stay rejected.
+                    if os.fstat(self.handle).st_size != 0:
+                        raise
+                else:
+                    if existing.get("format") != _WRITER_LOCK_FORMAT:
+                        raise ValueError(
+                            "writer lock is not a local knowledge lock"
+                        )
             self._token = uuid4().hex
             record = {
                 "format": _WRITER_LOCK_FORMAT,
@@ -397,8 +410,10 @@ class DiskQueue:
         self,
         max_jobs: int,
         max_bytes: int = DEFAULT_QUEUE_BATCH_BYTES,
+        *,
+        max_entries: int = DEFAULT_QUEUE_SCAN_ENTRIES,
     ) -> tuple[list[Job], bool]:
-        """Read a bounded queue snapshot without creating or updating lock files."""
+        """Read a bounded snapshot, counting every directory entry scanned."""
         if isinstance(max_jobs, bool) or not isinstance(max_jobs, int) or max_jobs < 1:
             raise ValueError("max_jobs must be a positive integer")
         if (
@@ -407,6 +422,12 @@ class DiskQueue:
             or not 1 <= max_bytes <= MAX_QUEUE_BATCH_BYTES
         ):
             raise ValueError("max_bytes must be a positive bounded integer")
+        if (
+            isinstance(max_entries, bool)
+            or not isinstance(max_entries, int)
+            or not 1 <= max_entries <= MAX_QUEUE_SCAN_ENTRIES
+        ):
+            raise ValueError("max_entries must be a positive bounded integer")
         scan_target = (
             self.root
             if os.name == "nt"
@@ -414,8 +435,13 @@ class DiskQueue:
         )
         names: list[str] = []
         truncated = False
+        scanned = 0
         with os.scandir(scan_target) as entries:
             for entry in entries:
+                scanned += 1
+                if scanned > max_entries:
+                    truncated = True
+                    break
                 if not entry.name.endswith(".json"):
                     continue
                 if len(names) >= max_jobs:

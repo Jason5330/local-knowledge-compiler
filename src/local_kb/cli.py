@@ -48,6 +48,9 @@ stable_seconds = 5.0
 [queue]
 max_retries = 3
 """
+STATUS_MAX_JOBS = 10_000
+STATUS_MAX_BYTES = 16 * 1024 * 1024
+STATUS_MAX_ENTRIES = 20_000
 
 
 def _compiler_for_config(config: Config, paths: VaultPaths):
@@ -397,8 +400,9 @@ def _status_report(paths: VaultPaths) -> dict[str, object]:
         raise ValueError("queue directory is missing; run kb init")
     queue = DiskQueue(paths.queue)
     jobs, truncated = queue.iter_jobs_bounded_readonly(
-        max_jobs=10_000,
-        max_bytes=16 * 1024 * 1024,
+        max_jobs=STATUS_MAX_JOBS,
+        max_bytes=STATUS_MAX_BYTES,
+        max_entries=STATUS_MAX_ENTRIES,
     )
     actionable = [
         _status_job(job) for job in jobs if job.state != "published"
@@ -409,6 +413,8 @@ def _status_report(paths: VaultPaths) -> dict[str, object]:
         "healthy": not attention_required,
         "attention_required": attention_required,
         "truncated": truncated,
+        "actionable_count": len(actionable),
+        "actionable_count_is_lower_bound": truncated,
         "jobs": actionable,
     }
 

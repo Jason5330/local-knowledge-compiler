@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -66,6 +67,54 @@ def test_writer_lock_rejects_foreign_file_and_does_not_delete_replacement(tmp_pa
     held.__exit__(None, None, None)
     assert lock_path.read_text(encoding="utf-8") == "replacement"
     assert moved.read_bytes() == original
+
+
+def test_writer_lock_recovers_when_an_existing_empty_record_wins_creation_race(
+    tmp_path, monkeypatch
+):
+    from local_kb.queue import WriterLock
+
+    lock_path = tmp_path / "runtime" / "write.lock"
+    creator_waiting = threading.Event()
+    allow_creator = threading.Event()
+    outcomes = []
+    original_try_lock = WriterLock._try_lock
+
+    def pause_creator(descriptor):
+        if (
+            threading.current_thread().name == "lock-creator"
+            and not allow_creator.is_set()
+        ):
+            creator_waiting.set()
+            assert allow_creator.wait(timeout=5)
+        return original_try_lock(descriptor)
+
+    monkeypatch.setattr(
+        WriterLock, "_try_lock", staticmethod(pause_creator)
+    )
+
+    def create_first():
+        try:
+            with WriterLock(lock_path, timeout=2):
+                outcomes.append("creator")
+        except BaseException as error:
+            outcomes.append(error)
+
+    creator = threading.Thread(target=create_first, name="lock-creator")
+    creator.start()
+    assert creator_waiting.wait(timeout=5)
+    try:
+        try:
+            with WriterLock(lock_path, timeout=2):
+                outcomes.append("racer")
+        except BaseException as error:
+            outcomes.append(error)
+    finally:
+        allow_creator.set()
+        creator.join(timeout=5)
+
+    assert not creator.is_alive()
+    assert outcomes == ["racer", "creator"]
 
 
 def test_writer_lock_rejects_symlink_without_touching_target(tmp_path):
