@@ -18,9 +18,11 @@ files_modified:
 
 請完整讀完本文件，再依序讀：
 
-1. `README.md`
-2. `docs/superpowers/specs/2026-07-25-local-knowledge-iteration-system-design.md`
-3. `80_system/KNOWLEDGE_PROTOCOL.md`  
+1. `docs/BEGINNER_GUIDE.zh-TW.md`
+2. `docs/CLI_REFERENCE.zh-TW.md`
+3. `README.md`
+4. `docs/superpowers/specs/2026-07-25-local-knowledge-iteration-system-design.md`
+5. `80_system/KNOWLEDGE_PROTOCOL.md`
    注意：這個檔案要等真正執行 `kb init` 建立知識庫後，才會出現在知識庫裡。
 
 不要重新設計或重寫已完成的系統。下一個實際工作是：
@@ -264,15 +266,28 @@ C:\KnowledgeBase\80_system\KNOWLEDGE_PROTOCOL.md
 
 ### 7.1 最安全的一次性匯入
 
-不要刪除使用者原本的 Excel。可直接從原路徑匯入：
+不要直接把唯一原始 Excel 交給 `ingest-once`。同一磁碟上的檔案可能在接管階段被
+移入處理區。必須先把原檔複製到 `00_inbox`，再只匯入該副本：
 
 ```powershell
+$InboxCopy = "C:\KnowledgeBase\00_inbox\資料.xlsx"
+if (Test-Path -LiteralPath $InboxCopy) {
+  throw "00_inbox 已有同名檔案，請等待處理完成或改用新檔名。"
+}
+Copy-Item `
+  -LiteralPath "C:\使用者資料\資料.xlsx" `
+  -Destination $InboxCopy `
+  -ErrorAction Stop
+
 Set-Location "C:\AI\local-knowledge-compiler"
 .\.venv\Scripts\kb.exe ingest-once `
   "C:\KnowledgeBase" `
-  "C:\使用者資料\資料.xlsx" `
+  $InboxCopy `
   --space work
 ```
+
+複製前若 `00_inbox` 已有同名檔案，不得直接覆蓋；先等待舊副本處理完成，或替新副本
+加上日期。使用者唯一原檔必須留在原位置。
 
 空間選擇：
 
@@ -280,9 +295,12 @@ Set-Location "C:\AI\local-knowledge-compiler"
 - 工作資料：`work`
 - 可共用資料：`shared`
 - 還不能判斷：`unclassified`
-- 特定專案：`project:<英文專案代號>`
 
 不要擅自把低信心資料放進 `shared`。
+
+第一版 Windows 匯入不要使用設計中預留的 `project:<代號>`。查詢層雖能辨識它，
+但原始檔保存層目前不接受冒號資料夾名稱。特定專案資料暫時歸入 `work`，並在檔名
+或內容標明專案。
 
 ### 7.2 持續監看
 

@@ -3,6 +3,16 @@
 這套工具把一般資料夾變成 Codex 與 Claude 都能使用的本地知識庫。原始檔永久保留，
 AI 只從本機索引整理證據；你不需要 Obsidian，也不需要理解程式架構。
 
+## 完全不懂技術，請從這裡開始
+
+- [零基礎安裝與使用指南](docs/BEGINNER_GUIDE.zh-TW.md)：從安裝 Git、Python、
+  登入 GitHub，到第一次安全匯入 Excel、提問、保存答案與故障處理。
+- [所有指令參考](docs/CLI_REFERENCE.zh-TW.md)：`init`、`watch`、
+  `ingest-once`、`prepare`、`finalize`、`status`、`resume`、`lint`、
+  `rebuild` 的完整白話說明。
+- [換電腦／換 AI 的交接文件](AI_HANDOFF.md)：讓 Codex、Claude 或其他 AI
+  直接接手目前進度。
+
 ## 初次安裝
 
 在 PowerShell 進入本專案資料夾，依序執行：
