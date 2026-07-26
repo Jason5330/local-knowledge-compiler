@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import html
 import os
@@ -96,10 +97,18 @@ def finalize_and_enqueue(
     """Save an answer and atomically create its fully-typed derived queue job."""
     paths = _vault_paths(vault)
     validated = _validate(packet, answer)
-    path, identity = _write_answer(paths, _render(validated))
+    rendered = _render(validated)
+    path, identity = _write_answer(paths, rendered)
     relative = path.relative_to(paths.root).as_posix()
+    answer_sha256 = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
     try:
-        job = _enqueue_derived_update(queue, relative, validated.raw_source_ids)
+        job = _enqueue_derived_update(
+            queue,
+            relative,
+            validated.raw_source_ids,
+            answer_sha256=answer_sha256,
+            answer_identity=identity,
+        )
     except BaseException:
         _remove_exact_answer(paths, path, identity)
         raise
@@ -408,11 +417,21 @@ def _answer_identity_matches(
 
 
 def _enqueue_derived_update(
-    queue: DiskQueue, answer_path: str, source_ids: tuple[str, ...]
+    queue: DiskQueue,
+    answer_path: str,
+    source_ids: tuple[str, ...],
+    *,
+    answer_sha256: str,
+    answer_identity: tuple[int, int, int, int],
 ) -> Job:
     method = getattr(queue, "enqueue_derived_update", None)
     if callable(method):
-        return method(answer_path=answer_path, raw_source_ids=list(source_ids))
+        return method(
+            answer_path=answer_path,
+            raw_source_ids=list(source_ids),
+            answer_sha256=answer_sha256,
+            answer_identity=list(answer_identity),
+        )
     if not isinstance(queue, DiskQueue):
         raise TypeError("queue must support derived updates")
     identifier = uuid4().hex
@@ -423,6 +442,8 @@ def _enqueue_derived_update(
             "job_type": "derived_update",
             "answer_path": answer_path,
             "raw_source_ids": list(source_ids),
+            "answer_sha256": answer_sha256,
+            "answer_identity": list(answer_identity),
         },
     )
     with queue._locked():

@@ -286,6 +286,8 @@ def test_finalize_and_enqueue_carries_only_cited_raw_source_ids(tmp_path):
     assert job.metadata["job_type"] == "derived_update"
     assert job.metadata["raw_source_ids"] == ["src-ok"]
     assert job.metadata["answer_path"] == result.path.relative_to(vault.root).as_posix()
+    assert job.metadata["answer_sha256"]
+    assert len(job.metadata["answer_identity"]) == 4
     assert job.source_path == ""
     assert all(result.path.name not in value for value in job.metadata["raw_source_ids"])
 
@@ -319,8 +321,10 @@ def test_watcher_never_ingests_derived_answer_as_raw_source(tmp_path):
 
     assert watch_once(vault, StableTracker(0, trusted_root=vault.inbox), set()) == []
     job = queue.get(result.job_id)
-    assert job.state == "discovered"
-    assert job.attempts == 0
+    assert job.state == "retrying"
+    assert job.attempts == 1
+    assert "unknown raw sources" in job.error
+    assert not list(vault.raw.rglob("manifest.json"))
 
 
 def test_queue_failure_leaves_no_saved_answer(tmp_path):

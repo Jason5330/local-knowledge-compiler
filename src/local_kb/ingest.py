@@ -228,10 +228,28 @@ class IngestService:
         if source.status != "extracted":
             return _CompileOutcome()
         evidence = self._compiler_evidence(source, extraction)
+        return self._prepare_compilation_evidence(
+            source,
+            evidence,
+            compiler=compiler,
+            allowed_source_ids=(source.source_id,),
+        )
+
+    def _prepare_compilation_evidence(
+        self,
+        source: SourceVersion,
+        evidence: str,
+        *,
+        compiler: Any = None,
+        allowed_source_ids: tuple[str, ...],
+    ) -> _CompileOutcome:
+        """Compile already-validated evidence into the shared durable receipt."""
         result = (compiler or self.compiler).compile(evidence)
         if isinstance(result, Path):
             return _CompileOutcome(handoff=self._handoff_metadata(result))
-        changes = self._validated_compiler_changes(result, source)
+        changes = self._validated_compiler_changes(
+            result, source, allowed_source_ids=allowed_source_ids
+        )
         now = _utc_now()
         pages: list[tuple[str, WikiPage]] = []
         for relative, change in changes:
@@ -267,6 +285,247 @@ class IngestService:
         return _CompileOutcome(
             paths=tuple(relative for relative, _ in rendered), receipt=receipt
         )
+
+    def process_derived_update(
+        self, job_id: str, *, compiler: Any = None
+    ) -> list[str]:
+        """Compile a saved cited answer into Wiki only, never into raw/catalog."""
+        job = self.queue.get(job_id)
+        try:
+            source, evidence, source_ids = self._derived_update_inputs(job)
+            if "compilation_receipt" in job.metadata:
+                receipt = self._validate_compilation_receipt(
+                    job.metadata.get("compilation_receipt"),
+                    job.metadata.get("compilation_receipt_sha256"),
+                    source,
+                )
+                paths = self._apply_compilation_receipt(receipt, source)
+                self._complete_compilation(job_id, source)
+                return paths
+            if job.state == "published":
+                return []
+            if job.state == "pending_attention":
+                self._validate_derived_pending(job)
+                return []
+            outcome = self._prepare_compilation_evidence(
+                source,
+                evidence,
+                compiler=compiler,
+                allowed_source_ids=source_ids,
+            )
+            if outcome.handoff is not None:
+                self._mark_derived_pending(job_id, source, outcome.handoff)
+                return []
+            assert outcome.receipt is not None
+            self._persist_compilation_receipt(job_id, source, outcome.receipt)
+            paths = self._apply_compilation_receipt(outcome.receipt, source)
+            self._complete_compilation(job_id, source)
+            return paths
+        except BaseException as error:
+            self.queue.fail(job_id, error)
+            raise
+
+    def resume_derived_update(
+        self, job_id: str, *, compiler: Any = None
+    ) -> list[str]:
+        """Retry an actionable derived-answer handoff without raw ingestion."""
+        job = self.queue.get(job_id)
+        self._validate_derived_pending(job)
+        source, evidence, source_ids = self._derived_update_inputs(job)
+        outcome = self._prepare_compilation_evidence(
+            source,
+            evidence,
+            compiler=compiler,
+            allowed_source_ids=source_ids,
+        )
+        if outcome.handoff is not None:
+            self._mark_derived_pending(job_id, source, outcome.handoff)
+            return []
+        assert outcome.receipt is not None
+        self._persist_compilation_receipt(job_id, source, outcome.receipt)
+        paths = self._apply_compilation_receipt(outcome.receipt, source)
+        self._complete_compilation(job_id, source)
+        return paths
+
+    def _derived_update_inputs(
+        self, job: Job
+    ) -> tuple[SourceVersion, str, tuple[str, ...]]:
+        if job.metadata.get("job_type") != "derived_update" or job.source_path != "":
+            raise ValueError("job is not a derived update")
+        answer_path = job.metadata.get("answer_path")
+        if (
+            not isinstance(answer_path, str)
+            or "\\" in answer_path
+            or answer_path.startswith("/")
+        ):
+            raise ValueError("derived answer path is invalid")
+        relative = PurePosixPath(answer_path)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.parts[:1] != ("30_answers",)
+            or relative.suffix != ".md"
+        ):
+            raise ValueError("derived answer path is invalid")
+        candidate = self.vault.root / Path(*relative.parts)
+        from .query import _open_pinned_regular as open_pinned_answer
+        from .query import _pinned_directory
+
+        with _pinned_directory(self.vault.root, candidate.parent) as parent_fd:
+            with open_pinned_answer(
+                candidate, parent_fd=parent_fd, name=candidate.name
+            ) as (descriptor, identity):
+                digest_builder = hashlib.sha256()
+                chunks = bytearray()
+                while chunk := os.read(descriptor, 65_536):
+                    digest_builder.update(chunk)
+                    chunks.extend(chunk)
+                    if len(chunks) > MAX_EVIDENCE_CHARS:
+                        raise ValueError(
+                            "derived answer exceeds compiler evidence budget"
+                        )
+        digest = digest_builder.hexdigest()
+        expected_digest = job.metadata.get("answer_sha256")
+        expected_identity = job.metadata.get("answer_identity")
+        if (
+            not isinstance(expected_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+            or digest != expected_digest
+            or not isinstance(expected_identity, list)
+            or expected_identity != list(identity)
+        ):
+            raise ValueError("derived answer binding is invalid")
+        raw_source_ids = job.metadata.get("raw_source_ids")
+        if (
+            not isinstance(raw_source_ids, list)
+            or not 1 <= len(raw_source_ids) <= 128
+            or len(set(raw_source_ids)) != len(raw_source_ids)
+            or any(
+                not isinstance(value, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", value) is None
+                for value in raw_source_ids
+            )
+        ):
+            raise ValueError("derived raw source IDs are invalid")
+        source_ids = tuple(raw_source_ids)
+        placeholders = ", ".join("?" for _ in source_ids)
+        with self.catalog.connection() as connection:
+            found = {
+                row[0]
+                for row in connection.execute(
+                    f"SELECT DISTINCT source_id FROM sources "
+                    f"WHERE source_id IN ({placeholders})",
+                    source_ids,
+                )
+            }
+        if found != set(source_ids):
+            raise ValueError("derived answer cites unknown raw sources")
+        try:
+            answer = bytes(chunks).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("derived answer is not UTF-8") from error
+        if self._derived_answer_source_ids(answer) != source_ids:
+            raise ValueError("derived answer citations do not match queue metadata")
+        wrapper = (
+            "evidence_kind=derived_answer\n"
+            f"answer_path={answer_path}\n"
+            f"cited_raw_source_ids={json.dumps(source_ids, ensure_ascii=False)}\n"
+            "This is derived text, not raw evidence. Preserve the cited raw source IDs.\n\n"
+            + answer
+        )
+        if len(wrapper) > MAX_EVIDENCE_CHARS:
+            raise ValueError("derived answer exceeds compiler evidence budget")
+        synthetic = SourceVersion(
+            source_id=source_ids[0],
+            version_id=f"derived_{job.job_id}",
+            space="unclassified",
+            original_name=candidate.name,
+            relative_path=answer_path,
+            sha256=digest,
+            media_type="text/markdown",
+            status="extracted",
+        )
+        return synthetic, wrapper, source_ids
+
+    @staticmethod
+    def _derived_answer_source_ids(answer: str) -> tuple[str, ...]:
+        import html
+
+        match = re.search(
+            r"(?ms)^(`{3,})json\n(.*?)\n\1\s*$",
+            answer,
+        )
+        if match is None:
+            return ()
+        try:
+            citations = json.loads(html.unescape(match.group(2)))
+        except json.JSONDecodeError as error:
+            raise ValueError("derived answer citations are invalid") from error
+        if not isinstance(citations, list):
+            raise ValueError("derived answer citations are invalid")
+        found: list[str] = []
+        for citation in citations:
+            if not isinstance(citation, dict):
+                raise ValueError("derived answer citations are invalid")
+            values: list[object]
+            if "source_id" in citation:
+                values = [citation["source_id"]]
+            else:
+                source_ids = citation.get("source_ids")
+                if not isinstance(source_ids, list):
+                    raise ValueError("derived answer citations are invalid")
+                values = source_ids
+            for value in values:
+                if isinstance(value, str) and value not in found:
+                    found.append(value)
+        return tuple(found)
+
+    def _mark_derived_pending(
+        self, job_id: str, source: SourceVersion, handoff: dict[str, Any]
+    ) -> None:
+        self._validate_handoff_record(handoff)
+
+        def pending(current: Job) -> None:
+            history = current.metadata.get("compiler_handoffs", [])
+            if not isinstance(history, list):
+                raise ValueError("compiler handoff history is invalid")
+            for item in history:
+                self._validate_handoff_record(item)
+            current.state = "pending_attention"
+            current.error = "compiler handoff required"
+            current.metadata["source"] = asdict(source)
+            current.metadata["compiler_status"] = "needs_agent"
+            current.metadata["compiler_handoffs"] = [*history, handoff]
+            current.metadata["compiler_handoff"] = handoff["path"]
+            current.metadata["compiler_requested_at"] = handoff["created_at"]
+
+        try:
+            self.queue.update(job_id, pending)
+        except Exception:
+            if self._derived_handoff_is_durably_pending(job_id, handoff):
+                return
+            self._remove_unpersisted_handoff(handoff)
+            raise
+
+    def _derived_handoff_is_durably_pending(
+        self, job_id: str, handoff: dict[str, Any]
+    ) -> bool:
+        try:
+            current = self.queue.get(job_id)
+            self._validate_derived_pending(current)
+        except (OSError, ValueError):
+            return False
+        history = current.metadata.get("compiler_handoffs")
+        return isinstance(history, list) and bool(history) and history[-1] == handoff
+
+    def _validate_derived_pending(self, job: Job) -> None:
+        if (
+            job.metadata.get("job_type") != "derived_update"
+            or job.state != "pending_attention"
+            or job.metadata.get("compiler_status") != "needs_agent"
+        ):
+            raise ValueError("derived update is not awaiting a compiler handoff")
+        self._validate_handoff_history(job.metadata)
 
     def resume_compilation(self, job_id: str, *, compiler: Any = None) -> SourceVersion:
         """Recompile one durable manual handoff without re-ingesting its raw file."""
@@ -692,7 +951,11 @@ class IngestService:
         return "\n".join(pieces)
 
     def _validated_compiler_changes(
-        self, result: object, source: SourceVersion
+        self,
+        result: object,
+        source: SourceVersion,
+        *,
+        allowed_source_ids: tuple[str, ...] | None = None,
     ) -> list[tuple[str, dict[str, Any]]]:
         if not isinstance(result, dict) or set(result) != {"changes"}:
             raise ValueError("compiler result must contain only changes")
@@ -721,9 +984,14 @@ class IngestService:
             if confidence not in _WIKI_CONFIDENCES:
                 raise ValueError("compiler confidence is invalid")
             source_ids = change["source_ids"]
-            if (not isinstance(source_ids, list) or len(source_ids) != 1
-                    or source_ids[0] != source.source_id):
-                raise ValueError("compiler change must cite only the current source")
+            required_source_ids = allowed_source_ids or (source.source_id,)
+            if (
+                not isinstance(source_ids, list)
+                or tuple(source_ids) != required_source_ids
+            ):
+                raise ValueError(
+                    "compiler change must cite exactly the approved raw sources"
+                )
             current_state = _safe_compiler_text(change["current_state"], "current_state")
             conflicts = _safe_compiler_text(change["conflicts"], "conflicts", empty=True, limit=20_000)
             timeline_entry = _safe_compiler_text(change["timeline_entry"], "timeline_entry")

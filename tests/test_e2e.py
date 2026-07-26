@@ -13,6 +13,7 @@ import pytest
 
 from local_kb.catalog import Catalog
 from local_kb.cli import build_vault
+from local_kb.config import Config
 from local_kb.health import lint
 from local_kb.finalize import finalize_and_enqueue
 from local_kb.ingest import IngestService
@@ -25,6 +26,11 @@ def _citation(evidence: dict[str, object]) -> dict[str, object]:
         key: evidence[key]
         for key in ("source_id", "version_id", "locator", "evidence_sha256")
     }
+
+
+def _source_count(catalog: Catalog) -> int:
+    with catalog.connection() as connection:
+        return int(connection.execute("SELECT count(*) FROM sources").fetchone()[0])
 
 
 def test_offline_ingest_prepare_cited_answer_finalize_and_derived_job(
@@ -333,3 +339,203 @@ def test_source_distribution_manifest_includes_windows_launcher():
     manifest = (repository / "MANIFEST.in").read_text(encoding="ascii")
 
     assert "include scripts/start-kb.ps1" in manifest
+
+
+def test_compiler_factory_honors_provider_and_rejects_unknown(tmp_path):
+    from local_kb.cli import _compiler_for_config
+    from local_kb.compiler import ClaudeCompiler, ManualCompiler
+
+    paths = build_vault(tmp_path)
+    claude = _compiler_for_config(
+        Config(vault=paths.root, compiler="claude"), paths
+    )
+    manual = _compiler_for_config(
+        Config(vault=paths.root, compiler="manual"), paths
+    )
+
+    assert isinstance(claude, ClaudeCompiler)
+    assert isinstance(claude.fallback, ManualCompiler)
+    assert claude.cwd == paths.root
+    assert isinstance(manual, ManualCompiler)
+    with pytest.raises(ValueError, match="compiler.provider"):
+        _compiler_for_config(Config(vault=paths.root, compiler="unknown"), paths)
+
+
+def test_cli_claude_provider_publishes_compiler_receipt(tmp_path, monkeypatch):
+    import local_kb.cli as cli_module
+
+    paths = build_vault(tmp_path)
+    source = paths.inbox / "source.md"
+    source.write_text("選擇 B 方案。", encoding="utf-8")
+    created = []
+
+    class FakeClaude:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def compile(self, evidence):
+            source_id = evidence.split("source_id=", 1)[1].split(" ", 1)[0]
+            return {"changes": [{
+                "path": "20_wiki/work/decisions/b.md",
+                "title": "B 方案",
+                "type": "decision",
+                "space": "work",
+                "confidence": "high",
+                "source_ids": [source_id],
+                "current_state": "選擇 B 方案。",
+                "conflicts": "",
+                "timeline_entry": "已整理本地來源。",
+            }]}
+
+    monkeypatch.setattr(cli_module, "ClaudeCompiler", FakeClaude)
+
+    assert cli_module.main([
+        "ingest-once", str(paths.root), str(source), "--space", "work"
+    ]) == 0
+    assert (paths.wiki / "work" / "decisions" / "b.md").is_file()
+    assert created[0]["cwd"] == paths.root
+
+
+def test_cli_missing_claude_creates_actionable_handoff_without_false_success(
+    tmp_path, monkeypatch
+):
+    import local_kb.compiler as compiler_module
+    from local_kb.cli import main
+
+    paths = build_vault(tmp_path)
+    source = paths.inbox / "source.md"
+    source.write_text("本地證據。", encoding="utf-8")
+
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError("claude is unavailable")
+
+    monkeypatch.setattr(compiler_module, "_run_bounded_process", unavailable)
+
+    assert main([
+        "ingest-once", str(paths.root), str(source), "--space", "work"
+    ]) == 0
+    jobs = DiskQueue(paths.queue).iter_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].state == "pending_attention"
+    assert jobs[0].metadata["compiler_status"] == "needs_agent"
+    assert Path(paths.root / jobs[0].metadata["compiler_handoff"]).is_file()
+    assert not list(paths.wiki.rglob("*.md"))
+
+
+def test_finalize_then_watch_consumes_derived_job_without_raw_feedback(
+    tmp_path, monkeypatch
+):
+    import local_kb.cli as cli_module
+    from local_kb.watcher import StableTracker
+
+    paths = build_vault(tmp_path)
+    queue = DiskQueue(paths.queue)
+    catalog = Catalog(paths.index / "catalog.sqlite3")
+    incoming = paths.inbox / "proof.md"
+    incoming.write_text("團隊選擇 B 方案。", encoding="utf-8")
+    raw = IngestService(paths, queue, catalog).process(
+        queue.enqueue(incoming).job_id, space="work"
+    )
+    packet = QueryService(catalog, vault=paths, queue=queue).prepare(
+        "團隊選擇哪個方案？", {"work"}
+    )
+    evidence = next(item for item in packet["evidence"] if item["kind"] == "raw_fragment")
+    answer = {
+        "conclusion": "團隊選擇 B 方案。",
+        "citations": [_citation(evidence)],
+        "confidence": "high",
+        "conflicts": "沒有衝突。",
+    }
+    result = finalize_and_enqueue(paths, queue, packet, answer)
+    before = _source_count(catalog)
+
+    class FakeClaude:
+        def __init__(self, **kwargs):
+            pass
+
+        def compile(self, compiler_evidence):
+            assert "evidence_kind=derived_answer" in compiler_evidence
+            assert raw.source_id in compiler_evidence
+            return {"changes": [{
+                "path": "20_wiki/work/decisions/derived-b.md",
+                "title": "B 方案結論",
+                "type": "decision",
+                "space": "work",
+                "confidence": "high",
+                "source_ids": [raw.source_id],
+                "current_state": "團隊選擇 B 方案。",
+                "conflicts": "",
+                "timeline_entry": "由已引用答案整理。",
+            }]}
+
+    monkeypatch.setattr(cli_module, "ClaudeCompiler", FakeClaude)
+    cli_module.watch_once(
+        paths, StableTracker(0, trusted_root=paths.inbox), set(), space="work"
+    )
+
+    derived_job = queue.get(result.job_id)
+    assert derived_job.state == "published"
+    assert derived_job.metadata["compiler_status"] == "completed"
+    wiki = paths.wiki / "work" / "decisions" / "derived-b.md"
+    assert raw.source_id in wiki.read_text(encoding="utf-8")
+    assert _source_count(catalog) == before
+
+
+def test_finalize_then_manual_watch_is_actionable_and_not_left_discovered(tmp_path):
+    from local_kb.watcher import StableTracker
+
+    paths = build_vault(tmp_path)
+    paths.config.write_text(
+        paths.config.read_text(encoding="utf-8").replace(
+            'provider = "claude"', 'provider = "manual"'
+        ),
+        encoding="utf-8",
+    )
+    queue = DiskQueue(paths.queue)
+    catalog = Catalog(paths.index / "catalog.sqlite3")
+    incoming = paths.inbox / "proof.md"
+    incoming.write_text("團隊選擇 B 方案。", encoding="utf-8")
+    raw = IngestService(paths, queue, catalog).process(
+        queue.enqueue(incoming).job_id, space="work"
+    )
+    packet = QueryService(catalog, vault=paths, queue=queue).prepare(
+        "選擇哪個方案？", {"work"}
+    )
+    evidence = next(item for item in packet["evidence"] if item["kind"] == "raw_fragment")
+    result = finalize_and_enqueue(paths, queue, packet, {
+        "conclusion": "選擇 B 方案。",
+        "citations": [_citation(evidence)],
+        "confidence": "high",
+        "conflicts": "",
+    })
+    before = _source_count(catalog)
+
+    from local_kb.cli import watch_once
+    watch_once(paths, StableTracker(0, trusted_root=paths.inbox), set(), space="work")
+
+    job = queue.get(result.job_id)
+    assert job.state == "pending_attention"
+    assert job.metadata["compiler_status"] == "needs_agent"
+    assert Path(paths.root / job.metadata["compiler_handoff"]).is_file()
+    assert _source_count(catalog) == before
+
+    class ReplacementCompiler:
+        def compile(self, compiler_evidence):
+            return {"changes": [{
+                "path": "20_wiki/work/decisions/resumed-b.md",
+                "title": "恢復後的 B 方案",
+                "type": "decision",
+                "space": "work",
+                "confidence": "high",
+                "source_ids": [raw.source_id],
+                "current_state": "選擇 B 方案。",
+                "conflicts": "",
+                "timeline_entry": "人工工作已安全恢復。",
+            }]}
+
+    service = IngestService(paths, queue, catalog)
+    service.resume_derived_update(result.job_id, compiler=ReplacementCompiler())
+
+    assert queue.get(result.job_id).state == "published"
+    assert (paths.wiki / "work" / "decisions" / "resumed-b.md").is_file()
+    assert _source_count(catalog) == before

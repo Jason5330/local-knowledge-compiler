@@ -77,8 +77,15 @@ AI 應把結論、信心、衝突與「結構化引用」寫入答案 JSON，然
 - 背景自動編譯目前使用 Claude CLI。原因是這台電腦安裝的 Codex Desktop
   不能當成背景 CLI 呼叫；Codex 仍可透過同一份 `AGENTS.md`、`kb prepare` 與
   `kb finalize` 完整使用知識庫。
+- `80_system/config.toml` 的 `compiler.provider = "claude"` 會真的呼叫 Claude CLI；
+  若 CLI 不存在或失敗，工作會安全轉成 `pending_attention` 人工交接，不會假裝
+  Wiki 已更新。改成 `"manual"` 則從一開始就只建立人工交接檔。
 - Claude CLI 是背景編譯選項，不代表所有資料都留在本機；其雲端資料處理規則仍
   取決於你的 Claude 帳戶與服務設定。
+
+`kb finalize` 建立的衍生整理工作會由監看器消化：它只把已引用的答案整理進
+`20_wiki`，不會把答案放進 `10_raw`，也不會增加原始來源數量。若背景模型不可用，
+工作會停在可恢復的人工交接狀態，完成交接後可繼續發布。
 
 Codex 與 Claude 的入口檔都只指向
 `80_system/KNOWLEDGE_PROTOCOL.md`。所以兩邊遵守同一份規則，不會各自長出兩套互相

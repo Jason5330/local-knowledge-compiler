@@ -11,6 +11,7 @@ from typing import Sequence
 from uuid import uuid4
 
 from .catalog import Catalog
+from .compiler import ClaudeCompiler, ManualCompiler
 from .config import Config
 from .finalize import finalize_and_enqueue, read_json_document
 from .health import lint, rebuild_catalog
@@ -45,6 +46,20 @@ stable_seconds = 5.0
 [queue]
 max_retries = 3
 """
+
+
+def _compiler_for_config(config: Config, paths: VaultPaths):
+    fallback = ManualCompiler(
+        paths.runtime / "manual", trusted_root=paths.root
+    )
+    provider = config.compiler.strip().casefold()
+    if provider == "manual":
+        return fallback
+    if provider == "claude":
+        return ClaudeCompiler(fallback=fallback, cwd=paths.root)
+    raise ValueError(
+        "compiler.provider must be either 'claude' or 'manual'"
+    )
 
 
 def build_vault(root: Path) -> VaultPaths:
@@ -291,7 +306,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "ingest-once":
             with WriterLock(paths.runtime / "write.lock", timeout=0):
                 queue = DiskQueue(paths.queue, config.max_retries)
-                service = IngestService(paths, queue, Catalog(paths.index / "catalog.sqlite3"))
+                service = IngestService(
+                    paths,
+                    queue,
+                    Catalog(paths.index / "catalog.sqlite3"),
+                    compiler=_compiler_for_config(config, paths),
+                )
                 source_path = arguments.path.resolve(strict=True)
                 service._hash_pinned_regular(source_path)
                 job = queue.enqueue(source_path)
@@ -365,10 +385,24 @@ def _watch_once_locked(
 ) -> list:
     config = Config.load(paths.config)
     queue = DiskQueue(paths.queue, config.max_retries)
-    service = IngestService(paths, queue, Catalog(paths.index / "catalog.sqlite3"))
+    service = IngestService(
+        paths,
+        queue,
+        Catalog(paths.index / "catalog.sqlite3"),
+        compiler=_compiler_for_config(config, paths),
+    )
     results = []
     for job in queue.iter_jobs():
         if job.metadata.get("job_type") == "derived_update":
+            if job.state in {"published", "pending_attention"}:
+                continue
+            try:
+                service.process_derived_update(job.job_id)
+            except Exception as error:
+                print(
+                    f"kb watch: derived {job.job_id}: {error}",
+                    file=__import__("sys").stderr,
+                )
             continue
         if job.state == "pending_attention":
             original = Path(str(job.metadata.get("original_source_path", job.source_path)))
