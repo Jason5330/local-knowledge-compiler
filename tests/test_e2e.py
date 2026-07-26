@@ -78,10 +78,20 @@ def test_init_installs_one_canonical_protocol_and_thin_agent_entries(tmp_path):
         "裸網址",
         "不得抓取",
         "space",
+        "直接結論",
+        "證據整理",
+        "來源",
+        "衝突與時效",
+        "信心",
+        "未知事項",
+        "下一個本地資料缺口",
     ):
         assert required in protocol
     assert "80_system/KNOWLEDGE_PROTOCOL.md" in agents
     assert "80_system/KNOWLEDGE_PROTOCOL.md" in claude
+    for entry in (agents, claude):
+        assert "只使用本地證據" in entry
+        assert "不得自動搜尋網路" in entry
     assert "kb prepare" not in agents
     assert "kb prepare" not in claude
 
