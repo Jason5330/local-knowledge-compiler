@@ -393,6 +393,49 @@ class DiskQueue:
                 jobs.append(job); used += actual_size
             return jobs, scan_truncated
 
+    def iter_jobs_bounded_readonly(
+        self,
+        max_jobs: int,
+        max_bytes: int = DEFAULT_QUEUE_BATCH_BYTES,
+    ) -> tuple[list[Job], bool]:
+        """Read a bounded queue snapshot without creating or updating lock files."""
+        if isinstance(max_jobs, bool) or not isinstance(max_jobs, int) or max_jobs < 1:
+            raise ValueError("max_jobs must be a positive integer")
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 1 <= max_bytes <= MAX_QUEUE_BATCH_BYTES
+        ):
+            raise ValueError("max_bytes must be a positive bounded integer")
+        scan_target = (
+            self.root
+            if os.name == "nt"
+            else self._require_root_descriptor()
+        )
+        names: list[str] = []
+        truncated = False
+        with os.scandir(scan_target) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".json"):
+                    continue
+                if len(names) >= max_jobs:
+                    truncated = True
+                    break
+                if entry.is_file(follow_symlinks=False):
+                    names.append(entry.name)
+        jobs: list[Job] = []
+        used = 0
+        for name in sorted(names):
+            try:
+                job, actual_size = self._read_pinned(
+                    self.root / name, max_bytes - used
+                )
+            except _BatchBudgetExceeded:
+                return jobs, True
+            jobs.append(job)
+            used += actual_size
+        return jobs, truncated
+
     def active_for_source(self, source_path: Path | str) -> Job | None:
         wanted = os.path.normcase(os.path.abspath(os.fspath(source_path)))
         for job in self.iter_jobs():

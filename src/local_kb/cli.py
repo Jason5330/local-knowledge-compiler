@@ -2,9 +2,11 @@
 
 import argparse
 from importlib import resources
+import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import time
 from typing import Sequence
@@ -255,6 +257,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     finalize_parser.add_argument("--vault", type=Path, default=Path.cwd())
     finalize_parser.add_argument("--packet", type=Path, required=True)
     finalize_parser.add_argument("--answer", type=Path, required=True)
+    status_parser = subcommands.add_parser(
+        "status", help="list actionable queue jobs without changing the vault"
+    )
+    status_parser.add_argument("--vault", type=Path, default=Path.cwd())
+    resume_parser = subcommands.add_parser(
+        "resume", help="resume one actionable compiler handoff"
+    )
+    resume_parser.add_argument("--vault", type=Path, default=Path.cwd())
+    resume_parser.add_argument("--job-id", required=True)
     lint_parser = subcommands.add_parser("lint", help="inspect vault health without changing it")
     lint_parser.add_argument("--vault", type=Path, default=Path.cwd())
     rebuild_parser = subcommands.add_parser("rebuild", help="rebuild the search catalog from cache")
@@ -268,9 +279,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     paths = VaultPaths(arguments.vault.resolve())
     try:
+        if arguments.command == "status":
+            report = _status_report(paths)
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+            return 2 if report["attention_required"] else 0
         if arguments.command == "lint":
-            import json
-
             report = lint(paths)
             print(json.dumps(report, ensure_ascii=False, sort_keys=True))
             return 0 if report.get("healthy") is True else 2
@@ -303,6 +316,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Saved answer: {result.path}")
             print(f"Queued derived update: {result.job_id}")
             return 0
+        if arguments.command == "resume":
+            with WriterLock(paths.runtime / "write.lock", timeout=0):
+                queue = DiskQueue(paths.queue, config.max_retries)
+                service = IngestService(
+                    paths,
+                    queue,
+                    Catalog(paths.index / "catalog.sqlite3"),
+                    compiler=_compiler_for_config(config, paths),
+                )
+                job = queue.get(arguments.job_id)
+                try:
+                    if job.metadata.get("job_type") == "derived_update":
+                        service.resume_derived_update(job.job_id)
+                    else:
+                        service.resume_compilation(job.job_id)
+                except Exception as error:
+                    try:
+                        current = queue.get(job.job_id)
+                        if current.state != "published":
+                            queue.fail(job.job_id, error)
+                    except Exception:
+                        pass
+                    raise
+                current = queue.get(job.job_id)
+            if current.state == "published":
+                print(f"Job {current.job_id}: published")
+                return 0
+            if current.state == "pending_attention":
+                _print_pending_job(current, config.compiler)
+                return 2
+            print(f"Job {current.job_id}: {current.state}")
+            return 2
         if arguments.command == "ingest-once":
             with WriterLock(paths.runtime / "write.lock", timeout=0):
                 queue = DiskQueue(paths.queue, config.max_retries)
@@ -316,6 +361,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 service._hash_pinned_regular(source_path)
                 job = queue.enqueue(source_path)
                 source = service.process(job.job_id, space=arguments.space)
+                current = queue.get(job.job_id)
+            if current.state == "pending_attention":
+                _print_pending_job(current, config.compiler)
+                return 2
             print(f"{source.version_id} {source.status}")
             return 0
         tracker = StableTracker(config.stable_seconds, trusted_root=paths.inbox)
@@ -325,7 +374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"{source.version_id} {source.status}")
             time.sleep(config.poll_seconds)
     except Exception as error:
-        print(f"kb: {error}", file=__import__("sys").stderr)
+        print(f"kb: {error}", file=sys.stderr)
         return 1
 
     return 1
@@ -341,6 +390,66 @@ def _queue_has_job(path: Path, *, max_entries: int = 10_000) -> bool:
             if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False):
                 return True
     return False
+
+
+def _status_report(paths: VaultPaths) -> dict[str, object]:
+    if not paths.queue.is_dir():
+        raise ValueError("queue directory is missing; run kb init")
+    queue = DiskQueue(paths.queue)
+    jobs, truncated = queue.iter_jobs_bounded_readonly(
+        max_jobs=10_000,
+        max_bytes=16 * 1024 * 1024,
+    )
+    actionable = [
+        _status_job(job) for job in jobs if job.state != "published"
+    ]
+    attention_required = bool(actionable) or truncated
+    return {
+        "schema_version": 1,
+        "healthy": not attention_required,
+        "attention_required": attention_required,
+        "truncated": truncated,
+        "jobs": actionable,
+    }
+
+
+def _status_job(job) -> dict[str, object]:
+    source = job.metadata.get("source")
+    source_id = source.get("source_id") if isinstance(source, dict) else None
+    version_id = source.get("version_id") if isinstance(source, dict) else None
+    handoff = job.metadata.get("compiler_handoff")
+    return {
+        "job_id": job.job_id,
+        "type": (
+            "derived_update"
+            if job.metadata.get("job_type") == "derived_update"
+            else "source_ingest"
+        ),
+        "state": job.state,
+        "error": job.error,
+        "handoff_path": handoff if isinstance(handoff, str) else None,
+        "source_id": source_id if isinstance(source_id, str) else None,
+        "version_id": version_id if isinstance(version_id, str) else None,
+    }
+
+
+def _print_pending_job(job, compiler_provider: str, *, stream=None) -> None:
+    destination = stream or sys.stdout
+    provider = compiler_provider.strip().casefold()
+    reason = (
+        "Claude 不可用，需要人工處理"
+        if provider == "claude"
+        else "目前設定為手動編譯，需要人工處理"
+    )
+    handoff = job.metadata.get("compiler_handoff")
+    print(f"Job {job.job_id}: pending_attention", file=destination)
+    print(reason, file=destination)
+    if isinstance(handoff, str):
+        print(f"Handoff: {handoff}", file=destination)
+    print(
+        f"下一步：修正編譯器後執行 kb resume --vault \"VAULT\" --job-id {job.job_id}",
+        file=destination,
+    )
 
 
 def _select_prepare_spaces(catalog: Catalog, question: str, explicit: list[str]) -> tuple[list[str], str]:
@@ -398,10 +507,15 @@ def _watch_once_locked(
                 continue
             try:
                 service.process_derived_update(job.job_id)
+                current = queue.get(job.job_id)
+                if current.state == "pending_attention":
+                    _print_pending_job(
+                        current, config.compiler, stream=sys.stderr
+                    )
             except Exception as error:
                 print(
                     f"kb watch: derived {job.job_id}: {error}",
-                    file=__import__("sys").stderr,
+                    file=sys.stderr,
                 )
             continue
         if job.state == "pending_attention":
@@ -413,10 +527,15 @@ def _watch_once_locked(
         try:
             result = service.process(job.job_id, space=str(job.metadata.get("space", space)))
         except Exception as error:
-            print(f"kb watch: {job.job_id}: {error}", file=__import__("sys").stderr)
+            print(f"kb watch: {job.job_id}: {error}", file=sys.stderr)
             continue
+        current = queue.get(job.job_id)
+        if current.state == "pending_attention":
+            _print_pending_job(current, config.compiler, stream=sys.stderr)
         results.append(result)
-        original = Path(str(job.metadata.get("original_source_path", job.source_path)))
+        original = Path(
+            str(current.metadata.get("original_source_path", current.source_path))
+        )
         submitted.discard(original)
         tracker.forget(original)
     for candidate in sorted(tracker.iter_trusted_children()):
@@ -429,9 +548,15 @@ def _watch_once_locked(
         job = queue.enqueue(candidate)
         submitted.add(candidate)
         try:
-            results.append(service.process(job.job_id, space=space))
+            result = service.process(job.job_id, space=space)
+            current = queue.get(job.job_id)
+            if current.state == "pending_attention":
+                _print_pending_job(
+                    current, config.compiler, stream=sys.stderr
+                )
+            results.append(result)
         except Exception as error:
-            print(f"kb watch: {job.job_id}: {error}", file=__import__("sys").stderr)
+            print(f"kb watch: {job.job_id}: {error}", file=sys.stderr)
             continue
         submitted.discard(candidate)
         tracker.forget(candidate)

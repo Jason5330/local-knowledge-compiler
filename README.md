@@ -90,3 +90,31 @@ AI 應把結論、信心、衝突與「結構化引用」寫入答案 JSON，然
 Codex 與 Claude 的入口檔都只指向
 `80_system/KNOWLEDGE_PROTOCOL.md`。所以兩邊遵守同一份規則，不會各自長出兩套互相
 矛盾的知識庫流程。
+
+## 工作卡住時：查看與繼續
+
+先查看有哪些工作需要處理。這個指令只讀取狀態，不會改動知識庫：
+
+```powershell
+.\.venv\Scripts\kb.exe status --vault "C:\你的資料夾\我的知識庫"
+```
+
+輸出的 JSON 會列出 `job_id`、工作類型、目前狀態、錯誤、人工交接檔位置，以及
+來源與版本。看到 `pending_attention`，通常代表 Claude CLI 不可用，或你把
+`compiler.provider` 設為 `manual`。先修好 Claude CLI 或調整設定，再複製該筆
+`job_id` 執行：
+
+```powershell
+.\.venv\Scripts\kb.exe resume --vault "C:\你的資料夾\我的知識庫" `
+  --job-id "畫面上的-job_id"
+```
+
+不論它是一般來源或由答案產生的知識更新，都使用同一個 `resume` 指令。系統會自己
+辨認類型；答案更新只會寫入 `20_wiki`，不會重新塞進 `10_raw`。
+
+- Exit code `0`：成功，或目前沒有待處理工作。
+- Exit code `1`：發生錯誤；畫面會顯示原因，工作會保留重試狀態。
+- Exit code `2`：工作尚未完成，需要人工處理；依畫面上的 handoff 與下一步操作即可。
+
+`watch` 也會在新工作首次進入人工交接時顯示 job ID 與 handoff；它不會在每一輪
+自動重試同一筆工作。之後隨時用 `status` 查詢，再用 `resume` 繼續。

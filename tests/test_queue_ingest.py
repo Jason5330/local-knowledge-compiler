@@ -814,7 +814,7 @@ def test_ingest_retry_recovers_after_each_recoverable_stage_failure(tmp_path, mo
     assert (vault.root / queue.get(job.job_id).metadata["processed_path"]).is_file()
 
 
-def test_cli_ingest_once_prints_version_and_watch_once_gates_unseen_stable_file(tmp_path, capsys):
+def test_cli_ingest_once_reports_handoff_and_watch_once_gates_unseen_stable_file(tmp_path, capsys):
     from local_kb.cli import main, watch_once
     from local_kb.queue import DiskQueue
     from local_kb.watcher import StableTracker
@@ -822,8 +822,11 @@ def test_cli_ingest_once_prints_version_and_watch_once_gates_unseen_stable_file(
     vault = make_vault(tmp_path)
     source = vault.inbox / "cli.txt"
     source.write_text("hello", encoding="utf-8")
-    assert main(["ingest-once", str(vault.root), str(source), "--space", "work"]) == 0
-    assert "ver_" in capsys.readouterr().out
+    assert main(["ingest-once", str(vault.root), str(source), "--space", "work"]) == 2
+    first_job = DiskQueue(vault.queue).iter_jobs()[0]
+    output = capsys.readouterr().out
+    assert first_job.job_id in output
+    assert str(first_job.metadata["compiler_handoff"]) in output
     later = vault.inbox / "later.txt"
     later.write_text("later", encoding="utf-8")
     tracker = StableTracker(0)

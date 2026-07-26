@@ -413,7 +413,7 @@ def test_cli_missing_claude_creates_actionable_handoff_without_false_success(
 
     assert main([
         "ingest-once", str(paths.root), str(source), "--space", "work"
-    ]) == 0
+    ]) == 2
     jobs = DiskQueue(paths.queue).iter_jobs()
     assert len(jobs) == 1
     assert jobs[0].state == "pending_attention"
