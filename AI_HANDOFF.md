@@ -1,558 +1,233 @@
 ---
-status: in-progress
+status: ready
 branch: master
-timestamp: 2026-07-26T21:48:04+08:00
-files_modified:
-  - AI_HANDOFF.md
+updated: 2026-07-27
+repository: Jason5330/local-knowledge-compiler
 ---
 
-# Local Knowledge Compiler 完整交接文件
+# Local Knowledge Compiler 完整交接
 
-更新日期：2026-07-26  
-專案狀態：第一版已完成、已測試、已上傳私人 GitHub  
-交接對象：Codex、Claude 或其他能操作本機檔案與 PowerShell 的 AI
+這份文件讓另一台電腦上的 Codex、Claude Code 或其他 AI 接手。使用者是技術初學者，
+代理應直接完成本機操作，不要要求使用者自己輸入終端機指令。
 
----
+## 1. 使用者目標
 
-## 0. 新 AI 請先做什麼
+使用者無法在 OA 環境安裝 Obsidian，希望建立：
 
-請完整讀完本文件，再依序讀：
+```text
+本地原始資料
+→ 自動保存版本
+→ 建立可搜尋索引
+→ 提問時找出精準證據
+→ AI 只依證據回答並引用
+→ 將高品質答案迭代進 Wiki
+```
 
-1. `docs/BEGINNER_GUIDE.zh-TW.md`
-2. `docs/CLI_REFERENCE.zh-TW.md`
-3. `README.md`
-4. `docs/superpowers/specs/2026-07-25-local-knowledge-iteration-system-design.md`
-5. `80_system/KNOWLEDGE_PROTOCOL.md`
-   注意：這個檔案要等真正執行 `kb init` 建立知識庫後，才會出現在知識庫裡。
+系統須同時供 Codex 與 Claude Code 使用，不能綁死單一 AI。
 
-不要重新設計或重寫已完成的系統。下一個實際工作是：
+## 2. 思想來源
 
-> 在新電腦安裝本專案，建立使用者的第一座知識庫，然後匯入 Excel 資料並驗證查詢。
-
-如果使用者尚未提供 Excel 檔案路徑與知識庫存放路徑，只需要詢問這兩個路徑。
-
----
-
-## 1. 使用者背景與溝通方式
-
-- GitHub 帳號：`Jason5330`
-- 語言：繁體中文
-- 技術程度：初學者，不熟悉 Git、Python、Codex 或系統架構
-- 使用方式：有時使用 Codex，有時使用 Claude
-- 溝通偏好：
-  - 先給結果
-  - 使用最大白話
-  - 適合時使用「A → B → C」流程
-  - 不要堆太多技術名詞
-  - 能由 AI 安全完成的操作，直接協助完成
-
-向使用者解釋時，請把以下名詞翻譯成白話：
-
-- repository／repo：放在 GitHub 上的專案資料夾
-- clone：把 GitHub 專案下載到電腦
-- vault：真正存放個人資料的知識庫資料夾
-- index：讓系統快速找資料的目錄
-- compiler：把原始資料整理成 Wiki 的背景整理員
-
----
-
-## 2. 事情的來龍去脈
-
-使用者原本想研究 Obsidian 知識庫與 `kepano/obsidian-skills`，但工作電腦無法安裝
-Obsidian。因此改為設計一套：
-
-- 不依賴 Obsidian
-- 資料保存在本機
-- Codex 與 Claude 通用
-- 新資料可持續加入
-- 每次提問先找本地證據
-- 回答後可把有來源支持的成果再整理回知識庫
-
-這套設計受到 Andrej Karpathy 的 LLM Knowledge Bases／LLM Wiki 思路啟發：
-
-- 原始 X 文章：<https://x.com/karpathy/status/2039805659525644595>
-- Karpathy 的 LLM Wiki Gist：
+- Andrej Karpathy 的 LLM Knowledge Bases / LLM Wiki 思路：
+  <https://x.com/karpathy/status/2039805659525644595>
+- Karpathy LLM Wiki Gist：
   <https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f>
-- 最早研究的 Obsidian skills：
+- Kepano Obsidian skills：
   <https://github.com/kepano/obsidian-skills>
 
-保留的核心想法是：
+採用的核心不是 Obsidian 軟體，而是：
 
 ```text
-原始資料 → AI 持續整理成 Markdown Wiki → 提問時讀取相關知識 → 新成果再迭代回去
+原始資料不變 → Markdown Wiki 是可重建的整理層 → 每次回答有證據 → 新答案再參與整理
 ```
 
-本專案在這個想法上增加了安全措施：
+## 3. GitHub 與版本
 
-- 原始檔永遠保留，不由 AI 覆寫
-- 同一檔案更新時建立新版本
-- 所有重要結論必須附來源定位
-- 新舊資料衝突時並列，不偷偷選一邊
-- Codex 與 Claude 使用同一份規則
-- SQLite 只是可重建的搜尋目錄，不是唯一真相
-- Wiki 修改使用 Git 保存歷史，可回復
-- 多個 AI 同時工作時，寫入會排隊，避免互相覆蓋
+- 帳號：`Jason5330`
+- 私人倉庫：<https://github.com/Jason5330/local-knowledge-compiler>
+- 主要分支：`master`
+- 已驗證實作基線：`3eac172cfebb88c8dc8ed85c377b5e7eb53b89d4`
+- 基線測試：`433 passed, 25 skipped`
 
----
+接手時先拉取遠端最新版，並檢查工作樹。不得覆蓋使用者尚未提交的修改。
 
-## 3. 已完成的成果
-
-私人 GitHub 儲存庫：
-
-<https://github.com/Jason5330/local-knowledge-compiler>
-
-目前 Git 狀態：
-
-- 預設分支：`master`
-- 保留分支：`feature/local-knowledge-compiler`
-- 第一版程式的已驗證基準提交：
-  `3eac172cfebb88c8dc8ed85c377b5e7eb53b89d4`
-- `feature/local-knowledge-compiler` 保留在上述程式基準。
-- `master` 在上述基準之後加入本交接文件，因此會比功能分支多出文件提交；這不是
-  未合併的程式功能。
-- 第一版最終測試：`433 passed, 25 skipped`
-- 第一版整合審查：沒有剩餘的 Critical 或 Important 問題
-- 儲存庫權限：PRIVATE
-
-已完成的主要能力：
-
-- `kb init`：建立知識庫骨架
-- `kb watch`：持續監看新資料
-- `kb ingest-once`：手動匯入單一檔案
-- `kb prepare`：依問題建立本地證據包
-- `kb finalize`：保存有引用的答案並排入知識迭代
-- `kb status`：查看卡住或等待人工處理的工作
-- `kb resume`：繼續先前卡住的工作
-- `kb lint`：檢查知識庫健康狀態
-- `kb rebuild`：從本地檔案重建搜尋索引
-
----
-
-## 4. 「程式專案」與「知識庫」不是同一個資料夾
-
-這點最容易讓初學者混淆。
+## 4. 預設位置
 
 ```text
-local-knowledge-compiler
-→ 工具本身，相當於知識庫的機器
-
-我的知識庫
-→ 使用者自己的 Excel、文件、Wiki 與回答
+程式：C:\AI\local-knowledge-compiler
+知識庫：C:\KnowledgeBase
 ```
 
-建議在新電腦使用兩個不同路徑，例如：
+若實際位置不同，使用現有位置，不要為了符合預設而搬動資料。
+
+## 5. 接手必讀
+
+依序讀取：
+
+1. `README.md`
+2. `docs/BEGINNER_GUIDE.zh-TW.md`
+3. `docs/CLI_REFERENCE.zh-TW.md`
+4. `docs/superpowers/specs/2026-07-25-local-knowledge-iteration-system-design.md`
+5. vault 的 `80_system/KNOWLEDGE_PROTOCOL.md`
+6. vault 的 `80_system/STATE.md`
+
+若 vault 尚未建立，第 5、6 項不存在是正常的。
+
+## 6. 使用者互動規則
+
+- 使用繁體中文和白話。
+- 先給結果，再說必要原因。
+- 代理自己執行檢查與操作。
+- 只有瀏覽器登入、公司管理員權限、付款、隱私決策或破壞性操作才請使用者接手。
+- 若需使用者操作，逐步說「看哪個畫面、按哪個按鈕」。
+- 不要把一串技術指令當成教學答案。
+- 沒有實際驗證，不可宣稱成功。
+
+## 7. 系統能力
+
+- `kb init`：建立 vault。
+- `kb ingest-once`：匯入單一 inbox 副本。
+- `kb watch`：持續監看 inbox。
+- `kb prepare`：依問題建立證據包。
+- `kb finalize`：驗證並保存答案，排入知識整理。
+- `kb status`：查看工作狀態。
+- `kb resume`：繼續卡住或人工交接的工作。
+- `kb lint`：完整性檢查。
+- `kb rebuild`：從原始資料重建衍生層。
+
+精確語法見 `docs/CLI_REFERENCE.zh-TW.md`，那是代理內部參考，不是要使用者操作。
+
+## 8. 已確認的重要限制
+
+### Excel 安全規則
+
+同磁碟匯入會 claim/move 傳入檔案。因此：
 
 ```text
-C:\AI\local-knowledge-compiler
-C:\KnowledgeBase
+絕對禁止：把使用者唯一原始 Excel 直接傳給 ingest-once
+正確方式：保留原檔 → 複製到 00_inbox → 只處理副本
 ```
 
-不要把使用者的私人 Excel 直接提交到工具的 GitHub 儲存庫。
+完成後必須再次確認原檔仍在原位置。
 
----
+### Windows space
 
-## 5. 在另一台 Windows 電腦接手
+目前 Windows v1 的 raw path 元件驗證不接受冒號，因此不要使用
+`project:<slug>`。專案資料先歸入 `work`，專案名保留在檔名或內容。
 
-### 5.1 前置需求
+### Manual provider
 
-需要安裝：
+`compiler.provider = "manual"` 會讓編譯工作進入 `pending_attention`，內部 Exit code
+可能是 2。這不代表匯入失敗：raw evidence 與索引可能已完成，`prepare` 也可能已能
+找到資料。代理需分別驗證，不可用單一代碼粗略判斷。
 
-- Git
-- GitHub CLI，指令名稱是 `gh`
-- Python 3.13
+### Claude provider
 
-先登入 GitHub：
+只有在 Claude CLI 存在、已登入且實際呼叫成功後才使用 `provider = "claude"`。
+失敗時保留可恢復 handoff，不得假裝 Wiki 已更新。
 
-```powershell
-gh auth login
-```
+### Codex
 
-### 5.2 下載私人專案
+Codex Desktop 不能當背景 CLI 時使用 manual provider。Codex 仍能完成匯入、檢索、
+回答、finalize 與人工 handoff。
 
-```powershell
-New-Item -ItemType Directory -Force "C:\AI"
-Set-Location "C:\AI"
-gh repo clone Jason5330/local-knowledge-compiler
-Set-Location "C:\AI\local-knowledge-compiler"
-```
+### 非文字檔
 
-如果使用者把專案放在別的磁碟或資料夾，後續命令要跟著更換路徑，不要硬套
-`C:\AI`。
+掃描 PDF、圖片、音訊、影片若無擷取器，標記 `pending_extractor`。檔案可保存，但
+不得冒充已讀取。
 
-### 5.3 建立本機執行環境
+### 網址
 
-`.venv` 不會上傳 GitHub，所以每台新電腦都要建立一次：
+裸網址只當書籤文字，系統不自動抓網頁。
 
-```powershell
-py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-```
+## 9. 安裝策略
 
-驗證工具：
-
-```powershell
-.\.venv\Scripts\kb.exe --help
-.\.venv\Scripts\python.exe -m pytest -q
-```
-
-完整測試可能需要一點時間。若只是第一次替使用者安裝，至少要確認 `kb --help`
-可以正常執行；若修改程式碼，完成前必須跑相關測試。
-
----
-
-## 6. 建立第一座知識庫
-
-假設使用者選擇：
+代理應自行：
 
 ```text
-C:\KnowledgeBase
+檢查 Git／GitHub 登入／Python 3.13
+→ 取得或更新私人倉庫
+→ 建立 .venv
+→ 安裝專案及開發依賴
+→ 驗證 kb help
+→ 保留或建立 vault
+→ 選擇 provider
+→ 執行 status 與 lint
+→ 用白話回報
 ```
 
-執行：
+GitHub 網頁授權或公司管理員權限無法自動完成時，才停下請使用者操作。禁止要求使用者
+貼出密碼、API key 或存取權杖。
 
-```powershell
-Set-Location "C:\AI\local-knowledge-compiler"
-.\.venv\Scripts\kb.exe init "C:\KnowledgeBase"
-```
+不得自行設定背景常駐、Windows 排程、開機啟動或 `shell:startup`。
 
-初始化後會建立：
+## 10. 每次匯入程序
+
+1. 解析來源絕對路徑。
+2. 確認檔案存在，記錄基本資訊。
+3. 產生 collision-safe inbox 副本名。
+4. 複製到 `00_inbox`。
+5. 再次確認來源仍存在。
+6. `ingest-once` 只接收副本。
+7. 分別檢查 raw、index、job state。
+8. 執行 `status` 與 `lint`。
+9. 回報原檔、保存位置、可搜尋狀態與待處理事項。
+
+## 11. 每次提問程序
+
+1. `prepare` 建立 packet。
+2. 只讀 packet 內證據。
+3. 證據不足就明說無法判定。
+4. 每個重要結論附結構化引用。
+5. 使用者要求保存時建立 answer JSON。
+6. `finalize`。
+7. 驗證衍生工作狀態與 `lint`。
+
+引用的 `source_id`、`version_id`、`locator`、`evidence_sha256` 必須從 packet 原樣複製。
+
+## 12. 完成標準
+
+安裝完成至少要有：
+
+- 程式說明可執行。
+- vault 可讀取。
+- status 可讀取。
+- lint 通過，或已清楚列出非阻斷警告。
+- Codex／Claude provider 與實際能力相符。
+
+匯入完成至少要有：
+
+- 使用者原始檔仍在原位置。
+- raw 版本安全保存。
+- 索引可找到新資料，或明確標示擷取器不足。
+- 狀態與 lint 已檢查。
+
+提問完成至少要有：
+
+- packet 確實由問題產生。
+- 回答沒有超出證據。
+- 引用可驗證。
+- 若保存，finalize 與後續狀態已確認。
+
+## 13. 目前文件設計決策
+
+2026-07-27 起，面向使用者的教學改為「貼提示詞給 Codex／Claude Code」：
+
+- 使用者不需自行操作終端機。
+- 技術命令集中在 `docs/CLI_REFERENCE.zh-TW.md`，只供代理執行。
+- Codex 與 Claude Code 有各自的首次安裝提示詞。
+- Excel 匯入、更新、提問、健康檢查與換 AI 都有可直接複製的提示詞。
+
+## 14. 接手後的第一個回覆
+
+先做只讀檢查，再用這種格式回報：
 
 ```text
-C:\KnowledgeBase\
-├── 00_inbox\       新資料入口
-├── 10_raw\         永久保存的原始證據與歷史版本
-├── 20_wiki\        AI 維護的知識頁
-├── 30_answers\     保存的重要回答
-├── 40_index\       搜尋索引與可讀目錄
-├── 80_system\      Codex／Claude 共用規則與設定
-├── 90_logs\        事件與查詢紀錄
-├── 99_trash\       可復原回收區
-├── .kb\            佇列、暫存與鎖
-├── AGENTS.md       Codex 入口
-└── CLAUDE.md       Claude 入口
+我已讀完交接資料。
+目前程式位置：……
+目前知識庫位置：……
+最近狀態：……
+需要注意：……
+現在可以直接替你做：……
 ```
 
-初始化後，新 AI 必須讀取：
-
-```text
-C:\KnowledgeBase\80_system\KNOWLEDGE_PROTOCOL.md
-```
-
-這是 Codex 與 Claude 的唯一正式知識處理規則。
-
----
-
-## 7. 使用者目前最關心：Excel 怎麼辦
-
-系統已直接支援：
-
-- `.xlsx`
-- `.xlsm` 的儲存格資料
-- 多工作表
-- 文字、數字、日期與公式已計算後的值
-- 每一列會保存「工作表名稱＋儲存格範圍」作為來源定位
-
-舊格式 `.xls` 不支援，請先用 Excel 另存為 `.xlsx`。
-
-目前不要承諾能完整理解：
-
-- 圖表
-- 內嵌圖片
-- 巨集程式本身
-- 密碼保護的活頁簿
-- Excel 外部連結的即時內容
-
-`.xlsm` 只讀取可見的儲存格資料，不執行巨集。
-
-### 7.1 最安全的一次性匯入
-
-不要直接把唯一原始 Excel 交給 `ingest-once`。同一磁碟上的檔案可能在接管階段被
-移入處理區。必須先把原檔複製到 `00_inbox`，再只匯入該副本：
-
-```powershell
-$InboxCopy = "C:\KnowledgeBase\00_inbox\資料.xlsx"
-if (Test-Path -LiteralPath $InboxCopy) {
-  throw "00_inbox 已有同名檔案，請等待處理完成或改用新檔名。"
-}
-Copy-Item `
-  -LiteralPath "C:\使用者資料\資料.xlsx" `
-  -Destination $InboxCopy `
-  -ErrorAction Stop
-
-Set-Location "C:\AI\local-knowledge-compiler"
-.\.venv\Scripts\kb.exe ingest-once `
-  "C:\KnowledgeBase" `
-  $InboxCopy `
-  --space work
-```
-
-複製前若 `00_inbox` 已有同名檔案，不得直接覆蓋；先等待舊副本處理完成，或替新副本
-加上日期。使用者唯一原檔必須留在原位置。
-
-空間選擇：
-
-- 個人或私密資料：`personal`
-- 工作資料：`work`
-- 可共用資料：`shared`
-- 還不能判斷：`unclassified`
-
-不要擅自把低信心資料放進 `shared`。
-
-第一版 Windows 匯入不要使用設計中預留的 `project:<代號>`。查詢層雖能辨識它，
-但原始檔保存層目前不接受冒號資料夾名稱。特定專案資料暫時歸入 `work`，並在檔名
-或內容標明專案。
-
-### 7.2 持續監看
-
-若使用者希望「檔案放進去後自動整理」：
-
-```powershell
-.\scripts\start-kb.ps1 -Vault "C:\KnowledgeBase"
-```
-
-接著使用者只要把新資料放進：
-
-```text
-C:\KnowledgeBase\00_inbox
-```
-
-監看器會等待檔案複製完成後再處理，避免讀到半個檔案。
-
-### 7.3 Excel 更新時
-
-同一份 Excel 內容改變後再次匯入：
-
-```text
-舊版本保留 → 新版本建立 → 新內容重新索引 → Wiki 排隊更新
-```
-
-內容完全相同時會依雜湊去重，不會假裝它是新知識。
-
----
-
-## 8. 每次提問的正式流程
-
-使用者可以在 Codex 或 Claude 自然提問，但 AI 必須先建立證據包。
-
-範例：
-
-```powershell
-.\.venv\Scripts\kb.exe prepare "這份 Excel 的主要決策與待辦是什麼？" `
-  --vault "C:\KnowledgeBase" `
-  --space work `
-  --output "C:\KnowledgeBase\.kb\last-packet.json"
-```
-
-AI 只能依證據包回答，不得用模型印象補答案。回答要包含：
-
-1. 直接結論
-2. 證據整理
-3. 來源與定位
-4. 衝突與時效
-5. 信心
-6. 未知事項
-7. 下一個應補進知識庫的本地資料
-
-回答 JSON 範例：
-
-```json
-{
-  "conclusion": "依目前本地資料整理出的結論。",
-  "citations": [
-    {
-      "source_id": "從證據包原樣複製",
-      "version_id": "從證據包原樣複製",
-      "locator": "從證據包原樣複製",
-      "evidence_sha256": "從證據包原樣複製"
-    }
-  ],
-  "confidence": "high",
-  "conflicts": "沒有發現衝突。"
-}
-```
-
-引用欄位必須從證據包原樣複製。證據不足時：
-
-- `conclusion` 明說無法判定
-- `citations` 使用空陣列
-- `confidence` 使用 `low`
-
-完成答案後：
-
-```powershell
-.\.venv\Scripts\kb.exe finalize `
-  --vault "C:\KnowledgeBase" `
-  --packet "C:\KnowledgeBase\.kb\last-packet.json" `
-  --answer "C:\KnowledgeBase\.kb\answer.json"
-```
-
----
-
-## 9. 日常使用的白話流程
-
-```text
-新資料
-→ 放入 00_inbox 或用 ingest-once
-→ 原始版本永久保存到 10_raw
-→ 抽取可搜尋文字
-→ 排隊整理 Wiki
-→ 提問時 prepare 找證據
-→ AI 依證據回答
-→ finalize 保存有引用的成果
-→ 後續問題使用累積後的知識
-```
-
----
-
-## 10. 背景整理員的設定
-
-知識庫建立後查看：
-
-```text
-C:\KnowledgeBase\80_system\config.toml
-```
-
-`compiler.provider` 支援：
-
-- `"claude"`：背景呼叫 Claude CLI 整理 Wiki
-- `"manual"`：不自動呼叫模型，建立人工交接工作
-
-Codex Desktop 目前不能直接當成背景 CLI，但 Codex 仍能完整使用：
-
-- `kb prepare`
-- 讀取證據包
-- 產生有引用的回答
-- `kb finalize`
-
-若 Claude CLI 不存在或失敗，系統會把工作標成 `pending_attention`，不會假裝整理
-成功。
-
-查看工作：
-
-```powershell
-.\.venv\Scripts\kb.exe status --vault "C:\KnowledgeBase"
-```
-
-繼續工作：
-
-```powershell
-.\.venv\Scripts\kb.exe resume `
-  --vault "C:\KnowledgeBase" `
-  --job-id "畫面顯示的-job_id"
-```
-
----
-
-## 11. 健康檢查與重建
-
-檢查知識庫：
-
-```powershell
-.\.venv\Scripts\kb.exe lint --vault "C:\KnowledgeBase"
-```
-
-重新建立搜尋目錄：
-
-```powershell
-.\.venv\Scripts\kb.exe rebuild --vault "C:\KnowledgeBase"
-```
-
-SQLite 索引可以重建。不要因為索引損壞就刪除 `10_raw` 或 `20_wiki`。
-
----
-
-## 12. 不可破壞的安全原則
-
-接手的 AI 必須遵守：
-
-1. 不永久刪除原始資料。
-2. 不直接覆寫 `10_raw`。
-3. 不把 AI 回答冒充原始來源。
-4. 不在沒有證據時猜測。
-5. 不擅自跨 `personal`、`work`、`shared` 或其他專案搜尋。
-6. 不因檔案裡有網址就自動上網下載。
-7. 不把私人知識庫內容推到工具的 GitHub 儲存庫。
-8. 不修改使用者原始 Excel；匯入時保留原檔。
-9. 不在工作失敗時回報假成功。
-10. 不重建已經完成並通過測試的第一版架構，除非使用者提出新需求或發現缺陷。
-
-重要隱私提醒：
-
-```text
-資料保存在本機
-≠
-送給 Codex／Claude 的證據仍完全離線
-```
-
-若證據包交給雲端模型，內容仍可能離開本機。處理公司機密或個資前，必須遵守使用者
-的公司政策與模型服務設定。
-
----
-
-## 13. 重要程式與文件位置
-
-- 使用說明：`README.md`
-- 正式設計：
-  `docs/superpowers/specs/2026-07-25-local-knowledge-iteration-system-design.md`
-- 實作計畫：
-  `docs/superpowers/plans/2026-07-25-local-knowledge-compiler-implementation.md`
-- CLI：`src/local_kb/cli.py`
-- 收錄流程：`src/local_kb/ingest.py`
-- Excel／Word 抽取：`src/local_kb/extractors/office.py`
-- 查詢：`src/local_kb/query.py`
-- 答案回寫：`src/local_kb/finalize.py`
-- 背景編譯：`src/local_kb/compiler.py`
-- Wiki 發布：`src/local_kb/wiki.py`
-- 安全交易：`src/local_kb/transaction.py`
-- 健康檢查：`src/local_kb/health.py`
-- 共用規則模板：`src/local_kb/templates/KNOWLEDGE_PROTOCOL.md`
-- Windows 監看啟動器：`scripts/start-kb.ps1`
-- 測試：`tests/`
-
----
-
-## 14. 下一位 AI 的優先工作
-
-目前不需要繼續開發程式。請依序：
-
-1. 確認新電腦能登入私人 GitHub。
-2. Clone `Jason5330/local-knowledge-compiler`。
-3. 建立 `.venv` 並安裝專案。
-4. 詢問或確認使用者想把真正的知識庫放在哪裡。
-5. 執行 `kb init`。
-6. 詢問或確認 Excel 的完整路徑及資料空間。
-7. 用 `kb ingest-once` 匯入第一份 Excel。
-8. 執行 `kb status` 與 `kb lint`。
-9. 用一個實際問題執行 `kb prepare`。
-10. 把結果用最大白話交付給使用者。
-
-只有在以上步驟出現實際錯誤時，才進入除錯或修改程式。
-
----
-
-## 15. 可直接貼給另一個 AI 的接手指令
-
-```text
-請先完整閱讀專案根目錄的 AI_HANDOFF.md，再閱讀 README.md。
-
-這是我的本地知識庫工具，GitHub 私人儲存庫是：
-https://github.com/Jason5330/local-knowledge-compiler
-
-不要重新設計已完成的系統。請先檢查目前電腦的 Git、GitHub 登入、Python 3.13
-與專案安裝狀態，然後依 AI_HANDOFF.md 的「下一位 AI 的優先工作」繼續。
-
-我是初學者，請用繁體中文、最大白話、先給結果。執行任何操作後都要驗證，不要在
-失敗時回報成功。不要刪除或修改我的原始 Excel。
-```
-
----
-
-## 16. 交接時的已知未完成事項
-
-- 尚未在使用者選定的位置建立第一座實際知識庫。
-- 尚未取得並匯入使用者的第一份 Excel。
-- 尚未用使用者自己的資料跑第一次 `prepare → 回答 → finalize`。
-- 另一台電腦必須重新建立 `.venv`。
-- GitHub 是私人儲存庫，新電腦必須先用 `Jason5330` 有權限的帳號登入。
-
-這些是正常的下一步，不代表第一版程式未完成。
+不要重新問已在本文件回答過的問題，也不要未經檢查就重新安裝。

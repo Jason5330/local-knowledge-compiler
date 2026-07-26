@@ -1,333 +1,258 @@
-# 本地知識庫指令參考
+# 給 Codex／Claude Code 的內部執行參考
 
-這是完整指令表。第一次安裝請先讀
-[零基礎安裝與使用指南](BEGINNER_GUIDE.zh-TW.md)。
+這份文件是給 AI 代理讀的。一般使用者不需要輸入以下指令。
 
-以下範例假設：
+預設位置：
 
 ```text
-工具：C:\AI\local-knowledge-compiler
-知識庫：C:\KnowledgeBase
+repository = C:\AI\local-knowledge-compiler
+vault = C:\KnowledgeBase
+python = C:\AI\local-knowledge-compiler\.venv\Scripts\python.exe
+kb = C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe
 ```
 
-先進入工具資料夾：
+## AI 執行原則
 
-```powershell
-Set-Location "C:\AI\local-knowledge-compiler"
+1. 先讀 `README.md`、`AI_HANDOFF.md`、本文件與 vault protocol。
+2. 在執行寫入前解析絕對路徑，確認目標在使用者指定範圍。
+3. 不得將唯一一份來源直接傳給 `ingest-once`。
+4. 先複製到 `00_inbox`，使用不衝突的檔名，再只處理副本。
+5. 對既有 vault 不得重跑具破壞性的初始化。
+6. 未經同意不得設定啟動項目、排程、常駐監看或外部分享。
+7. `provider=claude` 前必須實測 Claude CLI；否則使用 `manual`。
+8. Exit code 2 是可恢復的人工作業狀態，不可當成資料遺失。
+9. 完成前執行 `status` 與 `lint`，以實際輸出作為證據。
+
+以下使用單行形式，讓不同代理可以依自己的 shell 安全執行。不要把這些內容原樣丟給
+初學者。
+
+## 建立隔離環境
+
+```text
+py -3.13 -m venv C:\AI\local-knowledge-compiler\.venv
+C:\AI\local-knowledge-compiler\.venv\Scripts\python.exe -m pip install -e "C:\AI\local-knowledge-compiler[dev]"
 ```
 
----
+驗證：
 
-## 指令總表
-
-| 指令 | 用途 | 會不會修改知識庫 |
-|---|---|---|
-| `kb init` | 建立知識庫 | 會 |
-| `kb watch` | 持續監看並匯入 | 會 |
-| `kb ingest-once` | 匯入一個檔案 | 會 |
-| `kb prepare` | 依問題準備證據包 | 會寫入證據包檔案，不改原始證據 |
-| `kb finalize` | 保存有引用的回答 | 會 |
-| `kb status` | 查看待處理工作 | 不會 |
-| `kb resume` | 繼續一個待處理工作 | 會 |
-| `kb lint` | 健康檢查 | 不會 |
-| `kb rebuild` | 重建搜尋索引 | 會重建索引，不改原始來源 |
-
-查看全部指令：
-
-```powershell
-.\.venv\Scripts\kb.exe --help
+```text
+C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe --help
 ```
-
-查看某個指令：
-
-```powershell
-.\.venv\Scripts\kb.exe prepare --help
-```
-
----
 
 ## `kb init`
 
-用途：建立一座新知識庫。
-
-格式：
+用途：第一次建立 vault。只有確認目標不存在或是空白新位置時才執行。
 
 ```text
-kb init <知識庫路徑>
+C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe init C:\KnowledgeBase
 ```
 
-範例：
-
-```powershell
-.\.venv\Scripts\kb.exe init "C:\KnowledgeBase"
-```
-
-成功：
+初始化後檢查：
 
 ```text
-Initialized knowledge vault: C:\KnowledgeBase
+C:\KnowledgeBase\00_inbox
+C:\KnowledgeBase\10_raw
+C:\KnowledgeBase\20_wiki
+C:\KnowledgeBase\80_system
+C:\KnowledgeBase\80_system\KNOWLEDGE_PROTOCOL.md
 ```
-
-補充：
-
-- 已存在的預設設定與規則檔不會被初始化命令擅自覆蓋。
-- 路徑有空格或中文時，保留雙引號。
-
----
 
 ## `kb ingest-once`
 
-用途：匯入一個本地檔案。
-
-格式：
+用途：處理一個已複製到 inbox 的檔案。
 
 ```text
-kb ingest-once <知識庫> <檔案> --space <空間>
+C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe ingest-once C:\KnowledgeBase C:\KnowledgeBase\00_inbox\safe-copy.xlsx --space work
 ```
 
-安全規則：先把唯一原檔複製到 `00_inbox`，只處理副本。
+可用 space：
 
-範例：
-
-```powershell
-.\.venv\Scripts\kb.exe ingest-once `
-  "C:\KnowledgeBase" `
-  "C:\KnowledgeBase\00_inbox\資料.xlsx" `
-  --space work
+```text
+personal
+work
+shared
+unclassified
 ```
 
-參數：
+Windows v1 暫時不要使用 `project:<slug>`。專案資料先歸 `work`，把專案名保留在檔名
+或內容中。
 
-| 參數 | 必填 | 說明 |
-|---|---|---|
-| 第一個路徑 | 是 | 知識庫根目錄 |
-| 第二個路徑 | 是 | 要匯入的檔案副本 |
-| `--space` | 否 | 預設 `unclassified` |
+安全前置程序：
 
-可用空間：
+```text
+解析原始檔絕對路徑
+→ 記錄原檔大小、修改時間與雜湊（需要時）
+→ 產生不衝突的 inbox 副本名稱
+→ 複製
+→ 確認原檔仍存在
+→ ingest-once 只接收副本
+→ 檢查 raw、index、status、lint
+```
 
-- `personal`
-- `work`
-- `shared`
-- `unclassified`
+同磁碟 ingest 可能以 move claim 副本，這是為什麼絕不能直接傳入使用者唯一原檔。
 
-第一版 Windows 匯入請不要使用設計中預留的 `project:<代號>`；原始檔保存層目前
-不接受帶冒號的空間名稱。特定專案資料暫時使用 `work`，並在檔名或內容標示專案。
+## `kb prepare`
 
----
+用途：根據問題建立證據包。
+
+```text
+C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe prepare "使用者問題" --vault C:\KnowledgeBase --space work --output C:\KnowledgeBase\.kb\last-packet.json
+```
+
+代理必須讀取 packet，只根據 packet 回答。引用欄位必須逐字使用 packet 的值：
+
+```json
+{
+  "conclusion": "根據證據得到的結論",
+  "citations": [
+    {
+      "source_id": "原樣複製",
+      "version_id": "原樣複製",
+      "locator": "原樣複製",
+      "evidence_sha256": "原樣複製"
+    }
+  ],
+  "confidence": "high",
+  "conflicts": "沒有發現衝突。"
+}
+```
+
+證據不足時：
+
+```json
+{
+  "conclusion": "目前資料無法判定。",
+  "citations": [],
+  "confidence": "low",
+  "conflicts": "證據不足。"
+}
+```
+
+## `kb finalize`
+
+用途：驗證答案與引用，保存回答，排入知識整理。
+
+```text
+C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe finalize --vault C:\KnowledgeBase --packet C:\KnowledgeBase\.kb\last-packet.json --answer C:\KnowledgeBase\.kb\answer.json
+```
+
+finalize 後：
+
+```text
+status → 確認衍生工作狀態
+lint → 確認知識庫完整性
+```
+
+衍生答案只能整理進 `20_wiki`，不得冒充新的原始來源寫入 `10_raw`。
+
+## `kb status`
+
+用途：只讀查看工作狀態。
+
+```text
+C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe status --vault C:\KnowledgeBase
+```
+
+重點欄位：
+
+- `job_id`
+- `job_type`
+- `state`
+- `error`
+- `handoff_path`
+- `source_id`
+- `version_id`
+
+## `kb resume`
+
+用途：在修正問題或完成人工 handoff 後，繼續指定工作。
+
+```text
+C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe resume --vault C:\KnowledgeBase --job-id ACTUAL_JOB_ID
+```
+
+不要盲目重試。先讀 status、錯誤與 handoff，確認前置條件已處理。
+
+## `kb lint`
+
+用途：檢查 vault 結構、索引、引用與一致性。
+
+```text
+C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe lint --vault C:\KnowledgeBase
+```
+
+代理回報時不要只說「跑過」。要清楚說通過、失敗或警告數量，並列出使用者能理解的
+影響。
+
+## `kb rebuild`
+
+用途：從既有原始資料重建衍生索引。這不是一般故障排除的第一步。
+
+```text
+C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe rebuild --vault C:\KnowledgeBase
+```
+
+執行前：
+
+1. 說明重建範圍與預期影響。
+2. 確認 `10_raw` 與必要索引仍完整。
+3. 取得使用者明確同意。
+4. 完成後執行 `status`、`lint` 與抽樣查詢。
 
 ## `kb watch`
 
-用途：一直監看 `00_inbox` 裡直接放入的新檔案。
-
-格式：
+用途：持續監看 inbox。
 
 ```text
-kb watch <知識庫> --space <空間>
-```
-
-範例：
-
-```powershell
-.\.venv\Scripts\kb.exe watch "C:\KnowledgeBase" --space work
-```
-
-停止：
-
-```text
-Ctrl + C
+C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe watch C:\KnowledgeBase
 ```
 
 注意：
 
-- `--space` 預設是 `unclassified`。
-- 一次只用一個 space 監看同一個 inbox。
-- 新檔案要直接放進 `00_inbox`，不要藏在子資料夾。
+- 這是長時間執行程序。
+- 代理工作階段關閉後可能停止。
+- 不等於 Windows 服務。
+- 不得未經同意設定自動啟動。
+- manual provider 可能產生 `pending_attention`，需由 AI 接手 handoff。
 
----
+## Exit code
 
-## `kb prepare`
+- `0`：成功，或目前無待處理項目。
+- `1`：錯誤；保留輸出並調查原因。
+- `2`：等待人工處理；讀取 handoff，完成後用 `resume`。
 
-用途：根據問題搜尋本地知識，建立證據包。
+## Provider 選擇
 
-格式：
+### Codex
+
+Codex Desktop 無可呼叫的背景 CLI 時：
+
+```toml
+[compiler]
+provider = "manual"
+```
+
+Codex 仍可執行匯入、prepare、回答、finalize、status、resume 與 lint。
+
+### Claude Code
+
+只有在 `claude` 命令實測成功且已登入後：
+
+```toml
+[compiler]
+provider = "claude"
+```
+
+若 Claude CLI 呼叫失敗，切回 manual 或保留 `pending_attention`，不可宣稱 Wiki 已更新。
+
+## 代理完成回報模板
 
 ```text
-kb prepare "<問題>" --vault <知識庫> --space <空間> --output <輸出檔>
+結果：成功／部分完成／未完成
+原始資料：是否保持不動
+保存位置：raw 或版本位置
+可搜尋狀態：是／否，證據是什麼
+待處理：pending_attention／pending_extractor／無
+檢查：status 結果、lint 結果
+下一步：一句最簡單的建議
 ```
-
-範例：
-
-```powershell
-.\.venv\Scripts\kb.exe prepare `
-  "最後決定了什麼？" `
-  --vault "C:\KnowledgeBase" `
-  --space work `
-  --output ".kb\last-packet.json"
-```
-
-參數：
-
-| 參數 | 必填 | 預設 | 說明 |
-|---|---|---|---|
-| 問題 | 是 | 無 | 想查詢的自然語言問題 |
-| `--vault` | 否 | 目前資料夾 | 建議初學者永遠明確填寫 |
-| `--space` | 否 | 安全推斷 | 可重複指定；初學者建議明確填寫 |
-| `--output` | 否 | `.kb/last-packet.json` | 必須留在知識庫內 |
-
-跨多個已授權空間：
-
-```powershell
-.\.venv\Scripts\kb.exe prepare "共同資料是什麼？" `
-  --vault "C:\KnowledgeBase" `
-  --space work `
-  --space shared
-```
-
-不要在未授權時把 `personal` 和 `work` 混在一起。
-
-查詢層雖能辨識 `project:<代號>`，但第一版 Windows 匯入尚不能安全建立這種原始
-來源；因此初學者目前不要使用。
-
----
-
-## `kb finalize`
-
-用途：驗證引用、保存答案，並建立下一輪知識整理工作。
-
-格式：
-
-```text
-kb finalize --vault <知識庫> --packet <證據包> --answer <答案 JSON>
-```
-
-範例：
-
-```powershell
-.\.venv\Scripts\kb.exe finalize `
-  --vault "C:\KnowledgeBase" `
-  --packet "C:\KnowledgeBase\.kb\last-packet.json" `
-  --answer "C:\KnowledgeBase\.kb\answer.json"
-```
-
-答案必要欄位：
-
-- `conclusion`
-- `citations`
-- `confidence`
-
-`confidence` 只能是：
-
-- `high`
-- `medium`
-- `low`
-
-引用必須與證據包完全一致，包含 `evidence_sha256`。
-
-成功：
-
-```text
-Saved answer: ...
-Queued derived update: ...
-```
-
----
-
-## `kb status`
-
-用途：只查看目前有哪些工作未完成，不修改知識庫。
-
-範例：
-
-```powershell
-.\.venv\Scripts\kb.exe status --vault "C:\KnowledgeBase"
-```
-
-重要欄位：
-
-| 欄位 | 白話 |
-|---|---|
-| `healthy` | 目前是否沒有待處理問題 |
-| `attention_required` | 是否需要你或 AI 處理 |
-| `job_id` | 指定工作的編號 |
-| `type` | 原始檔匯入或答案衍生更新 |
-| `state` | 目前做到哪一步 |
-| `error` | 錯誤原因 |
-| `handoff_path` | 人工交接檔的位置 |
-
----
-
-## `kb resume`
-
-用途：修正背景編譯器後，繼續指定工作。
-
-範例：
-
-```powershell
-.\.venv\Scripts\kb.exe resume `
-  --vault "C:\KnowledgeBase" `
-  --job-id "畫面上的-job_id"
-```
-
-`job_id` 必須從 `kb status` 的結果原樣複製。
-
----
-
-## `kb lint`
-
-用途：只讀取並檢查知識庫是否健康。
-
-範例：
-
-```powershell
-.\.venv\Scripts\kb.exe lint --vault "C:\KnowledgeBase"
-```
-
-成功重點：
-
-```json
-"healthy": true
-```
-
-如果是 `false`，把完整 JSON 交給 Codex 或 Claude 分析，不要自行刪檔。
-
----
-
-## `kb rebuild`
-
-用途：從保存的抽取快取重建 SQLite 搜尋索引。
-
-範例：
-
-```powershell
-.\.venv\Scripts\kb.exe rebuild --vault "C:\KnowledgeBase"
-```
-
-成功：
-
-```text
-Indexed sources: 數字
-```
-
-不要把 `rebuild` 當作清理原始資料。它只負責搜尋目錄。
-
----
-
-## 結束代碼
-
-| Exit code | 意思 |
-|---|---|
-| `0` | 指令完成 |
-| `1` | 發生錯誤 |
-| `2` | 工作尚未完成或健康檢查需要注意 |
-
-Exit code `2` 不一定代表匯入失敗。例如 Claude CLI 不可用時，原始資料與索引可能
-已完成，但 Wiki 整理停在人工交接。
-
----
-
-## 相關文件
-
-- [零基礎安裝與使用指南](BEGINNER_GUIDE.zh-TW.md)
-- [README](../README.md)
-- [AI 完整交接文件](../AI_HANDOFF.md)

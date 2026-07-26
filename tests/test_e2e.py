@@ -293,6 +293,28 @@ def test_windows_launcher_and_beginner_readme_explain_safe_daily_workflow():
     assert "不代表送給 AI 的內容仍然離線" in readme
 
 
+def test_beginner_docs_use_ai_driven_installation_and_safe_excel_copy():
+    repository = Path(__file__).resolve().parents[1]
+    readme = (repository / "README.md").read_text(encoding="utf-8")
+    guide = (
+        repository / "docs" / "BEGINNER_GUIDE.zh-TW.md"
+    ).read_text(encoding="utf-8")
+    cli_reference = (
+        repository / "docs" / "CLI_REFERENCE.zh-TW.md"
+    ).read_text(encoding="utf-8")
+
+    assert "用 Codex 首次安裝" in guide
+    assert "用 Claude Code 首次安裝" in guide
+    assert "不要叫我自己輸入" in guide
+    assert "原始 Excel 永遠不能被搬走" in guide
+    assert "只把 00_inbox 裡的副本交給 ingest-once" in guide
+    assert "兩者都使用 `C:\\KnowledgeBase`" in readme
+    assert "這份文件是給 AI 代理讀的" in cli_reference
+    assert "一般使用者不需要輸入以下指令" in cli_reference
+    assert "```powershell" not in readme.casefold()
+    assert "```powershell" not in guide.casefold()
+
+
 def test_python_module_entrypoint_invokes_cli_help():
     completed = subprocess.run(
         [sys.executable, "-m", "local_kb.cli", "--help"],

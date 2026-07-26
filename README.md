@@ -1,130 +1,71 @@
 # 本地知識迭代系統
 
-這套工具把一般資料夾變成 Codex 與 Claude 都能使用的本地知識庫。原始檔永久保留，
-AI 只從本機索引整理證據；你不需要 Obsidian，也不需要理解程式架構。
+這套工具把 Excel、文件與筆記整理成 Codex 和 Claude Code 都能共用的本地知識庫。
+你不需要安裝 Obsidian，也不需要自己輸入終端機指令。
 
-## 完全不懂技術，請從這裡開始
+## 小白從這裡開始
 
-- [零基礎安裝與使用指南](docs/BEGINNER_GUIDE.zh-TW.md)：從安裝 Git、Python、
-  登入 GitHub，到第一次安全匯入 Excel、提問、保存答案與故障處理。
-- [所有指令參考](docs/CLI_REFERENCE.zh-TW.md)：`init`、`watch`、
-  `ingest-once`、`prepare`、`finalize`、`status`、`resume`、`lint`、
-  `rebuild` 的完整白話說明。
-- [換電腦／換 AI 的交接文件](AI_HANDOFF.md)：讓 Codex、Claude 或其他 AI
-  直接接手目前進度。
+打開以下指南，選擇你已經能使用的 AI，把裡面的提示詞整段貼給它：
+
+- [Codex／Claude Code 零基礎安裝與使用指南](docs/BEGINNER_GUIDE.zh-TW.md)
+- [給 AI 使用的內部指令參考](docs/CLI_REFERENCE.zh-TW.md)
+- [換電腦／換 AI 的完整交接文件](AI_HANDOFF.md)
+
+> 最重要的前提：Codex 或 Claude Code 至少要有一個已經能打開。
+> 如果兩個都還沒有，必須先請公司資訊人員或懂電腦的人替你安裝其中一個；AI 尚未
+> 啟動前，無法替自己安裝。
 
 ## 初次安裝
 
-在 PowerShell 進入本專案資料夾，依序執行：
+你只需把指南中的「首次安裝提示詞」貼給 Codex 或 Claude Code。AI 會替你：
 
-```powershell
-py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-.\.venv\Scripts\kb.exe init "C:\你的資料夾\我的知識庫"
-.\scripts\start-kb.ps1 -Vault "C:\你的資料夾\我的知識庫"
+```text
+檢查環境 → 下載專案 → 建立執行環境 → 建立知識庫 → 測試 → 回報結果
 ```
 
-最後一行會在畫面上持續監看；錯誤不會被隱藏。若要每次登入 Windows 後自動執行，
-可以按 `Win + R`、輸入 `shell:startup`，再手動放入這支 PowerShell 腳本的捷徑。
-程式本身不會擅自修改 Windows 啟動項目。
+預設位置：
+
+```text
+系統程式：C:\AI\local-knowledge-compiler
+知識庫：C:\KnowledgeBase
+```
+
+已經有同名資料夾時，AI 必須先檢查並保留原資料，不得直接覆蓋。
 
 ## 每天怎麼用
 
-流程很單純：
+你只要對 Codex 或 Claude Code 說自然語言：
 
 ```text
-新資料 → 放進 00_inbox → 監看器整理並保存原始版本
-提問 → Codex 或 Claude 先跑 kb prepare → 只依證據回答並引用
-回答完成 → kb finalize → 保存答案並排入下一輪知識整理
-檢查 → kb lint
-回看／復原 Wiki 變更 → git log → git revert <commit>
+匯入 Excel → AI 複製一份到 00_inbox → 整理並保留原始版本
+提出問題 → AI 執行 kb prepare → 只依證據回答並引用
+保存回答 → AI 執行 kb finalize → 更新可搜尋的知識
+健康檢查 → AI 執行 kb status 與 kb lint
+需要復原 → AI 先查看 git log，再經你同意執行 git revert
 ```
 
-手動準備證據包：
+請不要把唯一一份 Excel 直接交給匯入器。AI 必須先複製，原檔永遠留在原位置。
 
-```powershell
-.\.venv\Scripts\kb.exe prepare "團隊最後選了哪個方案？" `
-  --vault "C:\你的資料夾\我的知識庫" --space work `
-  --output .kb\last-packet.json
-```
+## Codex 與 Claude Code 如何共用
 
-AI 應把結論、信心、衝突與「結構化引用」寫入答案 JSON，然後執行：
-
-```json
-{
-  "conclusion": "團隊選擇 B 方案。",
-  "citations": [
-    {
-      "source_id": "從證據包原樣複製",
-      "version_id": "從證據包原樣複製",
-      "locator": "從證據包原樣複製",
-      "evidence_sha256": "從證據包原樣複製"
-    }
-  ],
-  "confidence": "high",
-  "conflicts": "沒有發現衝突。"
-}
-```
-
-引用欄位不可自己改寫。若證據不足，結論要明說無法判定、`citations` 使用空陣列，
-`confidence` 使用 `low`。
-
-```powershell
-.\.venv\Scripts\kb.exe finalize `
-  --vault "C:\你的資料夾\我的知識庫" `
-  --packet "C:\你的資料夾\我的知識庫\.kb\last-packet.json" `
-  --answer "C:\你的資料夾\我的知識庫\.kb\answer.json"
-.\.venv\Scripts\kb.exe lint --vault "C:\你的資料夾\我的知識庫"
-```
+- 兩者都使用 `C:\KnowledgeBase`，不要各建一套。
+- 兩者都必須遵守 `80_system/KNOWLEDGE_PROTOCOL.md`。
+- Codex 可以匯入、找證據、回答、保存答案與整理知識。
+- Claude Code 也能做相同工作；若電腦上的 Claude CLI 可用，還能擔任背景編譯器。
+- Codex Desktop 不能當作背景 CLI 時，系統改用人工交接模式，不會假裝已經完成。
 
 ## 你需要知道的限制
 
-- Codex 與 Claude 都是雲端模型。本機保存資料，不代表送給 AI 的內容仍然離線；
-  證據包可能會提交給你正在使用的模型服務，請先遵守公司與個人的資料規範。
-- 裸網址只會當成書籤文字，系統絕不抓取網頁，也不會自動搜尋網路。
-- 圖片、掃描 PDF、音訊與影片目前沒有文字擷取器時，會標記
-  `pending_extractor`；檔案仍會安全保存，但不能冒充已讀取內容。
-- 背景自動編譯目前使用 Claude CLI。原因是這台電腦安裝的 Codex Desktop
-  不能當成背景 CLI 呼叫；Codex 仍可透過同一份 `AGENTS.md`、`kb prepare` 與
-  `kb finalize` 完整使用知識庫。
-- `80_system/config.toml` 的 `compiler.provider = "claude"` 會真的呼叫 Claude CLI；
-  若 CLI 不存在或失敗，工作會安全轉成 `pending_attention` 人工交接，不會假裝
-  Wiki 已更新。改成 `"manual"` 則從一開始就只建立人工交接檔。
-- Claude CLI 是背景編譯選項，不代表所有資料都留在本機；其雲端資料處理規則仍
-  取決於你的 Claude 帳戶與服務設定。
+- Codex 與 Claude 都是雲端模型。本機保存資料，不代表送給 AI 的內容仍然離線。
+- 裸網址只會保存成文字，不會自動抓取網頁。
+- 圖片、掃描 PDF、音訊與影片若無擷取器，會標記 `pending_extractor`。
+- 工作顯示 `pending_attention`，代表 AI 還需處理，不代表原始資料遺失。
+- 內部 Exit code `0` 代表成功。
+- 內部 Exit code `1` 代表錯誤。
+- 內部 Exit code `2` 代表需要人工接手。
+- 是否設定背景監看或 Windows 自動啟動，必須先取得你的明確同意；AI 不得自行設定
+  `shell:startup`。
 
-`kb finalize` 建立的衍生整理工作會由監看器消化：它只把已引用的答案整理進
-`20_wiki`，不會把答案放進 `10_raw`，也不會增加原始來源數量。若背景模型不可用，
-工作會停在可恢復的人工交接狀態，完成交接後可繼續發布。
-
-Codex 與 Claude 的入口檔都只指向
-`80_system/KNOWLEDGE_PROTOCOL.md`。所以兩邊遵守同一份規則，不會各自長出兩套互相
-矛盾的知識庫流程。
-
-## 工作卡住時：查看與繼續
-
-先查看有哪些工作需要處理。這個指令只讀取狀態，不會改動知識庫：
-
-```powershell
-.\.venv\Scripts\kb.exe status --vault "C:\你的資料夾\我的知識庫"
-```
-
-輸出的 JSON 會列出 `job_id`、工作類型、目前狀態、錯誤、人工交接檔位置，以及
-來源與版本。看到 `pending_attention`，通常代表 Claude CLI 不可用，或你把
-`compiler.provider` 設為 `manual`。先修好 Claude CLI 或調整設定，再複製該筆
-`job_id` 執行：
-
-```powershell
-.\.venv\Scripts\kb.exe resume --vault "C:\你的資料夾\我的知識庫" `
-  --job-id "畫面上的-job_id"
-```
-
-不論它是一般來源或由答案產生的知識更新，都使用同一個 `resume` 指令。系統會自己
-辨認類型；答案更新只會寫入 `20_wiki`，不會重新塞進 `10_raw`。
-
-- Exit code `0`：成功，或目前沒有待處理工作。
-- Exit code `1`：發生錯誤；畫面會顯示原因，工作會保留重試狀態。
-- Exit code `2`：工作尚未完成，需要人工處理；依畫面上的 handoff 與下一步操作即可。
-
-`watch` 也會在新工作首次進入人工交接時顯示 job ID 與 handoff；它不會在每一輪
-自動重試同一筆工作。之後隨時用 `status` 查詢，再用 `resume` 繼續。
+遇到問題時，不用研究 `kb.exe status --vault`、`kb.exe resume --vault` 或
+`--job-id` 的寫法。直接貼指南中的「健康檢查提示詞」，讓 AI 檢查、修復並用白話
+回報。
