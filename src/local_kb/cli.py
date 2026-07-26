@@ -1,11 +1,14 @@
 """Command-line interface for local knowledge vaults."""
 
 import argparse
+from importlib import resources
 import os
 from pathlib import Path
+import stat
 import tempfile
 import time
 from typing import Sequence
+from uuid import uuid4
 
 from .catalog import Catalog
 from .config import Config
@@ -45,36 +48,159 @@ max_retries = 3
 
 def build_vault(root: Path) -> VaultPaths:
     """Create the standard layout and default configuration for a vault."""
-    paths = VaultPaths(Path(root).resolve())
+    requested_root = Path(root).absolute()
+    if os.path.lexists(requested_root) and (
+        requested_root.is_symlink()
+        or _is_reparse_path(requested_root)
+        or not requested_root.is_dir()
+    ):
+        raise ValueError("vault root is an unsafe link, reparse point, or non-directory")
+    requested_root.mkdir(parents=True, exist_ok=True)
+    paths = VaultPaths(requested_root)
     for name in ROOTS:
-        getattr(paths, name).mkdir(parents=True, exist_ok=True)
+        _ensure_vault_directory(paths.root, getattr(paths, name))
     for source_root in (paths.raw, paths.wiki):
         for category in CATEGORIES:
-            (source_root / category).mkdir(exist_ok=True)
-    paths.queue.mkdir(parents=True, exist_ok=True)
-    paths.staging.mkdir(parents=True, exist_ok=True)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=paths.system,
-            prefix=f".{paths.config.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as config_file:
-            temporary_path = Path(config_file.name)
-            config_file.write(DEFAULT_CONFIG)
-            config_file.flush()
-            os.fsync(config_file.fileno())
-        try:
-            os.link(temporary_path, paths.config)
-        except FileExistsError:
-            pass
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+            _ensure_vault_directory(paths.root, source_root / category)
+    _ensure_vault_directory(paths.root, paths.queue)
+    _ensure_vault_directory(paths.root, paths.staging)
+    _install_once(
+        paths.root,
+        paths.config,
+        DEFAULT_CONFIG.encode("utf-8"),
+        publish_with_link=True,
+    )
+    with tempfile.TemporaryDirectory(prefix="local-kb-catalog-") as catalog_stage:
+        staged_catalog = Path(catalog_stage) / "catalog.sqlite3"
+        Catalog(staged_catalog).initialize()
+        _install_once(
+            paths.root,
+            paths.index / "catalog.sqlite3",
+            staged_catalog.read_bytes(),
+        )
+    for template_name, destination in (
+        ("KNOWLEDGE_PROTOCOL.md", paths.system / "KNOWLEDGE_PROTOCOL.md"),
+        ("AGENTS.md", paths.root / "AGENTS.md"),
+        ("CLAUDE.md", paths.root / "CLAUDE.md"),
+    ):
+        payload = (
+            resources.files("local_kb")
+            .joinpath("templates", template_name)
+            .read_bytes()
+        )
+        _install_once(paths.root, destination, payload)
     return paths
+
+
+def _is_reparse_path(path: Path) -> bool:
+    try:
+        return bool(os.lstat(path).st_file_attributes & 0x400)
+    except AttributeError:
+        return False
+    except OSError:
+        return True
+
+
+def _ensure_vault_directory(root: Path, directory: Path) -> None:
+    """Create and pin one directory without traversing links or junctions."""
+    from .compiler import ManualCompiler
+
+    try:
+        directory.relative_to(root)
+    except ValueError as error:
+        raise ValueError("vault directory must stay inside the vault") from error
+    with ManualCompiler(directory, trusted_root=root)._pinned_outbox():
+        pass
+
+
+def _safe_installed_file(
+    destination: Path, *, directory_fd: int | None
+) -> os.stat_result | None:
+    try:
+        info = (
+            os.stat(destination.name, dir_fd=directory_fd, follow_symlinks=False)
+            if directory_fd is not None
+            else os.lstat(destination)
+        )
+    except FileNotFoundError:
+        return None
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or _is_reparse_path(destination)
+        or info.st_nlink != 1
+    ):
+        raise ValueError(f"managed target is an unsafe link: {destination.name}")
+    return info
+
+
+def _install_once(
+    root: Path,
+    destination: Path,
+    payload: bytes,
+    *,
+    publish_with_link: bool = False,
+) -> None:
+    """Publish a default file once; never replace user-owned bytes."""
+    from .compiler import ManualCompiler
+
+    if not isinstance(payload, bytes) or len(payload) > 1_000_000:
+        raise ValueError("template payload is invalid")
+    locker = ManualCompiler(destination.parent, trusted_root=root)
+    with locker._pinned_outbox(create=False) as directory_fd:
+        if _safe_installed_file(destination, directory_fd=directory_fd) is not None:
+            return
+        temporary_name = f".{destination.name}.{uuid4().hex}.tmp"
+        temporary_path = destination.parent / temporary_name
+        descriptor: int | None = None
+        try:
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            descriptor = (
+                os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+                if directory_fd is not None
+                else os.open(temporary_path, flags, 0o600)
+            )
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            try:
+                if directory_fd is not None:
+                    os.link(
+                        temporary_name,
+                        destination.name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    os.fsync(directory_fd)
+                elif publish_with_link:
+                    os.link(temporary_path, destination)
+                else:
+                    # Windows rename is an atomic no-replace operation.  It also
+                    # avoids exposing a partially written destination.
+                    os.rename(temporary_path, destination)
+            except FileExistsError:
+                _safe_installed_file(destination, directory_fd=directory_fd)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                if directory_fd is not None:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                else:
+                    temporary_path.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
+        _safe_installed_file(destination, directory_fd=directory_fd)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
