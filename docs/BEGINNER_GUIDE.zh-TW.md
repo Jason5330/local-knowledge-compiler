@@ -62,7 +62,7 @@ C:\KnowledgeBase\00_inbox（只處理副本）
 
 安裝要求：
 1. 先檢查目前資料夾與電腦環境，不要破壞或覆蓋任何既有檔案。
-2. 從 GitHub 私人倉庫 Jason5330/local-knowledge-compiler 取得最新版。
+2. 從 GitHub 公開倉庫 Jason5330/local-knowledge-compiler 取得最新版。
 3. 系統程式預設放在 C:\AI\local-knowledge-compiler。
 4. 知識庫預設放在 C:\KnowledgeBase。
 5. 如果上述位置已存在，先辨認它是不是既有系統；保留資料，只做安全更新。
@@ -113,7 +113,7 @@ docs/BEGINNER_GUIDE.zh-TW.md、docs/CLI_REFERENCE.zh-TW.md，
 
 安裝要求：
 1. 先檢查目前資料夾與電腦環境，不要破壞或覆蓋任何既有檔案。
-2. 從 GitHub 私人倉庫 Jason5330/local-knowledge-compiler 取得最新版。
+2. 從 GitHub 公開倉庫 Jason5330/local-knowledge-compiler 取得最新版。
 3. 系統程式預設放在 C:\AI\local-knowledge-compiler。
 4. 知識庫預設放在 C:\KnowledgeBase。
 5. 如果上述位置已存在，先辨認它是不是既有系統；保留資料，只做安全更新。

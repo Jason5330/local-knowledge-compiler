@@ -43,7 +43,7 @@ repository: Jason5330/local-knowledge-compiler
 ## 3. GitHub 與版本
 
 - 帳號：`Jason5330`
-- 私人倉庫：<https://github.com/Jason5330/local-knowledge-compiler>
+- 公開倉庫：<https://github.com/Jason5330/local-knowledge-compiler>
 - 主要分支：`master`
 - 已驗證實作基線：`3eac172cfebb88c8dc8ed85c377b5e7eb53b89d4`
 - 基線測試：`433 passed, 25 skipped`
@@ -145,7 +145,7 @@ Codex Desktop 不能當背景 CLI 時使用 manual provider。Codex 仍能完成
 
 ```text
 檢查 Git／GitHub 登入／Python 3.13
-→ 取得或更新私人倉庫
+→ 取得或更新公開倉庫
 → 建立 .venv
 → 安裝專案及開發依賴
 → 驗證 kb help
