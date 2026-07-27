@@ -315,6 +315,19 @@ def test_beginner_docs_use_ai_driven_installation_and_safe_excel_copy():
     assert "```powershell" not in guide.casefold()
 
 
+def test_repository_declares_mit_license():
+    repository = Path(__file__).resolve().parents[1]
+    license_text = (repository / "LICENSE").read_text(encoding="utf-8")
+    readme = (repository / "README.md").read_text(encoding="utf-8")
+    pyproject = (repository / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert license_text.startswith("MIT License\n")
+    assert "Copyright (c) 2026 Jason5330" in license_text
+    assert "Permission is hereby granted, free of charge" in license_text
+    assert 'license = { file = "LICENSE" }' in pyproject
+    assert "[MIT License](LICENSE)" in readme
+
+
 def test_python_module_entrypoint_invokes_cli_help():
     completed = subprocess.run(
         [sys.executable, "-m", "local_kb.cli", "--help"],
