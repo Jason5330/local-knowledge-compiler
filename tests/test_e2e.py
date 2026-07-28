@@ -315,6 +315,23 @@ def test_beginner_docs_use_ai_driven_installation_and_safe_excel_copy():
     assert "```powershell" not in guide.casefold()
 
 
+def test_root_agent_entrypoints_share_beginner_commands_and_git_boundary():
+    repository = Path(__file__).resolve().parents[1]
+    agents = (repository / "AGENTS.md").read_text(encoding="utf-8")
+    claude = (repository / "CLAUDE.md").read_text(encoding="utf-8")
+
+    for document in (agents, claude):
+        assert "初始化本專案知識庫" in document
+        assert "把新資料整理進我的知識庫" in document
+        assert "用我的知識庫回答這個問題" in document
+        assert "檢查知識庫是否正常" in document
+        assert "KnowledgeBase/00_inbox" in document
+        assert "不得 stage、commit 或 push" in document
+        assert "`KnowledgeBase/`" in document
+        assert "KnowledgeBase/80_system/KNOWLEDGE_PROTOCOL.md" in document
+        assert "不得自行搜尋網路" in document
+
+
 def test_repository_declares_mit_license():
     repository = Path(__file__).resolve().parents[1]
     license_text = (repository / "LICENSE").read_text(encoding="utf-8")
