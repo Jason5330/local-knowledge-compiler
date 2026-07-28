@@ -54,15 +54,15 @@ def _validate_office_zip(path: Path) -> None:
 def _append_table_fragments(
     table: Table, table_number: int, collector: FragmentCollector
 ) -> None:
-    seen_cells: set[int] = set()
+    seen_cells: set[object] = set()
     for row_number, row in enumerate(table.rows, 1):
         values: list[str] = []
         positions: list[int] = []
         for cell_number, cell in enumerate(row.cells, 1):
-            identity = id(cell._tc)
-            if identity in seen_cells:
+            element = cell._tc
+            if element in seen_cells:
                 continue
-            seen_cells.add(identity)
+            seen_cells.add(element)
             value = cell.text.strip()
             if value:
                 positions.append(cell_number)

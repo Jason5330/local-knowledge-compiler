@@ -182,6 +182,27 @@ def test_docx_extracts_table_only_rows_and_deduplicates_merged_cells(tmp_path: P
     ]
 
 
+def test_docx_table_deduplication_does_not_depend_on_recyclable_object_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from local_kb.extractors import office
+
+    path = tmp_path / "table-with-id-collision.docx"
+    document = Document()
+    table = document.add_table(rows=2, cols=1)
+    table.cell(0, 0).text = "第一列"
+    table.cell(1, 0).text = "第二列"
+    document.save(path)
+    monkeypatch.setattr(office, "id", lambda _: 1, raising=False)
+
+    result = registry.extract(path)
+
+    assert result.fragments == [
+        Fragment("table:1;row:1;cells:1-1", "第一列"),
+        Fragment("table:1;row:2;cells:1-1", "第二列"),
+    ]
+
+
 def test_xlsx_extracts_each_nonempty_row_across_sheets_and_keeps_none_cells(tmp_path: Path) -> None:
     path = tmp_path / "table.xlsx"
     book = Workbook()
