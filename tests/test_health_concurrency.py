@@ -194,8 +194,8 @@ def test_rebuild_restores_search_from_cache_without_deleting_good_db_on_failure(
     source = _seed_cache(vault)
     db = vault.index / "catalog.sqlite3"
     db.unlink()
-    count = rebuild_catalog(vault)
-    assert count == 1
+    report = rebuild_catalog(vault)
+    assert report == {"source_count": 1, "correction_count": 0}
     assert Catalog(db).search("searchable", {"work"})[0].version_id == source.version_id
 
     cache = vault.index / "cache" / f"{source.version_id}.json"
@@ -208,7 +208,7 @@ def test_rebuild_restores_search_from_cache_without_deleting_good_db_on_failure(
 
     cache.unlink()
     db.unlink()
-    assert rebuild_catalog(vault) == 1
+    assert rebuild_catalog(vault)["source_count"] == 1
     assert Catalog(db).search("searchable", {"work"})
 
 
@@ -221,7 +221,7 @@ def test_rebuild_rejects_untrusted_cache_and_raw_metadata(tmp_path):
     payload = json.loads(cache.read_text(encoding="utf-8"))
     payload["source"]["relative_path"] = "../outside"
     cache.write_text(json.dumps(payload), encoding="utf-8")
-    assert rebuild_catalog(vault) == 1
+    assert rebuild_catalog(vault)["source_count"] == 1
 
     cache.unlink()
     outside = tmp_path / "outside.json"
@@ -230,7 +230,7 @@ def test_rebuild_rejects_untrusted_cache_and_raw_metadata(tmp_path):
         cache.symlink_to(outside)
     except OSError:
         pytest.skip("file symlinks unavailable")
-    assert rebuild_catalog(vault) == 1
+    assert rebuild_catalog(vault)["source_count"] == 1
     assert outside.read_text(encoding="utf-8") == "{}"
 
 
@@ -263,10 +263,55 @@ def test_rebuild_cleans_safe_stale_sidecars_and_is_immediately_healthy(tmp_path)
     database = vault.index / "catalog.sqlite3"
     Path(f"{database}-wal").touch()
     Path(f"{database}-shm").touch()
-    assert rebuild_catalog(vault) == 1
+    assert rebuild_catalog(vault)["source_count"] == 1
     assert not Path(f"{database}-wal").exists()
     assert not Path(f"{database}-shm").exists()
     assert lint(vault)["healthy"] is True
+
+
+def test_lint_reports_correction_record_index_and_lifecycle_issues(tmp_path):
+    from dataclasses import replace
+
+    from local_kb.correction_index import CorrectionIndex
+    from local_kb.correction_model import (
+        EvidenceReference,
+        canonical_correction_hash,
+    )
+    from local_kb.correction_store import CorrectionStore
+    from local_kb.health import lint
+    from test_correction_model import _record
+
+    vault = _vault(tmp_path)
+    source = _seed_cache(vault)
+    base = _record()
+    record = replace(
+        base,
+        supporting_evidence=(EvidenceReference(
+            source_id=source.source_id,
+            version_id=source.version_id,
+            locator="lines:1-1",
+            evidence_sha256="a" * 64,
+        ),),
+        validated_versions=(source.version_id,),
+        content_sha256="",
+    )
+    record = replace(
+        record,
+        content_sha256=canonical_correction_hash(record),
+    )
+    store = CorrectionStore(vault)
+    store.create(record)
+    CorrectionIndex(vault).rebuild(store)
+
+    healthy = lint(vault)
+    assert healthy["issues"]["correction_records"] == []
+    assert healthy["issues"]["correction_index"] == []
+    assert healthy["issues"]["correction_lifecycle"] == []
+
+    vault.correction_index.write_bytes(b"corrupt")
+    broken = lint(vault)
+    assert broken["healthy"] is False
+    assert broken["issues"]["correction_index"]
 
 
 def test_lint_rejects_hardlinked_catalog_journal_without_modifying_alias(tmp_path):
@@ -708,7 +753,10 @@ def test_lint_and_rebuild_cli_print_json_and_count(tmp_path, capsys):
     assert main(["lint", "--vault", str(vault.root)]) == 0
     assert json.loads(capsys.readouterr().out)["healthy"] is True
     assert main(["rebuild", "--vault", str(vault.root)]) == 0
-    assert capsys.readouterr().out.strip() == "Indexed sources: 1"
+    assert json.loads(capsys.readouterr().out) == {
+        "source_count": 1,
+        "correction_count": 0,
+    }
 
 
 def test_lint_cli_returns_nonzero_with_complete_json_for_unhealthy_and_corrupt(

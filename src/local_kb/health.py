@@ -16,6 +16,8 @@ import time
 from uuid import uuid4
 
 from .catalog import Catalog
+from .correction_index import CorrectionIndex
+from .correction_store import CorrectionStore
 from .extractors import registry as extractor_registry
 from .extractors.base import ExtractionError, SnapshotCleanupError
 from .models import SourceVersion
@@ -46,14 +48,16 @@ class CatalogBusy(CatalogSnapshotUnavailable):
     """A live WAL/SHM requires mutable SQLite reader locks; retry later."""
 
 
-def rebuild_catalog(vault: VaultPaths | Path | str) -> int:
+def rebuild_catalog(
+    vault: VaultPaths | Path | str,
+) -> dict[str, int]:
     """Build a fresh catalog from verified cache files, then publish atomically."""
     paths = _paths(vault)
     with WriterLock(paths.runtime / "write.lock", timeout=0):
         return _rebuild_catalog_unlocked(paths)
 
 
-def _rebuild_catalog_unlocked(paths: VaultPaths) -> int:
+def _rebuild_catalog_unlocked(paths: VaultPaths) -> dict[str, int]:
     _safe_existing_tree(paths.root, paths.index)
     if (
         not paths.index.is_dir()
@@ -81,7 +85,13 @@ def _rebuild_catalog_unlocked(paths: VaultPaths) -> int:
         with _pinned_directory(paths.root, paths.index) as parent_fd:
             _quiesce_catalog_sidecars(target, parent_fd)
             _publish_rebuilt_catalog(built, target, parent_fd)
-        return len(ordered)
+        correction_count = CorrectionIndex(paths).rebuild(
+            CorrectionStore(paths)
+        )
+        return {
+            "source_count": len(ordered),
+            "correction_count": correction_count,
+        }
 
 
 def _quiesce_catalog_sidecars(target: Path, parent_fd: int | None) -> None:
@@ -360,6 +370,11 @@ def lint(vault: VaultPaths | Path | str) -> dict[str, object]:
             content_mismatches.append(f"fts:{version_id}")
     issues["index_content_mismatches"] = content_mismatches
     issues["index_wiki_mismatches"] = sorted(set(missing))
+    correction_issues = _correction_issues(
+        paths,
+        set(raw_rows),
+    )
+    issues.update(correction_issues)
     all_issues = any(bool(value) for value in issues.values())
     truncated = bool(scan_state["truncated"] or queue_truncated)
     return {
@@ -370,6 +385,116 @@ def lint(vault: VaultPaths | Path | str) -> dict[str, object]:
         "issues": issues,
         "truncated": truncated,
         "healthy": not all_issues and not truncated,
+    }
+
+
+def _correction_issues(
+    paths: VaultPaths,
+    raw_version_ids: set[str],
+) -> dict[str, list[str]]:
+    record_issues: list[str] = []
+    index_issues: list[str] = []
+    lifecycle_issues: list[str] = []
+    try:
+        store = CorrectionStore(paths)
+        records, truncated = store.iter_records()
+        if truncated:
+            record_issues.append("record_scan_truncated")
+    except (OSError, ValueError) as error:
+        return {
+            "correction_records": [
+                f"record_store_invalid:{error.__class__.__name__}"
+            ],
+            "correction_index": ["correction_index_unverifiable"],
+            "correction_lifecycle": ["correction_lifecycle_unverifiable"],
+        }
+    by_id = {record.correction_id: record for record in records}
+
+    try:
+        with os.scandir(paths.correction_timeline) as entries:
+            timeline_names = sorted(
+                entry.name
+                for entry in entries
+                if entry.name.endswith(".jsonl")
+            )
+        for name in timeline_names:
+            correction_id = name[:-6]
+            if correction_id not in by_id:
+                record_issues.append(
+                    f"orphan_timeline:{correction_id}"
+                )
+                continue
+            events = store.events(correction_id)
+            timestamps = [
+                str(event["created_at"])
+                for event in events
+            ]
+            if timestamps != sorted(timestamps):
+                record_issues.append(
+                    f"timeline_order:{correction_id}"
+                )
+    except (OSError, ValueError) as error:
+        record_issues.append(
+            f"timeline_invalid:{error.__class__.__name__}"
+        )
+
+    for record in records:
+        for linked_id in record.supersedes:
+            linked = by_id.get(linked_id)
+            if (
+                linked is None
+                or record.correction_id not in linked.superseded_by
+            ):
+                lifecycle_issues.append(
+                    f"supersedes_link:{record.correction_id}:{linked_id}"
+                )
+        for linked_id in record.superseded_by:
+            linked = by_id.get(linked_id)
+            if (
+                linked is None
+                or record.correction_id not in linked.supersedes
+            ):
+                lifecycle_issues.append(
+                    f"superseded_by_link:{record.correction_id}:{linked_id}"
+                )
+        if (
+            record.status == "active"
+            and not any(
+                reference.version_id in raw_version_ids
+                for reference in record.supporting_evidence
+            )
+        ):
+            lifecycle_issues.append(
+                f"active_evidence_missing:{record.correction_id}"
+            )
+
+    index = CorrectionIndex(paths)
+    if records or paths.correction_index.exists():
+        if not paths.correction_index.is_file() or not index.integrity_check():
+            index_issues.append("correction_index_invalid")
+        else:
+            try:
+                inventory, truncated = index.inventory()
+                if truncated:
+                    index_issues.append("correction_index_scan_truncated")
+                canonical = {
+                    record.correction_id: {
+                        "status": record.status,
+                        "space": record.applicability.spaces[0],
+                        "content_sha256": record.content_sha256,
+                    }
+                    for record in records
+                }
+                if inventory != canonical:
+                    index_issues.append(
+                        "correction_index_content_mismatch"
+                    )
+            except (OSError, ValueError, sqlite3.Error):
+                index_issues.append("correction_index_unverifiable")
+    return {
+        "correction_records": sorted(set(record_issues)),
+        "correction_index": sorted(set(index_issues)),
+        "correction_lifecycle": sorted(set(lifecycle_issues)),
     }
 
 

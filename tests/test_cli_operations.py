@@ -5,11 +5,15 @@ import re
 from local_kb.catalog import Catalog
 from local_kb.cli import build_vault, main, watch_once
 from local_kb.config import Config
+from local_kb.correction_index import CorrectionIndex
+from local_kb.correction_model import canonical_correction_hash
+from local_kb.correction_store import CorrectionStore
 from local_kb.finalize import finalize_and_enqueue
 from local_kb.ingest import IngestService
 from local_kb.query import QueryService
 from local_kb.queue import DiskQueue
 from local_kb.watcher import StableTracker
+from test_correction_model import _record
 
 
 def _set_provider(paths, provider: str) -> None:
@@ -76,6 +80,14 @@ def test_status_is_bounded_json_and_does_not_modify_vault(tmp_path, capsys):
         "truncated": False,
         "actionable_count": 1,
         "actionable_count_is_lower_bound": False,
+        "corrections": {
+            "active": 0,
+            "stale": 0,
+            "suspended": 0,
+            "retired": 0,
+            "scan_truncated": False,
+            "revalidation_pending": 0,
+        },
         "jobs": [
             {
                 "job_id": job.job_id,
@@ -89,6 +101,26 @@ def test_status_is_bounded_json_and_does_not_modify_vault(tmp_path, capsys):
         ],
     }
     assert _snapshot_tree(paths.root) == before
+
+
+def test_status_reports_correction_attention(tmp_path, capsys):
+    from dataclasses import replace
+
+    paths = build_vault(tmp_path / "KnowledgeBase")
+    record = _record()
+    stale = replace(record, status="stale", content_sha256="")
+    stale = replace(
+        stale,
+        content_sha256=canonical_correction_hash(stale),
+    )
+    store = CorrectionStore(paths)
+    store.create(stale)
+    CorrectionIndex(paths).rebuild(store)
+
+    assert main(["status", "--vault", str(paths.root)]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["corrections"]["stale"] == 1
+    assert report["attention_required"] is True
 
 
 def test_status_with_no_actionable_jobs_is_healthy(tmp_path, capsys):

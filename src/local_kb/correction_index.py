@@ -272,3 +272,44 @@ class CorrectionIndex:
                     return counts[0] == counts[1]
         except (OSError, ValueError, sqlite3.Error):
             return False
+
+    def inventory(
+        self,
+        *,
+        limit: int = 10_000,
+    ) -> tuple[dict[str, dict[str, str]], bool]:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 10_000
+        ):
+            raise ValueError("correction inventory limit is invalid")
+        with guarded_catalog_path(self.path) as bound:
+            with closing(self._connect_path(bound)) as connection:
+                if (
+                    connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0]
+                    != self.SCHEMA_VERSION
+                ):
+                    raise ValueError("correction index schema is invalid")
+                rows = connection.execute(
+                    """
+                    SELECT correction_id, status, space, content_sha256
+                    FROM corrections
+                    ORDER BY correction_id
+                    LIMIT ?
+                    """,
+                    (limit + 1,),
+                ).fetchall()
+        return (
+            {
+                row["correction_id"]: {
+                    "status": row["status"],
+                    "space": row["space"],
+                    "content_sha256": row["content_sha256"],
+                }
+                for row in rows[:limit]
+            },
+            len(rows) > limit,
+        )

@@ -324,7 +324,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(report, ensure_ascii=False, sort_keys=True))
             return 0 if report.get("healthy") is True else 2
         if arguments.command == "rebuild":
-            print(f"Indexed sources: {rebuild_catalog(paths)}")
+            print(json.dumps(
+                rebuild_catalog(paths),
+                ensure_ascii=False,
+                sort_keys=True,
+            ))
             return 0
         correction_result = handle_correction_command(arguments, paths)
         if correction_result is not None:
@@ -442,6 +446,8 @@ def _queue_has_job(path: Path, *, max_entries: int = 10_000) -> bool:
 
 
 def _status_report(paths: VaultPaths) -> dict[str, object]:
+    from .correction_store import CorrectionStore
+
     if not paths.queue.is_dir():
         raise ValueError("queue directory is missing; run kb init")
     queue = DiskQueue(paths.queue)
@@ -453,7 +459,42 @@ def _status_report(paths: VaultPaths) -> dict[str, object]:
     actionable = [
         _status_job(job) for job in jobs if job.state != "published"
     ]
-    attention_required = bool(actionable) or truncated
+    revalidation_pending = sum(
+        1
+        for job in jobs
+        if isinstance(
+            job.metadata.get("correction_revalidation"),
+            dict,
+        )
+        and job.metadata["correction_revalidation"].get("status")
+        == "pending_attention"
+    )
+    counts = {
+        "active": 0,
+        "stale": 0,
+        "suspended": 0,
+        "retired": 0,
+    }
+    correction_truncated = False
+    try:
+        records, correction_truncated = CorrectionStore(
+            paths
+        ).iter_records()
+        for record in records:
+            counts[record.status] += 1
+    except (OSError, ValueError):
+        correction_truncated = True
+    correction_attention = (
+        counts["stale"] > 0
+        or counts["suspended"] > 0
+        or correction_truncated
+        or revalidation_pending > 0
+    )
+    attention_required = (
+        bool(actionable)
+        or truncated
+        or correction_attention
+    )
     return {
         "schema_version": 1,
         "healthy": not attention_required,
@@ -461,6 +502,11 @@ def _status_report(paths: VaultPaths) -> dict[str, object]:
         "truncated": truncated,
         "actionable_count": len(actionable),
         "actionable_count_is_lower_bound": truncated,
+        "corrections": {
+            **counts,
+            "scan_truncated": correction_truncated,
+            "revalidation_pending": revalidation_pending,
+        },
         "jobs": actionable,
     }
 
