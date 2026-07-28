@@ -169,7 +169,7 @@ def test_prepare_packet_json_is_stable_and_cli_writes_inside_vault(tmp_path, cap
     assert main(["prepare", "CLI proof", "--vault", str(vault.root), "--space", "work", "--output", ".kb/packet.json"]) == 0
     assert Path(capsys.readouterr().out.strip()) == output.resolve()
     packet = json.loads(output.read_text(encoding="utf-8"))
-    assert packet["schema_version"] == 1
+    assert packet["schema_version"] == 2
     assert packet["status"] == "ready"
     assert any("evidence_sha256" in instruction for instruction in packet["instructions"])
     assert main(["prepare", "CLI proof", "--vault", str(vault.root), "--space", "work", "--output", ".kb/packet.json"]) == 0

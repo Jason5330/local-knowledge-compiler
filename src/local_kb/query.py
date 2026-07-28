@@ -10,18 +10,25 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import stat
 from uuid import uuid4
 
 from .catalog import Catalog
+from .correction_index import CorrectionIndex
+from .correction_match import (
+    CorrectionMatcher,
+    features_from_packet_inputs,
+)
+from .correction_store import CorrectionStore
 from .paths import VaultPaths
 from .queue import DiskQueue
 from .search import EvidenceHit, MAX_RESULTS, _deduplicate, exact_routes, has_searchable_terms, ranked_search, validate_question, validate_spaces
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_EVIDENCE_TEXT = 8_000
-MAX_PACKET_BYTES = 256_000
+MAX_PACKET_BYTES = 384_000
 MAX_PENDING_JOBS = 40
 MAX_JOB_TEXT = 256
 _FRONTMATTER_LINE = re.compile(r"^([a-z_]+):\s*(.*)$")
@@ -382,6 +389,141 @@ def _pending_jobs(queue: DiskQueue | None, spaces: tuple[str, ...], question: st
             "queue_scan_truncated": queue_scan_truncated, "counts_are_lower_bound": queue_scan_truncated}
 
 
+def _empty_correction_context(
+    *,
+    index_available: bool,
+    save_allowed: bool,
+    warnings: list[str] | None = None,
+    truncated: bool = False,
+) -> dict[str, object]:
+    return {
+        "applicable": [],
+        "possible": [],
+        "scan": {
+            "total_considered": 0,
+            "applicable_count": 0,
+            "possible_count": 0,
+            "truncated": truncated,
+            "index_available": index_available,
+            "save_allowed": save_allowed,
+        },
+        "warnings": list(warnings or []),
+    }
+
+
+def _correction_context(
+    catalog: Catalog,
+    vault: VaultPaths | None,
+    question: str,
+    spaces: tuple[str, ...],
+    evidence: list[dict[str, object]],
+) -> dict[str, object]:
+    if vault is None:
+        return _empty_correction_context(
+            index_available=False,
+            save_allowed=False,
+            warnings=["correction_unavailable"],
+        )
+    try:
+        store = CorrectionStore(vault)
+        records, records_truncated = store.iter_records()
+    except (OSError, ValueError):
+        return _empty_correction_context(
+            index_available=False,
+            save_allowed=False,
+            warnings=["correction_unavailable"],
+        )
+    index = CorrectionIndex(vault)
+    if not records:
+        if vault.correction_index.exists() and not index.integrity_check():
+            return _empty_correction_context(
+                index_available=False,
+                save_allowed=False,
+                warnings=["correction_unavailable"],
+            )
+        return _empty_correction_context(
+            index_available=True,
+            save_allowed=not records_truncated,
+            warnings=(
+                ["correction_scan_truncated"]
+                if records_truncated
+                else []
+            ),
+            truncated=records_truncated,
+        )
+    if not vault.correction_index.is_file() or not index.integrity_check():
+        return _empty_correction_context(
+            index_available=False,
+            save_allowed=False,
+            warnings=["correction_unavailable"],
+        )
+    by_id = {record.correction_id: record for record in records}
+    routes = tuple(_significant_routes(question))[:64]
+    applicable = []
+    possible = []
+    considered = 0
+    truncated = records_truncated
+    try:
+        for space in spaces:
+            candidate_ids, candidate_truncated = index.candidates(
+                space=space,
+                terms=routes,
+                limit=100,
+            )
+            if not candidate_ids and routes:
+                candidate_ids, fallback_truncated = index.candidates(
+                    space=space,
+                    terms=(),
+                    limit=100,
+                )
+                candidate_truncated = (
+                    candidate_truncated or fallback_truncated
+                )
+            truncated = truncated or candidate_truncated
+            candidates = [
+                by_id[correction_id]
+                for correction_id in candidate_ids
+                if correction_id in by_id
+            ]
+            features = features_from_packet_inputs(
+                catalog,
+                question,
+                space,
+                [
+                    item
+                    for item in evidence
+                    if item.get("space") == space
+                ],
+            )
+            result = CorrectionMatcher(candidates).match(features)
+            applicable.extend(result.applicable)
+            possible.extend(result.possible)
+            considered += result.total_considered
+            truncated = truncated or result.truncated
+    except (OSError, ValueError, sqlite3.Error):
+        return _empty_correction_context(
+            index_available=False,
+            save_allowed=False,
+            warnings=["correction_unavailable"],
+        )
+    applicable = applicable[: CorrectionMatcher.MAX_APPLICABLE]
+    possible = possible[: CorrectionMatcher.MAX_POSSIBLE]
+    warnings = ["correction_scan_truncated"] if truncated else []
+    return {
+        "applicable": applicable,
+        "possible": possible,
+        "scan": {
+            "total_considered": considered,
+            "applicable_count": len(applicable),
+            "possible_count": len(possible),
+            "truncated": truncated,
+            "index_available": True,
+            "save_allowed": not truncated,
+        },
+        "warnings": warnings,
+    }
+
+
 class QueryService:
     def __init__(
         self, catalog: Catalog, *, vault: VaultPaths | None = None,
@@ -433,6 +575,13 @@ class QueryService:
         else:
             reason = "no_matching_evidence"
         pending_jobs = _pending_jobs(self.queue, checked_spaces, checked_question)
+        correction_context = _correction_context(
+            self.catalog,
+            self.vault,
+            checked_question,
+            checked_spaces,
+            evidence,
+        )
         packet: dict[str, object] = {
             "schema_version": SCHEMA_VERSION, "question": checked_question,
             "prepared_at": _validate_prepared_at(self.clock()), "spaces": list(checked_spaces),
@@ -443,9 +592,14 @@ class QueryService:
                 "raw_fragment 要引用 source_id、version_id、locator、evidence_sha256；derived_wiki 要引用 path、locator、source_ids、evidence_sha256，且不可當成原文。",
                 "遇到衝突、未知或證據不足時，明確說明並降低信心。",
                 "不要把 pending_jobs 當成已完成或已驗證的證據。",
+                "逐項處理 applicable_corrections；每筆必須回報 applied、not_applicable 或 conflict，不得用修正取代原始證據。",
             ],
             "evidence": evidence, "pending_jobs": pending_jobs,
             "warnings": warnings,
+            "applicable_corrections": correction_context["applicable"],
+            "possible_corrections": correction_context["possible"],
+            "correction_scan": correction_context["scan"],
+            "correction_warnings": correction_context["warnings"],
             "truncated": {
                 "evidence": any(item.get("truncated") is True for item in evidence),
                 "pending_jobs": pending_jobs["truncated"],

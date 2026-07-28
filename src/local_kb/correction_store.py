@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
@@ -17,8 +18,7 @@ from .correction_model import (
 )
 from .paths import VaultPaths
 from .queue import WriterLock
-from .query import _is_reparse, _open_pinned_regular, _pinned_directory
-from .safety import secure_directory
+from .safety import is_reparse, secure_directory
 
 
 _CORRECTION_ID = re.compile(r"COR-[0-9]{8}-[0-9a-f]{12}\Z")
@@ -92,6 +92,64 @@ def _safe_line(value: object, label: str, maximum: int = 2_000) -> str:
     return value
 
 
+@contextmanager
+def _pinned_directory(root: Path, directory: Path):
+    from .compiler import ManualCompiler
+
+    locker = ManualCompiler(directory, trusted_root=root)
+    with locker._pinned_outbox(create=False) as descriptor:
+        yield descriptor
+
+
+@contextmanager
+def _open_pinned_regular(
+    path: Path,
+    *,
+    parent_fd: int | None = None,
+    name: str | None = None,
+):
+    before = (
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if parent_fd is not None and name is not None
+        else os.lstat(path)
+    )
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or is_reparse(path)
+        or before.st_nlink != 1
+    ):
+        raise ValueError("correction file is not a safe regular file")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = (
+        os.open(name, flags, dir_fd=parent_fd)
+        if parent_fd is not None and name is not None
+        else os.open(path, flags)
+    )
+    try:
+        opened = os.fstat(descriptor)
+        token = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+        )
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != token:
+            raise ValueError("correction file changed while opening")
+        yield descriptor, token
+    finally:
+        os.close(descriptor)
+
+
 class CorrectionStore:
     MAX_RECORD_BYTES = 64_000
     MAX_TIMELINE_BYTES = 2_000_000
@@ -104,7 +162,7 @@ class CorrectionStore:
             candidate = Path(os.path.abspath(os.fspath(vault)))
             paths = VaultPaths(candidate)
         root = Path(os.path.abspath(os.fspath(paths.root)))
-        if not root.is_dir() or root.is_symlink() or _is_reparse(root):
+        if not root.is_dir() or root.is_symlink() or is_reparse(root):
             raise ValueError("correction vault root is unsafe")
         self.paths = VaultPaths(root)
         secure_directory(self.paths.correction_records)
@@ -277,7 +335,7 @@ class CorrectionStore:
                     entry.is_symlink()
                     or not stat.S_ISREG(info.st_mode)
                     or info.st_nlink != 1
-                    or _is_reparse(Path(entry.path))
+                    or is_reparse(Path(entry.path))
                 ):
                     raise ValueError("correction record entry is unsafe")
                 safe_entries.append((entry.name, info.st_size))

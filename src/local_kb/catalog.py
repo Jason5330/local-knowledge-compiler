@@ -605,6 +605,44 @@ class Catalog:
             ).fetchone()
         return self._source_from_row(row) if row is not None else None
 
+    def source_metadata(
+        self,
+        version_ids: Collection[str],
+        *,
+        limit: int = 100,
+    ) -> dict[str, dict[str, str]]:
+        checked = tuple(dict.fromkeys(version_ids))
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 100
+            or len(checked) > limit
+            or any(not isinstance(item, str) for item in checked)
+        ):
+            raise ValueError("source metadata request exceeds limit")
+        if not checked:
+            return {}
+        marks = ", ".join("?" for _ in checked)
+        with self.connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT version_id, source_id, space,
+                       original_name, media_type
+                FROM sources
+                WHERE version_id IN ({marks})
+                """,
+                checked,
+            ).fetchall()
+        return {
+            row["version_id"]: {
+                "source_id": row["source_id"],
+                "space": row["space"],
+                "original_name": row["original_name"],
+                "media_type": row["media_type"],
+            }
+            for row in rows
+        }
+
     def search(
         self, query: str, spaces: Collection[Space], limit: int = 20
     ) -> list[SearchHit]:
