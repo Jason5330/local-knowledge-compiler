@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -17,6 +17,7 @@ from uuid import uuid4
 from .models import Job
 from .paths import VaultPaths
 from .queue import DiskQueue
+from .correction_store import CorrectionStore
 from .query import (
     _is_reparse,
     _open_pinned_regular,
@@ -48,6 +49,7 @@ class _ValidatedAnswer:
     conflicts: str
     citations: tuple[dict[str, object], ...]
     raw_source_ids: tuple[str, ...]
+    correction_decisions: tuple[dict[str, str], ...]
 
 
 def read_json_document(path: Path | str) -> dict[str, object]:
@@ -83,7 +85,7 @@ def read_json_document(path: Path | str) -> dict[str, object]:
 def finalize_answer(vault: VaultPaths | Path | str, packet: dict, answer: dict) -> Path:
     """Save a validated derived answer without adding it to the raw catalog."""
     paths = _vault_paths(vault)
-    validated = _validate(packet, answer)
+    validated = _validate(paths, packet, answer)
     path, _ = _write_answer(paths, _render(validated))
     return path
 
@@ -96,7 +98,7 @@ def finalize_and_enqueue(
 ) -> FinalizeResult:
     """Save an answer and atomically create its fully-typed derived queue job."""
     paths = _vault_paths(vault)
-    validated = _validate(packet, answer)
+    validated = _validate(paths, packet, answer)
     rendered = _render(validated)
     path, identity = _write_answer(paths, rendered)
     relative = path.relative_to(paths.root).as_posix()
@@ -123,7 +125,11 @@ def _vault_paths(vault: VaultPaths | Path | str) -> VaultPaths:
     return VaultPaths(root)
 
 
-def _validate(packet: object, answer: object) -> _ValidatedAnswer:
+def _validate(
+    paths: VaultPaths,
+    packet: object,
+    answer: object,
+) -> _ValidatedAnswer:
     if not isinstance(packet, dict) or not isinstance(answer, dict):
         raise TypeError("packet and answer must be objects")
     question = _safe_text(packet.get("question"), "question", MAX_QUESTION_CHARS, allow_empty=False)
@@ -139,6 +145,8 @@ def _validate(packet: object, answer: object) -> _ValidatedAnswer:
         if identity in allowed:
             raise ValueError("packet contains duplicate evidence")
         allowed[identity] = (public, raw_ids)
+    if packet.get("schema_version") != 2:
+        raise ValueError("unsupported packet schema_version")
 
     citations = answer.get("citations", [])
     if not isinstance(citations, list):
@@ -170,6 +178,11 @@ def _validate(packet: object, answer: object) -> _ValidatedAnswer:
     confidence = answer.get("confidence", "low")
     if not isinstance(confidence, str) or confidence not in _CONFIDENCE:
         raise ValueError("confidence must be high, medium, or low")
+    correction_decisions = _validate_correction_decisions(
+        paths,
+        packet,
+        answer,
+    )
     return _ValidatedAnswer(
         question=question,
         conclusion=conclusion,
@@ -177,7 +190,138 @@ def _validate(packet: object, answer: object) -> _ValidatedAnswer:
         conflicts=conflicts,
         citations=tuple(selected),
         raw_source_ids=tuple(dict.fromkeys(raw_source_ids)),
+        correction_decisions=correction_decisions,
     )
+
+
+def _validate_correction_decisions(
+    paths: VaultPaths,
+    packet: dict,
+    answer: dict,
+) -> tuple[dict[str, str], ...]:
+    scan = packet.get("correction_scan")
+    if (
+        not isinstance(scan, dict)
+        or scan.get("save_allowed") is not True
+        or scan.get("truncated") is not False
+    ):
+        raise ValueError("correction scan does not allow saving")
+    applicable = packet.get("applicable_corrections")
+    if not isinstance(applicable, list):
+        raise TypeError("applicable_corrections must be a list")
+    if len(applicable) > 20:
+        raise ValueError("too many applicable corrections")
+
+    supplied = answer.get("correction_decisions")
+    if supplied is None and not applicable:
+        supplied = []
+    if not isinstance(supplied, list):
+        raise TypeError("correction_decisions must be a list")
+    if len(supplied) > 20:
+        raise ValueError("too many correction decisions")
+
+    packet_by_id: dict[str, dict] = {}
+    for item in applicable:
+        if not isinstance(item, dict):
+            raise TypeError("applicable correction must be an object")
+        correction_id = _safe_id(
+            item.get("correction_id"),
+            "applicable correction_id",
+        )
+        if correction_id in packet_by_id:
+            raise ValueError("duplicate applicable correction")
+        _safe_digest(
+            item.get("content_sha256"),
+            "applicable correction content_sha256",
+        )
+        supporting = item.get("supporting_evidence")
+        if not isinstance(supporting, list):
+            raise TypeError(
+                "applicable correction supporting_evidence must be a list"
+            )
+        packet_by_id[correction_id] = item
+
+    decisions: list[dict[str, str]] = []
+    seen: set[str] = set()
+    required_keys = {
+        "correction_id",
+        "decision",
+        "reason",
+        "content_sha256",
+    }
+    for item in supplied:
+        if not isinstance(item, dict) or set(item) != required_keys:
+            raise ValueError(
+                "correction decision must contain exact fields"
+            )
+        correction_id = _safe_id(
+            item["correction_id"],
+            "correction decision correction_id",
+        )
+        if correction_id not in packet_by_id:
+            raise ValueError(f"unknown correction decision: {correction_id}")
+        if correction_id in seen:
+            raise ValueError("duplicate correction decision")
+        seen.add(correction_id)
+        decision = item["decision"]
+        if decision not in {"applied", "not_applicable", "conflict"}:
+            raise ValueError("invalid correction decision")
+        if decision == "conflict":
+            raise ValueError(
+                f"correction conflict blocks saving: {correction_id}"
+            )
+        reason = _safe_text(
+            item["reason"],
+            "correction decision reason",
+            2_000,
+            allow_empty=False,
+        )
+        digest = _safe_digest(
+            item["content_sha256"],
+            "correction decision content_sha256",
+        )
+        if digest != packet_by_id[correction_id]["content_sha256"]:
+            raise ValueError("correction changed between packet and answer")
+        decisions.append(
+            {
+                "correction_id": correction_id,
+                "decision": decision,
+                "reason": reason,
+                "content_sha256": digest,
+            }
+        )
+
+    missing = set(packet_by_id) - seen
+    if missing:
+        raise ValueError(
+            "missing correction decision: " + ", ".join(sorted(missing))
+        )
+
+    if packet_by_id:
+        store = CorrectionStore(paths)
+        for correction_id, packet_item in packet_by_id.items():
+            try:
+                current = store.get(correction_id)
+            except FileNotFoundError as error:
+                raise ValueError(
+                    f"unknown correction: {correction_id}"
+                ) from error
+            if current.status != "active":
+                raise ValueError(
+                    f"correction is no longer active: {correction_id}"
+                )
+            if current.content_sha256 != packet_item["content_sha256"]:
+                raise ValueError(
+                    f"correction changed after prepare: {correction_id}"
+                )
+            if [
+                asdict(reference)
+                for reference in current.supporting_evidence
+            ] != packet_item["supporting_evidence"]:
+                raise ValueError(
+                    f"correction evidence changed after prepare: {correction_id}"
+                )
+    return tuple(decisions)
 
 
 def _evidence_identity(item: object) -> tuple[tuple[object, ...], dict[str, object], tuple[str, ...]]:
@@ -310,6 +454,16 @@ def _render(answer: _ValidatedAnswer) -> str:
         citations = f"{fence}json\n{html.escape(payload, quote=False)}\n{fence}"
     else:
         citations = "- 無可用來源"
+    if answer.correction_decisions:
+        correction_audit = "\n".join(
+            (
+                f"- `{item['correction_id']}` — {item['decision']}: "
+                f"{_markdown(item['reason'])}"
+            )
+            for item in answer.correction_decisions
+        )
+    else:
+        correction_audit = "- 本次沒有適用修正。"
     return (
         "---\n"
         "type: derived-answer\n"
@@ -325,7 +479,9 @@ def _render(answer: _ValidatedAnswer) -> str:
         "## 證據引用\n\n"
         f"{citations}\n\n"
         "## 衝突與限制\n\n"
-        f"{_markdown(answer.conflicts)}\n"
+        f"{_markdown(answer.conflicts)}\n\n"
+        "## 本次修正紀錄\n\n"
+        f"{correction_audit}\n"
     )
 
 

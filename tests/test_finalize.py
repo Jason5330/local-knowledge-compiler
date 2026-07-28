@@ -9,7 +9,7 @@ def _packet() -> dict:
     from local_kb.query import evidence_sha256
 
     packet = {
-        "schema_version": 1,
+        "schema_version": 2,
         "question": "應該採用哪一個方案？",
         "evidence": [
             {
@@ -30,6 +30,14 @@ def _packet() -> dict:
                 "text": "目前決策是 B。",
             },
         ],
+        "applicable_corrections": [],
+        "possible_corrections": [],
+        "correction_scan": {
+            "save_allowed": True,
+            "index_available": True,
+            "truncated": False,
+        },
+        "correction_warnings": [],
     }
     for item in packet["evidence"]:
         item["evidence_sha256"] = evidence_sha256(item)
@@ -147,7 +155,17 @@ def test_finalize_allows_honest_uncited_answer(tmp_path):
 
     path = finalize_answer(
         tmp_path,
-        {"question": "未知問題", "evidence": []},
+        {
+            "schema_version": 2,
+            "question": "未知問題",
+            "evidence": [],
+            "applicable_corrections": [],
+            "correction_scan": {
+                "save_allowed": True,
+                "index_available": True,
+                "truncated": False,
+            },
+        },
         {"conclusion": "目前無法確定", "citations": [], "confidence": "low"},
     )
 
@@ -175,7 +193,17 @@ def test_finalize_rejects_malformed_or_unsafe_documents(tmp_path, packet, answer
 def test_finalize_escapes_markdown_and_yaml_control_content(tmp_path):
     from local_kb.finalize import finalize_answer
 
-    packet = {"question": "---\ntitle: forged", "evidence": []}
+    packet = {
+        "schema_version": 2,
+        "question": "---\ntitle: forged",
+        "evidence": [],
+        "applicable_corrections": [],
+        "correction_scan": {
+            "save_allowed": True,
+            "index_available": True,
+            "truncated": False,
+        },
+    }
     answer = {
         "conclusion": "<script>alert(1)</script>\n---",
         "citations": [],
