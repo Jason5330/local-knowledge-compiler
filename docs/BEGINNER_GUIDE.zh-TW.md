@@ -1,430 +1,221 @@
 # Codex／Claude Code 零基礎安裝與使用指南
 
-這份指南的對象是完全不懂程式的人。你不需要自己輸入終端機指令，只需要：
+這份指南寫給完全不懂技術的人。你只需要打開 Codex 或 Claude Code、貼上白話提示詞，
+剩下的檢查、安裝和指令都交給 AI。若提示詞寫了「不要叫我自己輸入」，AI 就應直接做，
+只有登入、公司管理員權限或隱私決定才請你接手。
+
+## 先理解兩個資料夾
 
 ```text
-打開 Codex 或 Claude Code → 複製提示詞 → 貼上 → 等 AI 回報
+local-knowledge-compiler/
+├── 公開工具與說明，可以更新或上傳 GitHub
+└── KnowledgeBase/
+    └── 你的 Excel、原始資料、索引、回答和 Wiki，只留在本機
 ```
 
-## 先理解三件事
+`KnowledgeBase/` 是本機私人資料夾，永遠不會跟著上傳 GitHub。
 
-### 1. 至少要先有一個 AI 能打開
-
-- Codex 已經能開：使用「Codex 首次安裝提示詞」。
-- Claude Code 已經能開：使用「Claude Code 首次安裝提示詞」。
-- 兩個都能開：任選一個安裝，以後可以交替使用。
-- 兩個都不能開：先請公司資訊人員或懂電腦的人安裝其中一個。
-
-AI 還沒啟動之前，無法替自己安裝。這是唯一不能靠貼提示詞跨過的步驟。
-
-### 2. 只有一套知識庫
-
-Codex 與 Claude Code 共用：
+位置由你把 Repo 放在哪裡決定：
 
 ```text
-C:\KnowledgeBase
+Repo 放在 C 槽 → 知識庫也在同一個 C 槽專案
+Repo 放在 D 槽 → 知識庫也在同一個 D 槽專案
+Repo 放在 OneDrive → 仍可使用；OneDrive 只警告、不阻擋
 ```
 
-不要建立「Codex 知識庫」和「Claude 知識庫」兩套，否則資料會分散。
+OneDrive 的提醒是要你避免同時在兩台電腦修改同一份資料。它不會阻止初始化，也不會
+把資料自動公開到 GitHub。
 
-### 3. 原始 Excel 永遠不能被搬走
+## 第一部分：取得專案
 
-匯入時，AI 必須先複製一份 Excel，再處理副本：
+### 方法 A：請 AI Clone（建議）
+
+在 Codex 或 Claude Code 貼：
 
 ```text
-你的原始 Excel（保留不動）
-        ↓ 複製
-C:\KnowledgeBase\00_inbox（只處理副本）
-        ↓
-保存原始版本 → 建立索引 → 日後可精準查找
+請幫我 Clone 這個 Repo：
+https://github.com/Jason5330/local-knowledge-compiler
+
+請放在我目前選擇的專案位置，資料夾名稱保持 local-knowledge-compiler。
+完成後打開這個專案。不要叫我自己輸入終端機指令。
 ```
 
----
+Clone 通常會得到乾淨的 `local-knowledge-compiler` 名稱。
 
-## 第一部分：用 Codex 首次安裝
+### 方法 B：Download ZIP（公司環境的備用方式）
 
-### 你要做的事
-
-1. 打開 Codex。
-2. 選擇一個你允許它工作的本地資料夾。
-3. 把下面整段提示詞貼給 Codex。
-4. 若出現 GitHub 登入網頁，只完成畫面上的登入或授權。
-5. 等 Codex 回覆「安裝完成」與檢查結果。
-
-### 貼給 Codex 的首次安裝提示詞
+在 GitHub 頁面按「Code」→「Download ZIP」→ 解壓縮。資料夾可能叫
+`local-knowledge-compiler-master`。再對 AI 說：
 
 ```text
-請替我安裝並初始化 Jason5330/local-knowledge-compiler。
-
-我是完全不懂技術的使用者。請你直接在本機完成所有檢查與操作，不要叫我自己輸入
-終端機指令。只有遇到 GitHub 網頁登入、公司管理員權限或必須由真人確認的畫面時，
-才停下來，用一句一句的白話告訴我要點哪裡。
-
-安裝要求：
-1. 先檢查目前資料夾與電腦環境，不要破壞或覆蓋任何既有檔案。
-2. 從 GitHub 公開倉庫 Jason5330/local-knowledge-compiler 取得最新版。
-3. 系統程式預設放在 C:\AI\local-knowledge-compiler。
-4. 知識庫預設放在 C:\KnowledgeBase。
-5. 如果上述位置已存在，先辨認它是不是既有系統；保留資料，只做安全更新。
-6. 檢查 Git、GitHub 登入及 Python 3.13。缺少時，在權限允許範圍內替我安裝。
-7. 建立專案自己的隔離執行環境並安裝需要的套件。
-8. 若 C:\KnowledgeBase 尚不存在，建立它；若已存在，不得重新初始化覆蓋。
-9. Codex 不能作為背景 CLI 時，把 compiler.provider 設為 manual，使用可恢復的人工
-   交接流程，不要假裝背景編譯成功。
-10. 依序驗證程式說明、知識庫狀態與完整性檢查。
-11. 不要自行設定開機自動啟動、排程、常駐監看或上傳我的私人資料。
-12. 不得顯示或保存密碼、存取權杖與登入祕密。
-
-開始前先讀取專案中的 README.md、AI_HANDOFF.md、
-docs/BEGINNER_GUIDE.zh-TW.md、docs/CLI_REFERENCE.zh-TW.md，
-以及知識庫中的 80_system/KNOWLEDGE_PROTOCOL.md（若已存在）。
-
-完成後只用白話回報：
-- 安裝是否成功
-- 系統程式位置
-- 知識庫位置
-- Codex 現在能做哪些事
-- 哪些步驟仍需要我本人處理
-- 你實際跑過哪些檢查，以及結果
-
-沒有實際檢查證據時，不要說安裝成功。
+我用 Download ZIP 取得專案。
+請把 local-knowledge-compiler-master 安全改名為 local-knowledge-compiler，
+確認內容完整後打開專案。不要刪除其他資料夾。
 ```
 
----
+`-master` 只是 ZIP 命名方式，不是系統故障。
 
-## 第二部分：用 Claude Code 首次安裝
+## 第二部分：用 Codex 首次安裝
 
-### 你要做的事
-
-1. 打開 Claude Code。
-2. 讓它進入一個你允許工作的本地資料夾。
-3. 把下面整段提示詞貼給 Claude Code。
-4. 若出現 GitHub 或 Claude 登入頁，只完成畫面要求的登入。
-5. 等它回報檢查結果。
-
-### 貼給 Claude Code 的首次安裝提示詞
+先用 Codex 打開 `local-knowledge-compiler` 專案，再貼：
 
 ```text
-請替我安裝並初始化 Jason5330/local-knowledge-compiler。
+初始化本專案知識庫。
 
-我是完全不懂技術的使用者。請你直接在本機完成所有檢查與操作，不要叫我自己輸入
-終端機指令。只有遇到 GitHub 網頁登入、Claude 登入、公司管理員權限或必須由真人
-確認的畫面時，才停下來，用一句一句的白話告訴我要點哪裡。
-
-安裝要求：
-1. 先檢查目前資料夾與電腦環境，不要破壞或覆蓋任何既有檔案。
-2. 從 GitHub 公開倉庫 Jason5330/local-knowledge-compiler 取得最新版。
-3. 系統程式預設放在 C:\AI\local-knowledge-compiler。
-4. 知識庫預設放在 C:\KnowledgeBase。
-5. 如果上述位置已存在，先辨認它是不是既有系統；保留資料，只做安全更新。
-6. 檢查 Git、GitHub 登入、Python 3.13 與 Claude CLI。缺少時，在權限允許範圍內
-   替我安裝。
-7. 建立專案自己的隔離執行環境並安裝需要的套件。
-8. 若 C:\KnowledgeBase 尚不存在，建立它；若已存在，不得重新初始化覆蓋。
-9. 確認 Claude CLI 可實際呼叫後，才把 compiler.provider 設為 claude；若不可用，
-   改用 manual，建立可恢復的人工交接，不要假裝成功。
-10. 依序驗證程式說明、知識庫狀態與完整性檢查。
-11. 不要自行設定開機自動啟動、排程、常駐監看或上傳我的私人資料。
-12. 不得顯示或保存密碼、存取權杖與登入祕密。
-
-開始前先讀取專案中的 README.md、AI_HANDOFF.md、
-docs/BEGINNER_GUIDE.zh-TW.md、docs/CLI_REFERENCE.zh-TW.md，
-以及知識庫中的 80_system/KNOWLEDGE_PROTOCOL.md（若已存在）。
-
-完成後只用白話回報：
-- 安裝是否成功
-- 系統程式位置
-- 知識庫位置
-- Claude Code 現在能做哪些事
-- 背景編譯是否真的可用；若不可用，目前採用什麼安全替代方式
-- 哪些步驟仍需要我本人處理
-- 你實際跑過哪些檢查，以及結果
-
-沒有實際檢查證據時，不要說安裝成功。
+請你直接檢查需要的環境、安裝本專案，並在目前專案建立 KnowledgeBase。
+KnowledgeBase/ 是本機私人資料夾，不得加入 Git，也不得上傳 GitHub。
+若專案在 OneDrive，只警告我風險，不要阻擋。
+完成後執行 status 和 lint，再用最大白話告訴我結果。
+不要叫我自己輸入任何技術指令。
 ```
 
----
-
-## 第三部分：確認安裝結果
-
-AI 說完成後，至少要看到以下資訊：
+成功後，你會看到：
 
 ```text
-系統程式：C:\AI\local-knowledge-compiler
-知識庫：C:\KnowledgeBase
-程式說明：可正常顯示
-知識庫狀態：可正常讀取
-完整性檢查：通過，或清楚列出仍待處理項目
+local-knowledge-compiler/KnowledgeBase/
+├── 00_inbox     ← 你平常放新資料副本的入口
+├── 10_raw       ← 系統保存的來源版本
+├── 20_wiki      ← AI 整理後的知識頁
+├── 30_answers   ← 你同意保存的回答
+├── 40_index     ← 搜尋索引
+└── 80_system    ← 規則與狀態
 ```
 
-如果 AI 只說「應該可以」或只貼一大串畫面文字，請回覆：
+## 第三部分：用 Claude Code 首次安裝
+
+先用 Claude Code 打開 `local-knowledge-compiler` 專案，再貼：
 
 ```text
-請不要猜。請實際執行程式說明、狀態檢查和完整性檢查，再用五句白話告訴我結果。
+初始化本專案知識庫。
+
+請你直接檢查需要的環境、安裝本專案，並在目前專案建立 KnowledgeBase。
+KnowledgeBase/ 是本機私人資料夾，不得加入 Git，也不得上傳 GitHub。
+若專案在 OneDrive，只警告我風險，不要阻擋。
+完成後執行 status 和 lint，再用最大白話告訴我結果。
+不要叫我自己輸入任何技術指令。
 ```
 
----
+Codex 和 Claude Code 使用同一個 `KnowledgeBase/`、同一套證據規則，不必建立兩份。
 
-## 第四部分：第一次匯入 Excel
+## 第四部分：匯入 Excel 或其他資料
 
-先在檔案總管找到 Excel。按住 `Shift` 再對檔案按滑鼠右鍵，選「複製為路徑」。
-你會得到類似：
+最簡單的方法是把資料「複製一份」到：
 
 ```text
-C:\Users\你的名字\Documents\公司資料\客戶清單.xlsx
+KnowledgeBase/00_inbox/
 ```
 
-資料分類只選以下四種：
-
-- `work`：工作資料。
-- `personal`：個人資料。
-- `shared`：多人共用資料。
-- `unclassified`：暫時不知道怎麼分。
-
-專案資料目前也先選 `work`，把專案名稱放在檔名或內容中。Windows 版暫時不要使用
-`project:專案名`。
-
-### 貼給任一 AI 的 Excel 匯入提示詞
-
-把路徑和分類改成你的實際內容：
+然後說：
 
 ```text
-請把這份 Excel 安全匯入我的本地知識庫。
+把新資料整理進我的知識庫。
 
-原始檔案：C:\Users\你的名字\Documents\公司資料\客戶清單.xlsx
-資料分類：work
-知識庫：C:\KnowledgeBase
-系統程式：C:\AI\local-knowledge-compiler
-
-必須遵守：
-1. 先確認原始檔存在，記錄大小與修改時間。
-2. 不得移動、改名、編輯或刪除原始檔。
-3. 先用不重名的新檔名複製到 C:\KnowledgeBase\00_inbox。
-4. 只把 00_inbox 裡的副本交給 ingest-once。
-5. 即使整理器回傳需要人工接手，也要確認原始版本是否已安全封存並建立索引。
-6. 完成後再次確認原始檔仍在原位置。
-7. 執行狀態檢查與完整性檢查。
-
-最後只用白話告訴我：
-- 原始檔是否仍完整保留
-- 副本最後保存在哪裡
-- Excel 內容現在能不能被搜尋
-- 是否有 pending_attention 或 pending_extractor
-- 下一步建議
+請只處理 KnowledgeBase/00_inbox 裡的新副本，保留原始檔，完成後檢查
+status 和 lint，告訴我哪些資料已可搜尋、哪些仍需要處理。
 ```
 
-### 更新同一份 Excel
-
-不要覆蓋知識庫裡的舊版本。把新版 Excel 路徑貼給 AI：
+如果原檔在別處，也可以貼完整路徑：
 
 ```text
-這是同一份資料的新版 Excel，請依「保留原檔、先複製、只匯入副本」的規則更新
-知識庫。請保留舊版本，建立新版本，完成後告訴我新舊版本是否都能追溯。
+請把這份 Excel 安全整理進我的知識庫：
+【貼上 Excel 的完整路徑】
 
-新版原始檔：請貼上完整路徑
-資料分類：work
-知識庫：C:\KnowledgeBase
+原始 Excel 永遠不能被搬走、改名、覆蓋或刪除。
+請先建立不衝突的副本放到 KnowledgeBase/00_inbox，
+只把 00_inbox 裡的副本交給 ingest-once。
+完成後確認原檔仍在，再檢查 status 和 lint。
 ```
 
----
+支援的 Excel 內容會被拆成可搜尋片段。公式、合併儲存格或複雜圖表可能需要額外確認；
+AI 不得假裝讀懂無法擷取的內容。
 
 ## 第五部分：向知識庫提問
 
-你不需要自己找檔案。直接貼：
+直接說：
 
 ```text
-請使用 C:\KnowledgeBase 回答下面的問題：
-
+用我的知識庫回答這個問題：
 【把問題寫在這裡】
 
-請先執行 kb prepare 取得證據包，只能依證據回答。
-回答必須包含：
-1. 一句話結論
-2. 關鍵事實
-3. 資料衝突或過期資訊
-4. 信心程度
-5. 每個重要結論的來源、版本與位置
-
-如果證據不足，直接說「目前資料無法判定」，不要猜。
-回答後建立合規的答案 JSON，執行 kb finalize 保存答案，再執行 kb lint。
-最後告訴我這次答案是否已成功加入下一輪知識整理。
+請先找出最相關的本地證據，只依證據回答，列出來源、資料衝突、時效與信心。
+證據不足就說目前資料無法判定，不要猜，也不要自行搜尋網路。
 ```
 
-AI 正確的工作流程是：
+系統流程：
 
 ```text
-你的問題
-   ↓
-prepare 找出相關證據
-   ↓
-AI 只讀證據並回答
-   ↓
-finalize 保存答案與引用
-   ↓
-下一輪整理進 Wiki
+問題
+→ prepare 找出相關證據
+→ AI 只看證據回答
+→ 你決定是否保存
 ```
 
-### 只查、不保存答案
-
-若你只想臨時查詢：
+回答不會因為出現在對話中就自動記錄。想保存時，再說：
 
 ```text
-請使用 C:\KnowledgeBase 回答問題。先執行 kb prepare，只依證據回答並標出來源。
-這次不要執行 finalize，也不要把答案寫回知識庫。
+保存這次回答。
 
-問題：【把問題寫在這裡】
+請用剛才的證據與引用完成 finalize，確認回答已保存並排入下一輪知識整理，
+最後執行 status 和 lint。
 ```
 
----
+這樣高品質回答才會進入 `30_answers`，並在後續整理時更新 `20_wiki`。
 
-## 第六部分：日常更新與健康檢查
+## 第六部分：健康檢查與排除卡住
 
-### 每次加入新資料
+平常說：
 
 ```text
-請依本系統的安全匯入規則，把下面的新資料加入 C:\KnowledgeBase。
-保留原檔、先複製到 00_inbox、只處理副本，完成後做狀態與完整性檢查。
+檢查知識庫是否正常。
 
-檔案完整路徑：【貼在這裡】
-分類：work
+請執行 status 和 lint，不要先修改任何資料。
+用「正常／要注意／需要我決定」三類回報。
 ```
 
-### 每週健康檢查
+看到 `pending_attention` 時說：
 
 ```text
-請替 C:\KnowledgeBase 做一次只讀優先的健康檢查。
+繼續處理知識庫中卡住的工作。
 
-請檢查：
-- kb status 是否有 pending_attention、失敗或卡住工作
-- kb lint 是否通過
-- 00_inbox 是否有久未處理檔案
-- 最近匯入的來源是否已建立版本與索引
-- 最近保存的答案是否已排入或完成知識整理
-
-先不要刪除、覆蓋、復原或重建任何資料。若需要修改，先用白話說明影響並等我同意。
-最後用「正常／要注意／需要我決定」三類回報。
+請先讀 status 和 handoff，說明原因，再安全 resume。
+不得重複匯入、跳過引用驗證或假裝已完成。最後再執行 status 和 lint。
 ```
 
-### 繼續卡住的工作
+看到 `pending_extractor` 代表檔案已保存，但目前缺少適合的讀取器，常見於掃描 PDF、
+圖片、音訊或影片。
+
+## 第七部分：換電腦或換 AI
+
+在新電腦先取得同一個公開 Repo。私人 `KnowledgeBase/` 不會從 GitHub 跟過去，需要用
+你公司允許的安全方式單獨搬移或由 OneDrive 同步。移動前先關閉另一台電腦上的處理程序，
+避免兩台同時寫入。
+
+新 AI 打開含有 `KnowledgeBase/` 的專案後，貼：
 
 ```text
-請檢查 C:\KnowledgeBase 中卡住或等待人工處理的工作。
-先讀取狀態與 handoff，判斷原因，再處理能安全恢復的項目。
-不得重複匯入原始檔，不得跳過引用驗證，也不得假裝工作已完成。
-若需要我的決定，只問一個最關鍵的問題。
-完成後再次執行狀態與完整性檢查。
+請接手這個本地知識庫。
+
+先讀 AI_HANDOFF.md、README.md、docs/BEGINNER_GUIDE.zh-TW.md、
+docs/CLI_REFERENCE.zh-TW.md，以及
+KnowledgeBase/80_system/KNOWLEDGE_PROTOCOL.md。
+不要重新初始化、不要覆蓋資料。先執行 status 和 lint，再告訴我目前狀態。
 ```
 
----
+## 第八部分：隱私與安全
 
-## 第七部分：Codex 與 Claude Code 輪流使用
+- `KnowledgeBase/` 不進 GitHub，但 Codex／Claude 可能是雲端模型。
+- 機密、個資、密碼、醫療與財務資料要遵守公司政策。
+- 不要把密碼、API key 或 GitHub 權杖貼進對話。
+- AI 不得刪除唯一原檔，不得未經同意開啟排程、常駐或對外分享。
+- AI 說成功前，必須實際檢查 status、lint 與需要的輸出。
 
-換 AI 時，貼這段：
-
-```text
-請接手我的本地知識庫。
-
-系統程式：C:\AI\local-knowledge-compiler
-知識庫：C:\KnowledgeBase
-
-先讀取：
-1. AI_HANDOFF.md
-2. README.md
-3. docs/BEGINNER_GUIDE.zh-TW.md
-4. docs/CLI_REFERENCE.zh-TW.md
-5. C:\KnowledgeBase\80_system\KNOWLEDGE_PROTOCOL.md
-6. C:\KnowledgeBase\80_system\STATE.md
-
-先做狀態與完整性檢查，不要重新建立知識庫，不要覆蓋資料。
-然後用白話告訴我：上次做到哪裡、目前有沒有卡住、現在可以做什麼。
-```
-
-重要觀念：
+## 最短版
 
 ```text
-Codex ─┐
-       ├→ 同一套 C:\KnowledgeBase → 同一份證據與引用規則
-Claude ─┘
-```
-
----
-
-## 第八部分：背景自動整理
-
-最安全的初學者模式是「需要時叫 AI 處理」，因為看得到每次發生什麼。
-
-如果你真的想要常駐監看，請先說：
-
-```text
-請先評估是否適合替 C:\KnowledgeBase 啟動背景監看。
-先不要啟動，也不要設定開機自動執行。請先告訴我：
-1. 關閉 Codex 或 Claude Code 後會不會停止
-2. 會使用哪個編譯器
-3. 資料是否會送到雲端模型
-4. 出錯時如何通知與恢復
-5. 取消方式
-```
-
-你確認後，AI 才能啟動。任何開機自動啟動、排程或常駐服務都必須再次取得明確同意。
-
----
-
-## 第九部分：常見問題
-
-### AI 說沒有 GitHub 權限
-
-```text
-請重新檢查 GitHub 登入狀態。若需要瀏覽器授權，請開啟授權流程，只告訴我要看哪個
-畫面、輸入哪個一次性代碼或按哪個按鈕。不要要求我提供密碼或存取權杖。
-```
-
-### AI 說找不到 Python、Git 或 Claude
-
-```text
-請你自行檢查缺少的是什麼，能在目前權限內安全安裝就直接安裝。
-如果被公司管理政策阻擋，請告訴我「缺少什麼、為何需要、要請資訊人員做什麼」，
-不要丟一串技術指令給我。
-```
-
-### 工作顯示 pending_attention
-
-這代表「需要 AI 接手」，不是資料消失。貼：
-
-```text
-請讀取這筆 pending_attention 的狀態與 handoff，完成可安全執行的人工交接，
-再繼續該工作。完成後驗證原始資料、索引和 Wiki 狀態。
-```
-
-### 顯示 pending_extractor
-
-檔案已保存，但目前無法讀取內容，常見於掃描 PDF、圖片、音訊或影片。你可以保留它，
-等日後加入相應擷取器，不要讓 AI 假裝已讀取。
-
-### 想復原 Wiki
-
-```text
-請先只讀查看 C:\KnowledgeBase 最近的 Wiki 變更紀錄，找出可能要復原的那一筆，
-用白話說明會影響哪些檔案。未經我明確同意，不要執行 git revert 或其他復原操作。
-```
-
----
-
-## 第十部分：隱私與安全
-
-- 本地知識庫保存在你的電腦，但送進 Codex 或 Claude 的證據可能交給雲端模型處理。
-- 公司機密、個資、密碼與醫療／財務敏感資料，先遵守公司政策。
-- 不要把 GitHub 權杖、API key 或密碼貼進對話。
-- AI 不得刪除原始資料，不得直接處理唯一副本。
-- AI 不得在未取得同意前設定開機自動執行、排程或對外分享。
-- AI 說「成功」前，必須實際檢查。
-
-## 最短版使用方法
-
-```text
-安裝：貼「Codex 首次安裝提示詞」或「Claude Code 首次安裝提示詞」
-匯入：貼 Excel 完整路徑 + 分類
-提問：貼問題，要求先 prepare、只依證據回答
-保存：要求 finalize
-檢查：貼「每週健康檢查」提示詞
-換 AI：貼「接手我的本地知識庫」提示詞
+第一次：初始化本專案知識庫
+有新資料：把新資料整理進我的知識庫
+要查資料：用我的知識庫回答這個問題
+要留下回答：保存這次回答
+定期檢查：檢查知識庫是否正常
+出現卡住：繼續處理知識庫中卡住的工作
 ```

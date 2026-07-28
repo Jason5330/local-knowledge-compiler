@@ -380,18 +380,21 @@ def test_watch_reports_new_source_manual_handoff_once(tmp_path, capsys):
     assert job.job_id not in second.err
 
 
-def test_beginner_readme_documents_status_resume_and_exit_codes():
-    readme = (
-        Path(__file__).resolve().parents[1] / "README.md"
+def test_agent_cli_reference_documents_status_resume_and_exit_codes():
+    repository = Path(__file__).resolve().parents[1]
+    reference = (
+        repository / "docs" / "CLI_REFERENCE.zh-TW.md"
     ).read_text(encoding="utf-8")
+    readme = (repository / "README.md").read_text(encoding="utf-8")
 
-    assert "kb.exe status --vault" in readme
-    assert "kb.exe resume --vault" in readme
-    assert "--job-id" in readme
-    assert "Exit code `0`" in readme
-    assert "Exit code `1`" in readme
-    assert "Exit code `2`" in readme
-    assert "pending_attention" in readme
+    assert "kb.exe status --vault" in reference
+    assert "kb.exe resume --vault" in reference
+    assert "--job-id" in reference
+    assert "Exit code `0`" in reference
+    assert "Exit code `1`" in reference
+    assert "Exit code `2`" in reference
+    assert "pending_attention" in reference
+    assert "檢查知識庫是否正常" in readme
 
 
 def test_status_discovers_project_local_vault(

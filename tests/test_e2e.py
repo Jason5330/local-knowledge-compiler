@@ -308,11 +308,44 @@ def test_beginner_docs_use_ai_driven_installation_and_safe_excel_copy():
     assert "不要叫我自己輸入" in guide
     assert "原始 Excel 永遠不能被搬走" in guide
     assert "只把 00_inbox 裡的副本交給 ingest-once" in guide
-    assert "兩者都使用 `C:\\KnowledgeBase`" in readme
+    for required in (
+        "local-knowledge-compiler",
+        "KnowledgeBase",
+        "初始化本專案知識庫",
+        "把新資料整理進我的知識庫",
+        "00_inbox",
+        "OneDrive",
+        "不阻擋",
+        "Download ZIP",
+        "-master",
+        "Clone",
+        "/KnowledgeBase/",
+    ):
+        assert required in readme + guide
+    assert "固定使用 `C:\\KnowledgeBase`" not in readme
+    assert "固定使用 `C:\\KnowledgeBase`" not in guide
     assert "這份文件是給 AI 代理讀的" in cli_reference
     assert "一般使用者不需要輸入以下指令" in cli_reference
     assert "```powershell" not in readme.casefold()
     assert "```powershell" not in guide.casefold()
+
+
+def test_beginner_docs_keep_local_vault_out_of_public_git():
+    repository = Path(__file__).resolve().parents[1]
+    documents = [
+        (repository / "README.md").read_text(encoding="utf-8"),
+        (
+            repository / "docs" / "BEGINNER_GUIDE.zh-TW.md"
+        ).read_text(encoding="utf-8"),
+        (repository / "AI_HANDOFF.md").read_text(encoding="utf-8"),
+    ]
+    combined = "\n".join(documents)
+
+    assert "KnowledgeBase/ 是本機私人資料夾" in combined
+    assert "永遠不會跟著上傳 GitHub" in combined
+    assert "Repo 放在 C 槽" in combined
+    assert "Repo 放在 D 槽" in combined
+    assert "OneDrive 只警告" in combined
 
 
 def test_root_agent_entrypoints_share_beginner_commands_and_git_boundary():

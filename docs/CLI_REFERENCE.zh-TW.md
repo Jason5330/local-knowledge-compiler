@@ -1,258 +1,187 @@
 # 給 Codex／Claude Code 的內部執行參考
 
-這份文件是給 AI 代理讀的。一般使用者不需要輸入以下指令。
+這份文件是給 AI 代理讀的。一般使用者不需要輸入以下指令。代理應自行找出目前專案路徑
+與虛擬環境，不得假設固定在 C 槽，也不要把命令原樣丟給初學者。
 
-預設位置：
+## 基本位置
 
 ```text
-repository = C:\AI\local-knowledge-compiler
-vault = C:\KnowledgeBase
-python = C:\AI\local-knowledge-compiler\.venv\Scripts\python.exe
-kb = C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe
+project = 目前開啟的 local-knowledge-compiler Repo 根目錄
+vault = <project>/KnowledgeBase
+kb = <project>/.venv/Scripts/kb.exe（Windows 虛擬環境）
 ```
 
-## AI 執行原則
+Repo 在 C 槽，Vault 就在該 C 槽專案；Repo 在 D 槽，Vault 就在該 D 槽專案。
 
-1. 先讀 `README.md`、`AI_HANDOFF.md`、本文件與 vault protocol。
-2. 在執行寫入前解析絕對路徑，確認目標在使用者指定範圍。
-3. 不得將唯一一份來源直接傳給 `ingest-once`。
-4. 先複製到 `00_inbox`，使用不衝突的檔名，再只處理副本。
-5. 對既有 vault 不得重跑具破壞性的初始化。
-6. 未經同意不得設定啟動項目、排程、常駐監看或外部分享。
-7. `provider=claude` 前必須實測 Claude CLI；否則使用 `manual`。
-8. Exit code 2 是可恢復的人工作業狀態，不可當成資料遺失。
-9. 完成前執行 `status` 與 `lint`，以實際輸出作為證據。
+## 初始化
 
-以下使用單行形式，讓不同代理可以依自己的 shell 安全執行。不要把這些內容原樣丟給
-初學者。
-
-## 建立隔離環境
+專案內預設初始化：
 
 ```text
-py -3.13 -m venv C:\AI\local-knowledge-compiler\.venv
-C:\AI\local-knowledge-compiler\.venv\Scripts\python.exe -m pip install -e "C:\AI\local-knowledge-compiler[dev]"
+kb init
+→ 建立 <cwd>/KnowledgeBase
+→ 檢查 /KnowledgeBase/ Git ignore
+→ 設定此 Repo 的 .githooks
 ```
 
-驗證：
+指定其他位置的舊用法仍可使用：
 
 ```text
-C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe --help
+kb init <path>
 ```
 
-## `kb init`
+指定路徑初始化不會安裝「目前專案」的 Git hooks。
 
-用途：第一次建立 vault。只有確認目標不存在或是空白新位置時才執行。
+初始化後應確認：
 
 ```text
-C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe init C:\KnowledgeBase
+KnowledgeBase/00_inbox
+KnowledgeBase/10_raw
+KnowledgeBase/20_wiki
+KnowledgeBase/80_system/KNOWLEDGE_PROTOCOL.md
 ```
 
-初始化後檢查：
+## Vault 自動尋找順序
+
+對 `prepare`、`finalize`、`status`、`resume`、`lint`、`rebuild`：
 
 ```text
-C:\KnowledgeBase\00_inbox
-C:\KnowledgeBase\10_raw
-C:\KnowledgeBase\20_wiki
-C:\KnowledgeBase\80_system
-C:\KnowledgeBase\80_system\KNOWLEDGE_PROTOCOL.md
+1. 使用明確傳入的 --vault
+2. 若 cwd 本身是已初始化 Vault，使用 cwd
+3. 若 cwd/KnowledgeBase 是已初始化 Vault，使用 cwd/KnowledgeBase
+4. 都找不到時，回傳可操作錯誤，提示初始化或指定 --vault
 ```
 
-## `kb ingest-once`
+`watch` 與 `ingest-once` 保留明確 Vault 位置，避免長時間或寫入作業選錯資料庫。
 
-用途：處理一個已複製到 inbox 的檔案。
+## OneDrive A2 模式
+
+若 Vault 位於 `OneDrive`、`OneDriveConsumer` 或 `OneDriveCommercial` 根目錄內：
+
+- 警告只寫到 stderr，避免破壞 stdout 的 JSON 或可供程式讀取的輸出。
+- OneDrive 只警告，不阻擋命令。
+- 提醒避免兩台電腦同時寫入同一 Vault。
+
+## Git 本機資料保護
+
+公開 Repo 必須包含：
 
 ```text
-C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe ingest-once C:\KnowledgeBase C:\KnowledgeBase\00_inbox\safe-copy.xlsx --space work
+.gitignore              → /KnowledgeBase/
+.githooks/pre-commit    → 檢查 staged paths
+.githooks/pre-push      → 檢查 tracked paths
+scripts/check-local-data.py
 ```
 
-可用 space：
+`kb init` 在 Git Repo 根目錄執行時，會把本 Repo 的 `core.hooksPath` 設成 `.githooks`。
+若無法確認 ignore 或 hooks，初始化本身可能已完成，但命令回傳 Exit code `2`，代理必須先
+修復發布保護。Download ZIP 沒有 `.git` 時跳過 hooks，`KnowledgeBase/` 仍保持本機。
+
+## 安裝開發環境
+
+代理依目前 Python 執行環境建立 `.venv`，再執行等價於：
 
 ```text
-personal
-work
-shared
-unclassified
+python -m venv <project>/.venv
+<project>/.venv/Scripts/python.exe -m pip install -e "<project>[dev]"
+<project>/.venv/Scripts/kb.exe --help
 ```
 
-Windows v1 暫時不要使用 `project:<slug>`。專案資料先歸 `work`，把專案名保留在檔名
-或內容中。
+不要要求初學者自行輸入。公司政策阻擋安裝時，清楚說明缺少項目和管理員需要做什麼。
 
-安全前置程序：
+## 安全匯入
+
+原始檔不得直接傳給 `ingest-once`：
 
 ```text
-解析原始檔絕對路徑
-→ 記錄原檔大小、修改時間與雜湊（需要時）
-→ 產生不衝突的 inbox 副本名稱
-→ 複製
+解析原始檔
+→ 記錄大小、時間與必要雜湊
+→ 建立 KnowledgeBase/00_inbox 不衝突副本
 → 確認原檔仍存在
-→ ingest-once 只接收副本
+→ ingest-once 只處理副本
 → 檢查 raw、index、status、lint
 ```
 
-同磁碟 ingest 可能以 move claim 副本，這是為什麼絕不能直接傳入使用者唯一原檔。
-
-## `kb prepare`
-
-用途：根據問題建立證據包。
+語法：
 
 ```text
-C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe prepare "使用者問題" --vault C:\KnowledgeBase --space work --output C:\KnowledgeBase\.kb\last-packet.json
+kb.exe ingest-once <vault> <vault>/00_inbox/safe-copy.xlsx --space work
 ```
 
-代理必須讀取 packet，只根據 packet 回答。引用欄位必須逐字使用 packet 的值：
+可用 space：`personal`、`work`、`shared`、`unclassified`。
 
-```json
-{
-  "conclusion": "根據證據得到的結論",
-  "citations": [
-    {
-      "source_id": "原樣複製",
-      "version_id": "原樣複製",
-      "locator": "原樣複製",
-      "evidence_sha256": "原樣複製"
-    }
-  ],
-  "confidence": "high",
-  "conflicts": "沒有發現衝突。"
-}
-```
-
-證據不足時：
-
-```json
-{
-  "conclusion": "目前資料無法判定。",
-  "citations": [],
-  "confidence": "low",
-  "conflicts": "證據不足。"
-}
-```
-
-## `kb finalize`
-
-用途：驗證答案與引用，保存回答，排入知識整理。
+## 建立問題證據包
 
 ```text
-C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe finalize --vault C:\KnowledgeBase --packet C:\KnowledgeBase\.kb\last-packet.json --answer C:\KnowledgeBase\.kb\answer.json
+kb.exe prepare "使用者問題" --vault <vault> --space work --output <vault>/.kb/last-packet.json
 ```
 
-finalize 後：
+若在專案根目錄，可省略 `--vault`。代理只能根據 packet 回答。重要結論的
+`source_id`、`version_id`、`locator`、`evidence_sha256` 必須原樣引用。
+
+證據不足時明確回答「目前資料無法判定」，不得猜測或自行搜尋網路。
+
+## 保存回答
+
+只有使用者要求保存時執行：
 
 ```text
-status → 確認衍生工作狀態
-lint → 確認知識庫完整性
+kb.exe finalize --vault <vault> --packet <vault>/.kb/last-packet.json --answer <vault>/.kb/answer.json
 ```
 
-衍生答案只能整理進 `20_wiki`，不得冒充新的原始來源寫入 `10_raw`。
+若在專案根目錄，可省略 `--vault`。finalize 驗證引用、保存答案並建立後續 Wiki 整理
+工作；衍生答案不得冒充新的原始來源。
 
-## `kb status`
+## 狀態、恢復與檢查
 
-用途：只讀查看工作狀態。
+完整顯式語法：
 
 ```text
-C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe status --vault C:\KnowledgeBase
+kb.exe status --vault <vault>
+kb.exe resume --vault <vault> --job-id ACTUAL_JOB_ID
+kb.exe lint --vault <vault>
+kb.exe rebuild --vault <vault>
 ```
 
-重點欄位：
-
-- `job_id`
-- `job_type`
-- `state`
-- `error`
-- `handoff_path`
-- `source_id`
-- `version_id`
-
-## `kb resume`
-
-用途：在修正問題或完成人工 handoff 後，繼續指定工作。
+在專案根目錄可省略 `--vault`：
 
 ```text
-C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe resume --vault C:\KnowledgeBase --job-id ACTUAL_JOB_ID
+kb.exe status
+kb.exe lint
 ```
 
-不要盲目重試。先讀 status、錯誤與 handoff，確認前置條件已處理。
+`resume` 前先讀 status、錯誤與 handoff，不得盲目重試。`rebuild` 不是一般故障排除的
+第一步，執行前要說明影響並取得同意。
 
-## `kb lint`
-
-用途：檢查 vault 結構、索引、引用與一致性。
+## 背景監看
 
 ```text
-C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe lint --vault C:\KnowledgeBase
+kb.exe watch <vault>
 ```
 
-代理回報時不要只說「跑過」。要清楚說通過、失敗或警告數量，並列出使用者能理解的
-影響。
-
-## `kb rebuild`
-
-用途：從既有原始資料重建衍生索引。這不是一般故障排除的第一步。
-
-```text
-C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe rebuild --vault C:\KnowledgeBase
-```
-
-執行前：
-
-1. 說明重建範圍與預期影響。
-2. 確認 `10_raw` 與必要索引仍完整。
-3. 取得使用者明確同意。
-4. 完成後執行 `status`、`lint` 與抽樣查詢。
-
-## `kb watch`
-
-用途：持續監看 inbox。
-
-```text
-C:\AI\local-knowledge-compiler\.venv\Scripts\kb.exe watch C:\KnowledgeBase
-```
-
-注意：
-
-- 這是長時間執行程序。
-- 代理工作階段關閉後可能停止。
-- 不等於 Windows 服務。
-- 不得未經同意設定自動啟動。
-- manual provider 可能產生 `pending_attention`，需由 AI 接手 handoff。
+這是長時間執行程序，不等於 Windows 服務。未經使用者同意，不得設定排程、
+`shell:startup` 或開機啟動。
 
 ## Exit code
 
-- `0`：成功，或目前無待處理項目。
-- `1`：錯誤；保留輸出並調查原因。
-- `2`：等待人工處理；讀取 handoff，完成後用 `resume`。
+- Exit code `0`：成功，或目前無待處理項目。
+- Exit code `1`：錯誤；保留輸出並調查。
+- Exit code `2`：`pending_attention` 或可恢復的人工作業／保護提醒；讀取輸出與 handoff。
 
-## Provider 選擇
+## Provider
 
-### Codex
+- Codex Desktop 無背景 CLI 時使用 `manual`，由目前代理接手 handoff。
+- Claude CLI 只有在命令存在、已登入且實際呼叫成功後使用 `claude`。
+- provider 失敗時保留 `pending_attention`，不可宣稱 Wiki 已更新。
 
-Codex Desktop 無可呼叫的背景 CLI 時：
-
-```toml
-[compiler]
-provider = "manual"
-```
-
-Codex 仍可執行匯入、prepare、回答、finalize、status、resume 與 lint。
-
-### Claude Code
-
-只有在 `claude` 命令實測成功且已登入後：
-
-```toml
-[compiler]
-provider = "claude"
-```
-
-若 Claude CLI 呼叫失敗，切回 manual 或保留 `pending_attention`，不可宣稱 Wiki 已更新。
-
-## 代理完成回報模板
+## 完成回報
 
 ```text
 結果：成功／部分完成／未完成
 原始資料：是否保持不動
 保存位置：raw 或版本位置
-可搜尋狀態：是／否，證據是什麼
+可搜尋：是／否，以及驗證證據
 待處理：pending_attention／pending_extractor／無
-檢查：status 結果、lint 結果
+檢查：status 與 lint
 下一步：一句最簡單的建議
 ```
