@@ -156,6 +156,7 @@ Codex Desktop 沒有可呼叫的背景 CLI 時可以用人工交接模式；Clau
 
 ## 詳細說明
 
+- [完整運作原理：資料整理、Wiki、搜尋、保存與回錯機制](docs/HOW_IT_WORKS.zh-TW.md)
 - [零基礎安裝與使用指南](docs/BEGINNER_GUIDE.zh-TW.md)
 - [Codex／Claude Code 內部命令參考](docs/CLI_REFERENCE.zh-TW.md)
 - [換電腦或換 AI 的完整交接](AI_HANDOFF.md)

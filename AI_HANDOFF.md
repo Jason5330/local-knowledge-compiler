@@ -168,7 +168,7 @@ watch 與 ingest-once 維持明確 Vault 參數。`kb init` 無 path 時建立
 
 1. 只讀檢查目前工作樹，不覆蓋未提交修改。
 2. 讀 `README.md`、本文件、`docs/BEGINNER_GUIDE.zh-TW.md`、
-   `docs/CLI_REFERENCE.zh-TW.md`。
+   `docs/HOW_IT_WORKS.zh-TW.md`、`docs/CLI_REFERENCE.zh-TW.md`。
 3. 找到 Vault 後讀 `80_system/KNOWLEDGE_PROTOCOL.md`。
 4. 執行 status 與 lint。
 5. 用白話回報位置、最近狀態、警告與可做的下一步。

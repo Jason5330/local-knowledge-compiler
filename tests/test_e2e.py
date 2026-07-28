@@ -164,6 +164,43 @@ def test_beginner_docs_explain_wrong_answer_correction_in_plain_language():
     assert "retired" in combined
 
 
+def test_architecture_guide_explains_the_complete_knowledge_lifecycle():
+    repository = Path(__file__).resolve().parents[1]
+    guide = (
+        repository / "docs" / "HOW_IT_WORKS.zh-TW.md"
+    ).read_text(encoding="utf-8")
+
+    for required in (
+        "什麼是「證據」",
+        "證據何時出現",
+        "內容＋來源位置＋來源版本",
+        "為什麼不能直接改原始資料",
+        "00_inbox",
+        "10_raw",
+        "20_wiki",
+        "30_answers",
+        "40_index",
+        "50_corrections",
+        "80_system",
+        ".kb",
+        "何時建立 index",
+        "提問時怎麼找資料",
+        "回答會不會自動保存",
+        "為什麼要保存回答",
+        "這個回答錯了",
+        "原始 Excel 證據 ＞ 修正紀錄",
+        "active",
+        "stale",
+        "suspended",
+        "retired",
+        "rebuild",
+        "status",
+        "lint",
+        "GitHub",
+    ):
+        assert required in guide
+
+
 def test_fresh_init_is_immediately_healthy(tmp_path):
     paths = build_vault(tmp_path)
 
