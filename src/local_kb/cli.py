@@ -18,6 +18,7 @@ from .config import Config
 from .finalize import finalize_and_enqueue, read_json_document
 from .health import lint, rebuild_catalog
 from .ingest import IngestService
+from .onedrive import warn_if_onedrive
 from .paths import VaultPaths
 from .project import default_vault_path, resolve_vault_path
 from .queue import DiskQueue, WriterLock
@@ -283,11 +284,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             else arguments.path
         )
         paths = build_vault(target)
+        warn_if_onedrive(paths.root)
         print(f"Initialized knowledge vault: {paths.root}")
         return 0
 
     try:
         paths = _paths_for_arguments(arguments)
+        warn_if_onedrive(paths.root)
         if arguments.command == "status":
             report = _status_report(paths)
             print(json.dumps(report, ensure_ascii=False, sort_keys=True))
