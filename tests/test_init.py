@@ -163,3 +163,38 @@ def test_main_initializes_requested_vault_and_reports_absolute_path(tmp_path, ca
 
     assert exit_code == 0
     assert capsys.readouterr().out == f"Initialized knowledge vault: {tmp_path.resolve()}\n"
+
+
+def test_main_init_without_path_creates_project_local_vault(
+    tmp_path, monkeypatch, capsys
+):
+    project = tmp_path / "local-knowledge-compiler"
+    project.mkdir()
+    monkeypatch.chdir(project)
+
+    result = main(["init"])
+
+    assert result == 0
+    vault = project / "KnowledgeBase"
+    assert (vault / "80_system" / "config.toml").is_file()
+    assert capsys.readouterr().out == (
+        f"Initialized knowledge vault: {vault.resolve()}\n"
+    )
+
+
+def test_main_init_explicit_path_keeps_existing_behavior(
+    tmp_path, monkeypatch, capsys
+):
+    project = tmp_path / "project"
+    explicit = tmp_path / "custom-vault"
+    project.mkdir()
+    monkeypatch.chdir(project)
+
+    result = main(["init", str(explicit)])
+
+    assert result == 0
+    assert (explicit / "80_system" / "config.toml").is_file()
+    assert not (project / "KnowledgeBase").exists()
+    assert capsys.readouterr().out == (
+        f"Initialized knowledge vault: {explicit.resolve()}\n"
+    )

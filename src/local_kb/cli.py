@@ -19,6 +19,7 @@ from .finalize import finalize_and_enqueue, read_json_document
 from .health import lint, rebuild_catalog
 from .ingest import IngestService
 from .paths import VaultPaths
+from .project import default_vault_path, resolve_vault_path
 from .queue import DiskQueue, WriterLock
 from .query import QueryService, write_packet
 from .search import ranked_search
@@ -243,7 +244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="kb")
     subcommands = parser.add_subparsers(dest="command", required=True)
     init_parser = subcommands.add_parser("init", help="initialize a knowledge vault")
-    init_parser.add_argument("path", type=Path)
+    init_parser.add_argument("path", type=Path, nargs="?")
     watch_parser = subcommands.add_parser("watch", help="ingest stable direct inbox files")
     watch_parser.add_argument("vault", type=Path)
     watch_parser.add_argument("--space", default="unclassified")
@@ -253,35 +254,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     once_parser.add_argument("--space", default="unclassified")
     prepare_parser = subcommands.add_parser("prepare", help="prepare a grounded local evidence packet")
     prepare_parser.add_argument("question")
-    prepare_parser.add_argument("--vault", type=Path, default=Path.cwd())
+    prepare_parser.add_argument("--vault", type=Path)
     prepare_parser.add_argument("--space", action="append", default=[])
     prepare_parser.add_argument("--output", type=Path, default=Path(".kb/last-packet.json"))
     finalize_parser = subcommands.add_parser("finalize", help="save a cited derived answer")
-    finalize_parser.add_argument("--vault", type=Path, default=Path.cwd())
+    finalize_parser.add_argument("--vault", type=Path)
     finalize_parser.add_argument("--packet", type=Path, required=True)
     finalize_parser.add_argument("--answer", type=Path, required=True)
     status_parser = subcommands.add_parser(
         "status", help="list actionable queue jobs without changing the vault"
     )
-    status_parser.add_argument("--vault", type=Path, default=Path.cwd())
+    status_parser.add_argument("--vault", type=Path)
     resume_parser = subcommands.add_parser(
         "resume", help="resume one actionable compiler handoff"
     )
-    resume_parser.add_argument("--vault", type=Path, default=Path.cwd())
+    resume_parser.add_argument("--vault", type=Path)
     resume_parser.add_argument("--job-id", required=True)
     lint_parser = subcommands.add_parser("lint", help="inspect vault health without changing it")
-    lint_parser.add_argument("--vault", type=Path, default=Path.cwd())
+    lint_parser.add_argument("--vault", type=Path)
     rebuild_parser = subcommands.add_parser("rebuild", help="rebuild the search catalog from cache")
-    rebuild_parser.add_argument("--vault", type=Path, default=Path.cwd())
+    rebuild_parser.add_argument("--vault", type=Path)
     arguments = parser.parse_args(argv)
 
     if arguments.command == "init":
-        paths = build_vault(arguments.path)
+        target = (
+            default_vault_path()
+            if arguments.path is None
+            else arguments.path
+        )
+        paths = build_vault(target)
         print(f"Initialized knowledge vault: {paths.root}")
         return 0
 
-    paths = VaultPaths(arguments.vault.resolve())
     try:
+        paths = _paths_for_arguments(arguments)
         if arguments.command == "status":
             report = _status_report(paths)
             print(json.dumps(report, ensure_ascii=False, sort_keys=True))
@@ -381,6 +387,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     return 1
+
+
+def _paths_for_arguments(arguments: argparse.Namespace) -> VaultPaths:
+    if arguments.command in {"ingest-once", "watch"}:
+        vault_root = Path(arguments.vault).resolve()
+    else:
+        vault_root = resolve_vault_path(
+            getattr(arguments, "vault", None)
+        )
+    return VaultPaths(vault_root)
 
 
 def _queue_has_job(path: Path, *, max_entries: int = 10_000) -> bool:

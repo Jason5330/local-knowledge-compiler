@@ -392,3 +392,37 @@ def test_beginner_readme_documents_status_resume_and_exit_codes():
     assert "Exit code `1`" in readme
     assert "Exit code `2`" in readme
     assert "pending_attention" in readme
+
+
+def test_status_discovers_project_local_vault(
+    tmp_path, monkeypatch, capsys
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    vault = build_vault(project / "KnowledgeBase")
+    monkeypatch.chdir(project)
+
+    result = main(["status"])
+
+    assert result == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["healthy"] is True
+    assert vault.root == (project / "KnowledgeBase").resolve()
+
+
+def test_explicit_status_vault_overrides_project_child(
+    tmp_path, monkeypatch, capsys
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    build_vault(project / "KnowledgeBase")
+    explicit = build_vault(tmp_path / "explicit")
+    queue = DiskQueue(explicit.queue)
+    queue.enqueue(explicit.inbox / "missing-source.md")
+    monkeypatch.chdir(project)
+
+    result = main(["status", "--vault", str(explicit.root)])
+
+    assert result == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["actionable_count"] == 1
