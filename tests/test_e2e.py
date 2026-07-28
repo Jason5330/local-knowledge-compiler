@@ -124,6 +124,46 @@ def test_init_installs_one_canonical_protocol_and_thin_agent_entries(tmp_path):
     assert "kb prepare" not in claude
 
 
+def test_agent_protocol_forces_correction_review_before_saved_answers():
+    repository = Path(__file__).resolve().parents[1]
+    documents = [
+        (repository / "AGENTS.md").read_text(encoding="utf-8"),
+        (repository / "CLAUDE.md").read_text(encoding="utf-8"),
+        (
+            repository
+            / "src"
+            / "local_kb"
+            / "templates"
+            / "KNOWLEDGE_PROTOCOL.md"
+        ).read_text(encoding="utf-8"),
+    ]
+
+    for document in documents:
+        assert "applicable_corrections" in document
+        assert "correction_decisions" in document
+        assert "不得用修正取代原始證據" in document
+        assert "未通過 finalize" in document
+
+
+def test_beginner_docs_explain_wrong_answer_correction_in_plain_language():
+    repository = Path(__file__).resolve().parents[1]
+    combined = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            repository / "README.md",
+            repository / "docs" / "BEGINNER_GUIDE.zh-TW.md",
+            repository / "AI_HANDOFF.md",
+        )
+    )
+    assert "這個回答錯了" in combined
+    assert "50_corrections" in combined
+    assert "原始 Excel 證據 ＞ 修正紀錄" in combined
+    assert "active" in combined
+    assert "stale" in combined
+    assert "suspended" in combined
+    assert "retired" in combined
+
+
 def test_fresh_init_is_immediately_healthy(tmp_path):
     paths = build_vault(tmp_path)
 

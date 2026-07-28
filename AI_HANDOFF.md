@@ -126,7 +126,36 @@ watch 與 ingest-once 維持明確 Vault 參數。`kb init` 無 path 時建立
 
 因此，同樣的問題回答不會自動記錄。只有成功 finalize 的回答才保存並參與下一輪整理。
 
-## 9. 已知狀態與限制
+## 9. 錯誤回饋與自動修正
+
+使用者說「這個回答錯了」是明確觸發信號：
+
+```text
+讀回上次 packet
+→ 重新核對原始 Excel 證據
+→ 有明確證據才建立 correction
+→ 保存於本機 50_corrections
+→ 重新 prepare
+→ 逐條輸出 correction_decisions
+→ finalize 機械驗證後才保存
+```
+
+權威順序是 `原始 Excel 證據 ＞ 修正紀錄 ＞ 模型推測`。修正不得替代證據。建立來源
+只允許明確使用者回報，或引用身分、十進位關係、單位換算的確定性驗證；主觀懷疑不寫入。
+
+修正生命週期：
+
+- `active`：有效，可被 prepare 帶入。
+- `stale`：新版本表格結構不再吻合，等待確認。
+- `suspended`：遇到明確例外或使用者暫停。
+- `retired`：永久退役，不會自動恢復。
+
+新來源版本寫入 catalog 後會自動重驗同 space、同來源家族的修正。重驗失敗不回滾
+不可變原始資料，而是在 status 顯示 `correction_revalidation.pending_attention`。
+接手時要檢查 status 的 corrections 計數、執行 lint，必要時用 `corrections-check`。
+不得把 `KnowledgeBase/50_corrections/` 的真實內容寫入公開文件或 Git。
+
+## 10. 已知狀態與限制
 
 - `pending_attention`：需代理接手，不等於資料遺失。
 - `pending_extractor`：檔案保存了，但內容讀取器不足，不得冒充已讀。
@@ -135,7 +164,7 @@ watch 與 ingest-once 維持明確 Vault 參數。`kb init` 無 path 時建立
 - Claude provider 只有在 Claude CLI 存在、登入且實測成功後使用。
 - 不得自行設定排程、開機啟動、常駐或對外分享。
 
-## 10. 接手順序
+## 11. 接手順序
 
 1. 只讀檢查目前工作樹，不覆蓋未提交修改。
 2. 讀 `README.md`、本文件、`docs/BEGINNER_GUIDE.zh-TW.md`、
@@ -146,7 +175,7 @@ watch 與 ingest-once 維持明確 Vault 參數。`kb init` 無 path 時建立
 
 不要重新問本文件已有答案的事情，也不要未經檢查重新初始化。
 
-## 11. 完成標準
+## 12. 完成標準
 
 安裝：
 
@@ -167,8 +196,10 @@ watch 與 ingest-once 維持明確 Vault 參數。`kb init` 無 path 時建立
 - packet 確由問題產生。
 - 回答未超出證據，引用可驗證。
 - 若要求保存，finalize 和後續狀態已確認。
+- 每筆 applicable correction 都有 decision；conflict 時沒有強行保存。
+- 修正健康狀態與新版本重驗警告已檢查。
 
-## 12. 接手回報模板
+## 13. 接手回報模板
 
 ```text
 我已讀完交接資料。

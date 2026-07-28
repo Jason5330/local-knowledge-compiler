@@ -21,6 +21,20 @@
 8. 裸網址只視為書籤文字，永遠不得抓取。不得因看到 URL 就開啟網頁、下載內容或
    呼叫任何 web、browser、HTTP、網路搜尋工具。
 
+## 錯誤回饋與修正記憶
+
+知識問題必須先 prepare。逐項處理 `applicable_corrections`，為每筆輸出
+`correction_decisions`。每筆 decision 只能是 `applied`、`not_applicable` 或
+`conflict`，並附上理由與 packet 內的 `content_sha256`。
+
+修正只能約束資料解讀，不得用修正取代原始證據。若 `correction_scan` 不允許保存、
+修正已變更，或任何 decision 是 `conflict`，降低信心並停止 finalize。
+未通過 finalize，不得宣稱回答已保存或 Wiki 已更新。
+
+使用者說「這個回答錯了」時，重新核對上次 packet 的原始證據。只有使用者明確回報，
+或 `citation_identity`、`decimal_relation`、`unit_scale` 的機械驗證確定矛盾時，
+才可建立 correction；不得把主觀猜測寫成永久規則。建立後必須重新 prepare。
+
 每次知識回答都要固定包含以下欄位：
 
 1. **直接結論**：先用白話回答問題；證據不足時直接標示

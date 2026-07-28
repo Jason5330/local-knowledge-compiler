@@ -13,10 +13,19 @@
 - 「保存這次回答」：依證據完成 finalize，再確認後續整理狀態。
 - 「檢查知識庫是否正常」：執行 status 與 lint，以白話回報。
 - 「繼續處理知識庫中卡住的工作」：先讀 status 與 handoff，再安全 resume。
+- 「這個回答錯了」：重新核對上次 packet 的原始證據；只有使用者明確回報或可驗證
+  矛盾時建立 correction，完成後重新 prepare。
 
 初始化後，必須先讀
 `KnowledgeBase/80_system/KNOWLEDGE_PROTOCOL.md`，並遵守其中的證據、引用與資料邊界。
 回答只能使用本地證據，不得自行搜尋網路。
+
+## 修正記憶強制流程
+
+知識問題必須先 prepare。逐項處理 `applicable_corrections`，為每筆輸出
+`correction_decisions`。修正只能約束資料解讀，不得用修正取代原始證據。
+若 `correction_scan` 不允許保存或任何 decision 是 `conflict`，降低信心並停止
+finalize。未通過 finalize，不得宣稱回答已保存或 Wiki 已更新。
 
 ## Git 資料邊界
 

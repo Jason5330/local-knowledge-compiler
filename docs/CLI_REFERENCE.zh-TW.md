@@ -119,6 +119,12 @@ kb.exe prepare "使用者問題" --vault <vault> --space work --output <vault>/.
 若在專案根目錄，可省略 `--vault`。代理只能根據 packet 回答。重要結論的
 `source_id`、`version_id`、`locator`、`evidence_sha256` 必須原樣引用。
 
+packet schema v2 另有：
+
+- `applicable_corrections`：強或中度符合的修正，回答時必須逐條表態。
+- `possible_corrections`：只有弱關聯，只作提醒，不能直接套用。
+- `correction_scan.save_allowed`：不是 `true` 就不得保存回答。
+
 證據不足時明確回答「目前資料無法判定」，不得猜測或自行搜尋網路。
 
 ## 保存回答
@@ -131,6 +137,50 @@ kb.exe finalize --vault <vault> --packet <vault>/.kb/last-packet.json --answer <
 
 若在專案根目錄，可省略 `--vault`。finalize 驗證引用、保存答案並建立後續 Wiki 整理
 工作；衍生答案不得冒充新的原始來源。
+
+若 packet 有 `applicable_corrections`，answer JSON 必須加入：
+
+```json
+{
+  "correction_decisions": [
+    {
+      "correction_id": "COR-20260728-0123456789ab",
+      "decision": "applied",
+      "reason": "相同工作表、欄位與萬元單位。",
+      "content_sha256": "從 packet 原樣複製的 64 字元雜湊"
+    }
+  ]
+}
+```
+
+`decision` 可用 `applied`、`not_applicable`、`conflict`。任何 `conflict`、漏答、假造
+修正 ID、修正已停用或雜湊已改變，都會阻止 finalize。
+
+## 錯誤回饋與修正管理
+
+使用者明確說「這個回答錯了」後，代理先用上次 packet 核對原始證據，再建立 proposal：
+
+```text
+kb.exe correct --vault <vault> --packet <packet.json> --proposal <proposal.json>
+```
+
+proposal 必須包含錯誤類型、適用條件、修正規則，以及 packet 中完全相同的原始證據
+引用。只有使用者明確回報，或 `citation_identity`、`decimal_relation`、
+`unit_scale` 的確定性驗證失敗，才可建立；主觀猜測會被拒絕。
+
+管理命令：
+
+```text
+kb.exe corrections-list --vault <vault> --status active --limit 100
+kb.exe corrections-show --vault <vault> --correction-id <CORRECTION_ID>
+kb.exe corrections-set-status --vault <vault> --correction-id <CORRECTION_ID> --status suspended --reason "使用者要求暫停" --expected-hash <CURRENT_SHA256>
+kb.exe corrections-set-status --vault <vault> --correction-id <CORRECTION_ID> --status active --reason "使用者確認恢復" --expected-hash <CURRENT_SHA256>
+kb.exe corrections-set-status --vault <vault> --correction-id <CORRECTION_ID> --status retired --reason "規則永久退役" --expected-hash <CURRENT_SHA256>
+kb.exe corrections-check --vault <vault>
+```
+
+代理在變更狀態前必須先 `corrections-show`，使用當下的 `content_sha256`，避免覆蓋另一個
+程序剛做的修改。不得直接把狀態設成 `stale`；`stale` 只由新資料重驗產生。
 
 ## 狀態、恢復與檢查
 
