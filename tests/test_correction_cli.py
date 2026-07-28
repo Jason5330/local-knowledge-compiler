@@ -1,6 +1,9 @@
 import json
 
 from local_kb.cli import build_vault, main
+from local_kb.correction_index import CorrectionIndex
+from local_kb.correction_store import CorrectionStore
+from test_correction_model import _record
 from test_correction_service import _packet, _proposal
 
 
@@ -69,3 +72,63 @@ def test_correct_cli_rejects_malformed_proposal(tmp_path, capsys):
         str(proposal_path),
     ]) == 1
     assert "kb:" in capsys.readouterr().err
+
+
+def test_correction_management_commands_list_show_and_suspend(
+    tmp_path,
+    capsys,
+):
+    paths = build_vault(tmp_path / "KnowledgeBase")
+    store = CorrectionStore(paths)
+    record = store.create(_record())
+    CorrectionIndex(paths).rebuild(store)
+
+    assert main([
+        "corrections-list",
+        "--vault",
+        str(paths.root),
+        "--status",
+        "active",
+    ]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["records"][0]["correction_id"] == record.correction_id
+
+    assert main([
+        "corrections-show",
+        "--vault",
+        str(paths.root),
+        "--correction-id",
+        record.correction_id,
+    ]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["record"]["content_sha256"] == record.content_sha256
+
+    assert main([
+        "corrections-set-status",
+        "--vault",
+        str(paths.root),
+        "--correction-id",
+        record.correction_id,
+        "--status",
+        "suspended",
+        "--reason",
+        "使用者要求暫停",
+        "--expected-hash",
+        record.content_sha256,
+    ]) == 0
+    changed = json.loads(capsys.readouterr().out)
+    assert changed["status"] == "suspended"
+
+
+def test_corrections_check_reports_index_health(tmp_path, capsys):
+    paths = build_vault(tmp_path / "KnowledgeBase")
+    store = CorrectionStore(paths)
+    store.create(_record())
+    CorrectionIndex(paths).rebuild(store)
+
+    assert main([
+        "corrections-check",
+        "--vault",
+        str(paths.root),
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["healthy"] is True

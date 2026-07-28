@@ -17,7 +17,7 @@ from .correction_model import (
     record_to_dict,
 )
 from .paths import VaultPaths
-from .queue import WriterLock
+from .queue import shared_writer_lock
 from .safety import is_reparse, secure_directory
 
 
@@ -382,6 +382,28 @@ class CorrectionStore:
         reason: str,
         details: dict[str, object],
     ) -> dict[str, object]:
+        with shared_writer_lock(
+            self.paths.runtime / "write.lock",
+            timeout=0,
+        ):
+            return self._append_event_unlocked(
+                correction_id,
+                event_type=event_type,
+                actor=actor,
+                reason=reason,
+                details=details,
+            )
+
+    def _append_event_unlocked(
+        self,
+        correction_id: str,
+        *,
+        event_type: str,
+        actor: str,
+        reason: str,
+        details: dict[str, object],
+    ) -> dict[str, object]:
+        """Append while the caller already owns the Vault writer lock."""
         self.get(correction_id)
         event = self._event(
             correction_id,
@@ -394,31 +416,30 @@ class CorrectionStore:
         if len(payload) > self.MAX_EVENT_BYTES:
             raise ValueError("correction event exceeds size limit")
         path = self._timeline_path(correction_id)
-        with WriterLock(self.paths.runtime / "write.lock", timeout=0):
-            existing_size = path.stat().st_size if path.exists() else 0
-            if existing_size + len(payload) > self.MAX_TIMELINE_BYTES:
-                raise ValueError("correction timeline exceeds size limit")
-            flags = (
-                os.O_WRONLY
-                | os.O_APPEND
-                | os.O_CREAT
-                | getattr(os, "O_BINARY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-            )
-            descriptor = os.open(path, flags, 0o600)
-            try:
-                info = os.fstat(descriptor)
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                    raise ValueError("correction timeline is unsafe")
-                offset = 0
-                while offset < len(payload):
-                    written = os.write(descriptor, payload[offset:])
-                    if written <= 0:
-                        raise OSError("short timeline write")
-                    offset += written
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+        existing_size = path.stat().st_size if path.exists() else 0
+        if existing_size + len(payload) > self.MAX_TIMELINE_BYTES:
+            raise ValueError("correction timeline exceeds size limit")
+        flags = (
+            os.O_WRONLY
+            | os.O_APPEND
+            | os.O_CREAT
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("correction timeline is unsafe")
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError("short timeline write")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         return event
 
     def _validate_event(

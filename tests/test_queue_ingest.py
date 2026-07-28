@@ -445,6 +445,36 @@ def test_ingest_text_archives_indexes_caches_and_moves_inbox_file(tmp_path):
     assert (vault.root / completed.metadata["processed_path"]).is_file()
 
 
+def test_ingest_keeps_raw_source_when_correction_revalidation_fails(
+    tmp_path,
+    monkeypatch,
+):
+    from local_kb.correction_service import CorrectionService
+
+    vault, queue, catalog, service = make_service(tmp_path)
+    incoming = vault.inbox / "revalidate.txt"
+    incoming.write_text("new source remains valid", encoding="utf-8")
+    job = queue.enqueue(incoming, job_id="revalidation-failure")
+
+    def fail_revalidation(self, source, fragments):
+        raise RuntimeError("simulated correction failure")
+
+    monkeypatch.setattr(
+        CorrectionService,
+        "revalidate_source",
+        fail_revalidation,
+    )
+    source = service.process(job.job_id, space="work")
+
+    assert (
+        catalog.latest_source("work", "revalidate.txt").version_id
+        == source.version_id
+    )
+    metadata = queue.get(job.job_id).metadata["correction_revalidation"]
+    assert metadata["status"] == "pending_attention"
+    assert "simulated correction failure" in metadata["error"]
+
+
 def test_ingest_claim_prevents_new_same_name_from_being_deleted(tmp_path, monkeypatch):
     vault, queue, _catalog, service = make_service(tmp_path)
     incoming = vault.inbox / "claim.txt"

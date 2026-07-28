@@ -148,6 +148,22 @@ class IngestService:
             processed = self._move_processed(self.queue.get(job_id), final)
             self._mark(job_id, "validated", source=asdict(final), processed_path=str(processed.relative_to(self.vault.root)))
             self.catalog.upsert_source(final, fragments)
+            try:
+                from .correction_service import CorrectionService
+
+                CorrectionService(self.vault).revalidate_source(
+                    final,
+                    fragments,
+                )
+            except Exception as error:
+                self._mark(
+                    job_id,
+                    "validated",
+                    correction_revalidation={
+                        "status": "pending_attention",
+                        "error": str(error)[:500],
+                    },
+                )
             self._cleanup_claim_staging(job_id)
             outcome = _CompileOutcome()
             if final.status == "extracted":
