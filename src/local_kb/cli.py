@@ -21,6 +21,7 @@ from .ingest import IngestService
 from .onedrive import warn_if_onedrive
 from .paths import VaultPaths
 from .project import default_vault_path, resolve_vault_path
+from .project_setup import configure_git_protection
 from .queue import DiskQueue, WriterLock
 from .query import QueryService, write_packet
 from .search import ranked_search
@@ -278,13 +279,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
 
     if arguments.command == "init":
+        project_local = arguments.path is None
         target = (
             default_vault_path()
-            if arguments.path is None
+            if project_local
             else arguments.path
         )
-        paths = build_vault(target)
-        warn_if_onedrive(paths.root)
+        try:
+            paths = build_vault(target)
+            warn_if_onedrive(paths.root)
+        except Exception as error:
+            print(f"kb: {error}", file=sys.stderr)
+            return 1
+        if project_local:
+            try:
+                configure_git_protection(Path.cwd(), paths.root)
+            except RuntimeError as error:
+                print(f"資料保護提醒：{error}", file=sys.stderr)
+                print(f"Initialized knowledge vault: {paths.root}")
+                return 2
         print(f"Initialized knowledge vault: {paths.root}")
         return 0
 
