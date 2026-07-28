@@ -15,6 +15,10 @@ from uuid import uuid4
 from .catalog import Catalog
 from .compiler import ClaudeCompiler, ManualCompiler
 from .config import Config
+from .correction_cli import (
+    add_correction_parsers,
+    handle_correction_command,
+)
 from .finalize import finalize_and_enqueue, read_json_document
 from .health import lint, rebuild_catalog
 from .ingest import IngestService
@@ -282,6 +286,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     lint_parser.add_argument("--vault", type=Path)
     rebuild_parser = subcommands.add_parser("rebuild", help="rebuild the search catalog from cache")
     rebuild_parser.add_argument("--vault", type=Path)
+    add_correction_parsers(subcommands)
     arguments = parser.parse_args(argv)
 
     if arguments.command == "init":
@@ -321,6 +326,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "rebuild":
             print(f"Indexed sources: {rebuild_catalog(paths)}")
             return 0
+        correction_result = handle_correction_command(arguments, paths)
+        if correction_result is not None:
+            return correction_result
         config = Config.load(paths.config)
         if arguments.command == "prepare":
             catalog = Catalog(paths.index / "catalog.sqlite3")
