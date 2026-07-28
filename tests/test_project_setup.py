@@ -164,3 +164,29 @@ def test_initialized_vault_content_stays_out_of_git_status(tmp_path):
     assert status.returncode == 0
     assert "KnowledgeBase" not in status.stdout
     assert "private.xlsx" not in status.stdout
+
+
+def test_old_vault_upgrade_adds_private_corrections_without_changing_user_files(
+    tmp_path,
+):
+    repository = tmp_path / "repo"
+    _make_repository(repository)
+    (repository / ".gitignore").write_text(
+        "/KnowledgeBase/\n",
+        encoding="utf-8",
+    )
+    paths = build_vault(repository / "KnowledgeBase")
+    shutil.rmtree(paths.corrections)
+    marker = paths.inbox / "keep.xlsx"
+    marker.write_bytes(b"user data")
+
+    build_vault(paths.root)
+
+    assert marker.read_bytes() == b"user data"
+    assert paths.correction_records.is_dir()
+    assert "KnowledgeBase" not in _git(
+        repository,
+        "status",
+        "--short",
+        "--untracked-files=all",
+    ).stdout
