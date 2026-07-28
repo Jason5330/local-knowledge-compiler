@@ -198,3 +198,11 @@ def test_main_init_explicit_path_keeps_existing_behavior(
     assert capsys.readouterr().out == (
         f"Initialized knowledge vault: {explicit.resolve()}\n"
     )
+
+
+def test_init_creates_private_correction_roots(tmp_path):
+    paths = build_vault(tmp_path / "KnowledgeBase")
+
+    assert paths.corrections.is_dir()
+    assert paths.correction_records.is_dir()
+    assert paths.correction_timeline.is_dir()

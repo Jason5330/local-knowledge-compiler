@@ -35,6 +35,7 @@ ROOTS = (
     "wiki",
     "answers",
     "index",
+    "corrections",
     "system",
     "logs",
     "trash",
@@ -81,6 +82,11 @@ def build_vault(root: Path) -> VaultPaths:
         for source_root in (paths.raw, paths.wiki):
             for category in CATEGORIES:
                 _ensure_vault_directory(paths.root, source_root / category)
+        for directory in (
+            paths.correction_records,
+            paths.correction_timeline,
+        ):
+            _ensure_vault_directory(paths.root, directory)
         _ensure_vault_directory(paths.root, paths.queue)
         _ensure_vault_directory(paths.root, paths.staging)
         _install_once(

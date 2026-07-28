@@ -31,6 +31,22 @@ class VaultPaths:
         return self.root / "40_index"
 
     @property
+    def corrections(self) -> Path:
+        return self.root / "50_corrections"
+
+    @property
+    def correction_records(self) -> Path:
+        return self.corrections / "records"
+
+    @property
+    def correction_timeline(self) -> Path:
+        return self.corrections / "timeline"
+
+    @property
+    def correction_index(self) -> Path:
+        return self.index / "corrections.sqlite3"
+
+    @property
     def system(self) -> Path:
         return self.root / "80_system"
 
