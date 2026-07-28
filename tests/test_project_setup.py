@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 import shutil
 
+from local_kb.cli import build_vault
 from local_kb.project_setup import (
     LOCAL_VAULT_PREFIX,
     configure_git_protection,
@@ -140,3 +141,26 @@ def test_non_git_zip_checkout_does_not_require_hooks(tmp_path):
 
     assert protection.repository is False
     assert protection.hooks_installed is False
+
+
+def test_initialized_vault_content_stays_out_of_git_status(tmp_path):
+    repository = tmp_path / "repo"
+    _make_repository(repository)
+    (repository / ".gitignore").write_text(
+        "/KnowledgeBase/\n",
+        encoding="utf-8",
+    )
+    vault = build_vault(repository / "KnowledgeBase")
+    private = vault.inbox / "private.xlsx"
+    private.write_bytes(b"private workbook placeholder")
+
+    status = _git(
+        repository,
+        "status",
+        "--short",
+        "--untracked-files=all",
+    )
+
+    assert status.returncode == 0
+    assert "KnowledgeBase" not in status.stdout
+    assert "private.xlsx" not in status.stdout

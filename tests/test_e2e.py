@@ -12,11 +12,12 @@ from http.client import HTTPConnection, HTTPSConnection
 import pytest
 
 from local_kb.catalog import Catalog
-from local_kb.cli import build_vault
+from local_kb.cli import build_vault, main
 from local_kb.config import Config
 from local_kb.health import lint
 from local_kb.finalize import finalize_and_enqueue
 from local_kb.ingest import IngestService
+from local_kb.paths import VaultPaths
 from local_kb.query import QueryService
 from local_kb.queue import DiskQueue
 
@@ -130,6 +131,61 @@ def test_fresh_init_is_immediately_healthy(tmp_path):
 
     assert report["healthy"] is True
     assert report["issues"]["index_raw_mismatches"] == []
+
+
+def test_project_local_vault_can_ingest_and_prepare_from_project_root(
+    tmp_path, monkeypatch, capsys
+):
+    project = tmp_path / "local-knowledge-compiler"
+    project.mkdir()
+    monkeypatch.chdir(project)
+
+    assert main(["init"]) == 0
+    capsys.readouterr()
+    vault = VaultPaths(project / "KnowledgeBase")
+    vault.config.write_text(
+        vault.config.read_text(encoding="utf-8").replace(
+            'provider = "claude"',
+            'provider = "manual"',
+        ),
+        encoding="utf-8",
+    )
+    source = vault.inbox / "decision.md"
+    source.write_text(
+        "The approved local choice is B.",
+        encoding="utf-8",
+    )
+
+    ingested = main(
+        [
+            "ingest-once",
+            str(vault.root),
+            str(source),
+            "--space",
+            "work",
+        ]
+    )
+    assert ingested == 2
+    capsys.readouterr()
+
+    packet = vault.runtime / "project-packet.json"
+    prepared = main(
+        [
+            "prepare",
+            "What local choice was approved?",
+            "--space",
+            "work",
+            "--output",
+            str(packet),
+        ]
+    )
+
+    assert prepared == 0
+    document = json.loads(packet.read_text(encoding="utf-8"))
+    assert any(
+        "approved local choice is B" in item.get("text", "")
+        for item in document["evidence"]
+    )
 
 
 @pytest.mark.parametrize("payload", [b"", b"not a sqlite database"])
